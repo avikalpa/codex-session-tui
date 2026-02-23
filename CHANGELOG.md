@@ -1,0 +1,23 @@
+# Changelog
+
+All notable changes to `codex-session-explorer` are documented in this file.
+
+## [0.2.0] - 2026-02-23
+
+### Added
+- Multi-select sessions with keyboard and mouse checkbox toggles.
+- Bulk session operations over selected sessions.
+- Project-scope folder remap actions:
+  - Rename folder sessions (rewrite `cwd` for all sessions in a project).
+  - Copy folder sessions (duplicate all sessions to a new `cwd`).
+- Session delete action with strict confirmation (`DELETE`) and backup-before-delete.
+- Input path tab-completion with repeated-Tab directory listing.
+- Theme-aware highlighted status rendering for repeated-Tab match lists.
+
+### Changed
+- Sessions pane default width increased for better readability.
+- Sessions pane status/footer controls now expose select-all (`a`) and invert (`i`).
+
+### Fixed
+- Deterministic mouse checkbox toggle/unselect behavior in Sessions pane.
+- Improved status bar action discoverability for project and session workflows.
