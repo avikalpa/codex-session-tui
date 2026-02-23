@@ -59,6 +59,22 @@ fn run_app(tui: &mut Tui, app: &mut App) -> Result<()> {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
+                if app.mode == Mode::Normal && key.code == KeyCode::Char('S') {
+                    if app.selection_mode {
+                        tui.set_mouse_capture(true)?;
+                        app.selection_mode = false;
+                        app.status =
+                            String::from("Selection mode OFF: mouse interactions restored");
+                    } else {
+                        tui.set_mouse_capture(false)?;
+                        app.selection_mode = true;
+                        app.drag_target = None;
+                        app.status = String::from(
+                            "Selection mode ON: drag mouse to select/copy text (Shift+drag on some terminals)",
+                        );
+                    }
+                    continue;
+                }
                 match app.mode {
                     Mode::Normal => {
                         if handle_normal_mode(key.code, app)? {
@@ -365,6 +381,17 @@ impl Tui {
         .context("failed to leave alternate screen")?;
         Ok(())
     }
+
+    fn set_mouse_capture(&mut self, enabled: bool) -> Result<()> {
+        if enabled {
+            execute!(self.terminal.backend_mut(), EnableMouseCapture)
+                .context("failed to enable mouse capture")?;
+        } else {
+            execute!(self.terminal.backend_mut(), DisableMouseCapture)
+                .context("failed to disable mouse capture")?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -440,6 +467,7 @@ struct App {
     search_focused: bool,
     search_dirty: bool,
     preview_mode: PreviewMode,
+    selection_mode: bool,
     drag_target: Option<DragTarget>,
     status: String,
     panes: PaneLayout,
@@ -481,6 +509,7 @@ impl App {
             search_focused: false,
             search_dirty: false,
             preview_mode: PreviewMode::Chat,
+            selection_mode: false,
             drag_target: None,
             status: String::from("Press q to quit, g to refresh"),
             panes: PaneLayout::default(),
@@ -1201,7 +1230,8 @@ fn block_tone_style(tone: BlockTone) -> Style {
     }
     let (bg, is_dark) = terminal_bg_rgb().unwrap_or(((0, 0, 0), true));
     let transformed = transform_bg(bg, if is_dark { 0.30 } else { -0.30 });
-    Style::default().bg(Color::Rgb(transformed.0, transformed.1, transformed.2))
+    let softened = blend_rgb(bg, transformed, 0.55);
+    Style::default().bg(Color::Rgb(softened.0, softened.1, softened.2))
 }
 
 fn infer_dark_theme_from_env() -> Option<bool> {
@@ -1233,6 +1263,20 @@ fn transform_bg(bg: (u8, u8, u8), delta: f32) -> (u8, u8, u8) {
         out.clamp(0.0, 255.0) as u8
     };
     (tweak(bg.0), tweak(bg.1), tweak(bg.2))
+}
+
+fn blend_rgb(base: (u8, u8, u8), overlay: (u8, u8, u8), alpha: f32) -> (u8, u8, u8) {
+    let a = alpha.clamp(0.0, 1.0);
+    let mix = |b: u8, o: u8| -> u8 {
+        ((b as f32) * (1.0 - a) + (o as f32) * a)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    (
+        mix(base.0, overlay.0),
+        mix(base.1, overlay.1),
+        mix(base.2, overlay.2),
+    )
 }
 
 fn ansi_index_to_rgb(idx: u8) -> (u8, u8, u8) {
@@ -1285,6 +1329,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
         Span::raw(" resize-pane  "),
         Span::styled("drag", Style::default().fg(Color::Cyan)),
         Span::raw(" splitter  "),
+        Span::styled("S", Style::default().fg(Color::Cyan)),
+        Span::raw(" select-copy  "),
         Span::styled("m/c/f", Style::default().fg(Color::Green)),
         Span::raw(" move/copy/fork  "),
         Span::styled("g", Style::default().fg(Color::Yellow)),
@@ -1306,11 +1352,12 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
         PreviewMode::Events => "events",
     };
     let pane_meta = format!(
-        "pane widths p/s/r: {}/{}/{}  preview: {}",
+        "pane widths p/s/r: {}/{}/{}  preview: {}  mouse: {}",
         app.project_width_pct,
         app.session_width_pct,
         app.preview_width_pct(),
-        preview_mode
+        preview_mode,
+        if app.selection_mode { "select" } else { "ui" }
     );
     let meta_line = Line::from(vec![
         Span::styled(search_meta, Style::default().fg(Color::DarkGray)),
@@ -1518,6 +1565,18 @@ fn build_preview_from_cached(
         }
         lines.push(Line::from(String::new()));
         tone_rows.push((lines.len().saturating_sub(1), tone));
+        if turn_idx + 1 < cached.turns.len() {
+            if tone == BlockTone::User {
+                // Ensure a terminal-bg hairline gap between USER blocks.
+                lines.push(Line::from(String::new()));
+            } else {
+                let width = inner_width.saturating_sub(1).max(1);
+                lines.push(Line::from(Span::styled(
+                    "─".repeat(width),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
     }
 
     PreviewData {
@@ -2275,6 +2334,12 @@ mod tests {
     }
 
     #[test]
+    fn blend_rgb_halfway_mixes_channels() {
+        let out = blend_rgb((0, 0, 0), (200, 100, 50), 0.5);
+        assert_eq!(out, (100, 50, 25));
+    }
+
+    #[test]
     fn session_item_lines_are_two_line_pretty_format() {
         let s = SessionSummary {
             path: PathBuf::from("/tmp/a.jsonl"),
@@ -2466,6 +2531,47 @@ mod tests {
     }
 
     #[test]
+    fn assistant_blocks_have_hairline_separator() {
+        let cached = CachedPreviewSource {
+            mtime: SystemTime::UNIX_EPOCH,
+            turns: vec![
+                ChatTurn {
+                    role: String::from("assistant"),
+                    timestamp: String::from("t1"),
+                    text: String::from("a1"),
+                },
+                ChatTurn {
+                    role: String::from("assistant"),
+                    timestamp: String::from("t2"),
+                    text: String::from("a2"),
+                },
+            ],
+            events: Vec::new(),
+        };
+        let s = SessionSummary {
+            path: PathBuf::from("/tmp/sep.jsonl"),
+            file_name: String::from("sep.jsonl"),
+            id: String::from("x"),
+            cwd: String::from("/tmp"),
+            started_at: String::from("t0"),
+            event_count: 2,
+            search_blob: String::new(),
+        };
+        let preview =
+            build_preview_from_cached(&s, PreviewMode::Chat, 30, &cached, &HashSet::new());
+        let rows = preview
+            .lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>();
+        let sep_idx = rows
+            .iter()
+            .position(|r| r.contains('─'))
+            .expect("assistant separator");
+        assert!(!preview.tone_rows.iter().any(|(idx, _)| *idx == sep_idx));
+    }
+
+    #[test]
     fn apply_search_filter_reduces_to_matching_sessions() {
         let s1 = SessionSummary {
             path: PathBuf::from("/tmp/a.jsonl"),
@@ -2510,6 +2616,7 @@ mod tests {
             search_focused: true,
             search_dirty: true,
             preview_mode: PreviewMode::Chat,
+            selection_mode: false,
             drag_target: None,
             status: String::new(),
             panes: PaneLayout::default(),
