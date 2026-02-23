@@ -140,6 +140,7 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
                 }
                 app.focus = Focus::Preview;
                 let row = app.preview_scroll + mouse_row_to_index(mouse.row, app.panes.preview);
+                let col = mouse_col_to_index(mouse.column, app.panes.preview);
                 if let Some((_, turn_idx)) = app
                     .preview_header_rows
                     .iter()
@@ -148,9 +149,9 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
                 {
                     app.preview_focus_turn = Some(*turn_idx);
                 }
-                app.preview_mouse_down_row = Some(row);
+                app.preview_mouse_down_pos = Some(app.clamp_preview_pos(row, col));
                 app.preview_selecting = false;
-                app.preview_selection = Some((row, row));
+                app.preview_selection = None;
             } else if point_in_rect(mouse.column, mouse.row, app.panes.status) {
                 app.search_focused = false;
                 handle_status_click(mouse.column, mouse.row, app);
@@ -169,13 +170,16 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
                 app.resize_from_mouse(target, mouse.column);
                 return;
             }
-            if let Some(start) = app.preview_mouse_down_row
+            if let Some(start) = app.preview_mouse_down_pos
                 && point_in_rect(mouse.column, mouse.row, app.panes.preview)
             {
                 let row = app.preview_scroll + mouse_row_to_index(mouse.row, app.panes.preview);
-                let row = row.min(app.preview_content_len.saturating_sub(1));
-                app.preview_selection = Some((start, row));
-                app.preview_selecting = true;
+                let col = mouse_col_to_index(mouse.column, app.panes.preview);
+                let current = app.clamp_preview_pos(row, col);
+                if current != start {
+                    app.preview_selection = Some((start, current));
+                    app.preview_selecting = true;
+                }
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
@@ -184,28 +188,27 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
                 app.drag_target = None;
                 return;
             }
-            if let Some(start) = app.preview_mouse_down_row.take() {
+            if let Some(start) = app.preview_mouse_down_pos.take() {
                 let row = app.preview_scroll + mouse_row_to_index(mouse.row, app.panes.preview);
-                let row = row.min(app.preview_content_len.saturating_sub(1));
+                let col = mouse_col_to_index(mouse.column, app.panes.preview);
+                let current = app.clamp_preview_pos(row, col);
                 if app.preview_selecting {
-                    app.preview_selection = Some((start, row));
-                    if let Some((a, b)) = app.preview_selection {
-                        let (start, end) = if a <= b { (a, b) } else { (b, a) };
-                        if let Some(text) = app.preview_selected_text(start, end) {
-                            if copy_to_clipboard_osc52(&text).is_ok() {
-                                app.status = format!(
-                                    "Copied {} preview lines to clipboard",
-                                    end - start + 1
-                                );
-                            } else {
-                                app.status =
-                                    String::from("Selection captured (clipboard copy failed)");
-                            }
+                    app.preview_selection = Some((start, current));
+                    if let Some((a, b)) = app.preview_selection
+                        && let Some(text) = app.preview_selected_text(a, b)
+                    {
+                        if copy_to_clipboard_osc52(&text).is_ok() {
+                            let line_count =
+                                a.0.max(b.0).saturating_sub(a.0.min(b.0)).saturating_add(1);
+                            app.status =
+                                format!("Copied selection ({} line(s)) to clipboard", line_count);
+                        } else {
+                            app.status = String::from("Selection captured (clipboard copy failed)");
                         }
                     }
                 } else if point_in_rect(mouse.column, mouse.row, app.panes.preview) {
                     app.preview_selection = None;
-                    app.toggle_fold_by_row(row);
+                    app.toggle_fold_by_row(current.0);
                 } else {
                     app.preview_selection = None;
                 }
@@ -371,6 +374,11 @@ fn jump_to_scroll_from_mouse(target: ScrollTarget, y: u16, app: &mut App) {
 fn mouse_row_to_index(y: u16, pane: ratatui::layout::Rect) -> usize {
     // Exclude the top border/title row.
     y.saturating_sub(pane.y.saturating_add(1)) as usize
+}
+
+fn mouse_col_to_index(x: u16, pane: ratatui::layout::Rect) -> usize {
+    // Exclude the left border.
+    x.saturating_sub(pane.x.saturating_add(1)) as usize
 }
 
 fn copy_to_clipboard_osc52(text: &str) -> Result<()> {
@@ -644,7 +652,7 @@ struct App {
     search_dirty: bool,
     preview_mode: PreviewMode,
     preview_selecting: bool,
-    preview_mouse_down_row: Option<usize>,
+    preview_mouse_down_pos: Option<(usize, usize)>,
     drag_target: Option<DragTarget>,
     scroll_drag: Option<ScrollTarget>,
     status: String,
@@ -655,7 +663,7 @@ struct App {
     session_scroll: usize,
     preview_scroll: usize,
     preview_content_len: usize,
-    preview_selection: Option<(usize, usize)>,
+    preview_selection: Option<((usize, usize), (usize, usize))>,
     preview_rendered_lines: Vec<String>,
     preview_focus_turn: Option<usize>,
     preview_cache: HashMap<PathBuf, CachedPreviewSource>,
@@ -692,7 +700,7 @@ impl App {
             search_dirty: false,
             preview_mode: PreviewMode::Chat,
             preview_selecting: false,
-            preview_mouse_down_row: None,
+            preview_mouse_down_pos: None,
             drag_target: None,
             scroll_drag: None,
             status: String::from("Press q to quit, g to refresh"),
@@ -1257,13 +1265,44 @@ impl App {
         }
     }
 
-    fn preview_selected_text(&self, start: usize, end: usize) -> Option<String> {
-        if self.preview_rendered_lines.is_empty() || start > end {
+    fn clamp_preview_pos(&self, row: usize, col: usize) -> (usize, usize) {
+        if self.preview_rendered_lines.is_empty() {
+            return (0, 0);
+        }
+        let row = row.min(self.preview_rendered_lines.len().saturating_sub(1));
+        let len = self.preview_rendered_lines[row].chars().count();
+        let col = if len == 0 {
+            0
+        } else {
+            col.min(len.saturating_sub(1))
+        };
+        (row, col)
+    }
+
+    fn preview_selected_text(&self, start: (usize, usize), end: (usize, usize)) -> Option<String> {
+        if self.preview_rendered_lines.is_empty() {
             return None;
         }
-        let end = end.min(self.preview_rendered_lines.len().saturating_sub(1));
-        let start = start.min(end);
-        Some(self.preview_rendered_lines[start..=end].join("\n"))
+        let start = self.clamp_preview_pos(start.0, start.1);
+        let end = self.clamp_preview_pos(end.0, end.1);
+        let (beg, fin) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        if beg.0 == fin.0 {
+            let line = &self.preview_rendered_lines[beg.0];
+            return Some(slice_chars(line, beg.1, fin.1.saturating_add(1)));
+        }
+        let mut out = Vec::new();
+        let first = &self.preview_rendered_lines[beg.0];
+        out.push(slice_chars(first, beg.1, first.chars().count()));
+        for row in (beg.0 + 1)..fin.0 {
+            out.push(self.preview_rendered_lines[row].clone());
+        }
+        let last = &self.preview_rendered_lines[fin.0];
+        out.push(slice_chars(last, 0, fin.1.saturating_add(1)));
+        Some(out.join("\n"))
     }
 
     fn current_project(&self) -> Option<&ProjectBucket> {
@@ -1581,17 +1620,50 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
         }
     }
     if let Some((a, b)) = app.preview_selection {
-        let (start, end) = if a <= b { (a, b) } else { (b, a) };
-        for row in start..=end {
+        let (beg, fin) = if a <= b { (a, b) } else { (b, a) };
+        for row in beg.0..=fin.0 {
             if row < scroll || row >= scroll + inner_h {
+                continue;
+            }
+            let line_len = app
+                .preview_rendered_lines
+                .get(row)
+                .map(|l| l.chars().count())
+                .unwrap_or(0);
+            if line_len == 0 {
+                continue;
+            }
+            let (col_start, col_end_inclusive) = if beg.0 == fin.0 {
+                (
+                    beg.1.min(line_len.saturating_sub(1)),
+                    fin.1.min(line_len.saturating_sub(1)),
+                )
+            } else if row == beg.0 {
+                (
+                    beg.1.min(line_len.saturating_sub(1)),
+                    line_len.saturating_sub(1),
+                )
+            } else if row == fin.0 {
+                (0, fin.1.min(line_len.saturating_sub(1)))
+            } else {
+                (0, line_len.saturating_sub(1))
+            };
+            if col_start > col_end_inclusive {
+                continue;
+            }
+            let x = inner_x.saturating_add(col_start as u16);
+            let w = (col_end_inclusive - col_start + 1) as u16;
+            let max_w = inner_w.saturating_sub(col_start as u16);
+            let width = w.min(max_w);
+            if width == 0 {
                 continue;
             }
             let screen_y = inner_y + (row - scroll) as u16;
             frame.buffer_mut().set_style(
                 ratatui::layout::Rect {
-                    x: inner_x,
+                    x,
                     y: screen_y,
-                    width: inner_w,
+                    width,
                     height: 1,
                 },
                 Style::default().add_modifier(Modifier::REVERSED),
@@ -2283,6 +2355,12 @@ fn chunk_by_width(input: &str, width: usize) -> Vec<String> {
     chunks
 }
 
+fn slice_chars(s: &str, start: usize, end_exclusive: usize) -> String {
+    let start = start.min(s.chars().count());
+    let end = end_exclusive.min(s.chars().count()).max(start);
+    s.chars().skip(start).take(end - start).collect()
+}
+
 fn summarize_event_line(v: &Value) -> String {
     let ts = v.get("timestamp").and_then(Value::as_str).unwrap_or("-");
     let ty = v.get("type").and_then(Value::as_str).unwrap_or("unknown");
@@ -2875,6 +2953,49 @@ mod tests {
     }
 
     #[test]
+    fn preview_selected_text_uses_character_bounds() {
+        let app = App {
+            sessions_root: PathBuf::from("/tmp"),
+            all_projects: Vec::new(),
+            projects: Vec::new(),
+            project_idx: 0,
+            session_idx: 0,
+            focus: Focus::Preview,
+            mode: Mode::Normal,
+            pending_action: None,
+            input: String::new(),
+            input_focused: false,
+            search_query: String::new(),
+            search_focused: false,
+            search_dirty: false,
+            preview_mode: PreviewMode::Chat,
+            preview_selecting: false,
+            preview_mouse_down_pos: None,
+            drag_target: None,
+            scroll_drag: None,
+            status: String::new(),
+            panes: PaneLayout::default(),
+            project_width_pct: 20,
+            session_width_pct: 36,
+            project_scroll: 0,
+            session_scroll: 0,
+            preview_scroll: 0,
+            preview_content_len: 2,
+            preview_selection: None,
+            preview_rendered_lines: vec![String::from("abcde"), String::from("vwxyz")],
+            preview_focus_turn: None,
+            preview_cache: HashMap::new(),
+            preview_folded: HashMap::new(),
+            preview_header_rows: Vec::new(),
+            preview_session_path: None,
+        };
+        let text = app
+            .preview_selected_text((0, 1), (1, 2))
+            .expect("selection text");
+        assert_eq!(text, "bcde\nvwx");
+    }
+
+    #[test]
     fn scroll_offset_from_mouse_maps_top_and_bottom() {
         let pane = ratatui::layout::Rect {
             x: 0,
@@ -3166,7 +3287,7 @@ mod tests {
             search_dirty: true,
             preview_mode: PreviewMode::Chat,
             preview_selecting: false,
-            preview_mouse_down_row: None,
+            preview_mouse_down_pos: None,
             drag_target: None,
             scroll_drag: None,
             status: String::new(),
@@ -3209,7 +3330,7 @@ mod tests {
             search_dirty: false,
             preview_mode: PreviewMode::Chat,
             preview_selecting: false,
-            preview_mouse_down_row: None,
+            preview_mouse_down_pos: None,
             drag_target: None,
             scroll_drag: None,
             status: String::new(),

@@ -1,0 +1,113 @@
+name: Build And Package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: codex-session-explorer
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            bin: codex-session-explorer
+          - os: macos-13
+            target: x86_64-apple-darwin
+            bin: codex-session-explorer
+          - os: macos-14
+            target: aarch64-apple-darwin
+            bin: codex-session-explorer
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            bin: codex-session-explorer.exe
+          - os: windows-2022
+            target: aarch64-pc-windows-msvc
+            bin: codex-session-explorer.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux ARM64 Linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER: link.exe
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Prepare Artifact
+        shell: bash
+        run: |
+          mkdir -p artifact/${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/${{ matrix.bin }} artifact/${{ matrix.target }}/
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: artifact/${{ matrix.target }}
+
+  npm-package:
+    name: npm package
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: npm/dist
+
+      - name: Flatten Dist Layout
+        run: |
+          mkdir -p npm/dist_flat
+          shopt -s nullglob
+          for d in npm/dist/*; do
+            name="$(basename "$d")"
+            mkdir -p "npm/dist_flat/$name"
+            cp -v "$d"/*/* "npm/dist_flat/$name/" || true
+          done
+          rm -rf npm/dist
+          mv npm/dist_flat npm/dist
+          find npm/dist -maxdepth 3 -type f -print
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Pack npm Artifact
+        run: |
+          cd npm
+          npm pack
+
+      - name: Publish to npm
+        if: github.event_name == 'release' && secrets.NPM_TOKEN != ''
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd npm
+          npm publish --access public

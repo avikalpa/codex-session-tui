@@ -1,0 +1,24 @@
+{
+  "name": "@avikalpa/codex-session-explorer",
+  "version": "0.1.0",
+  "description": "Prebuilt codex-session-explorer TUI binaries for macOS, Linux, and Windows.",
+  "license": "MIT",
+  "bin": {
+    "codex-session-explorer": "bin/codex-session-explorer.js"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/avikalpa/codex-session-tui.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
