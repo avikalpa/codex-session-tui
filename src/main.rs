@@ -4,7 +4,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
@@ -478,16 +478,29 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
 fn handle_input_mode(key: KeyEvent, app: &mut App) -> Result<()> {
     let disallowed_mods = KeyModifiers::CONTROL | KeyModifiers::ALT;
     match key.code {
-        KeyCode::Esc => app.cancel_input(),
-        KeyCode::Enter => app.submit_input()?,
+        KeyCode::Esc => {
+            app.clear_input_completion_cycle();
+            app.cancel_input();
+        }
+        KeyCode::Enter => {
+            app.clear_input_completion_cycle();
+            app.submit_input()?;
+        }
+        KeyCode::Tab => {
+            if app.input_focused && !key.modifiers.intersects(disallowed_mods) {
+                app.tab_complete_input_path();
+            }
+        }
         KeyCode::Backspace => {
             if app.input_focused {
                 app.input.pop();
+                app.clear_input_completion_cycle();
             }
         }
         KeyCode::Char(ch) => {
             if app.input_focused && !key.modifiers.intersects(disallowed_mods) {
                 app.input.push(ch);
+                app.clear_input_completion_cycle();
             }
         }
         _ => {}
@@ -647,6 +660,8 @@ struct App {
     pending_action: Option<Action>,
     input: String,
     input_focused: bool,
+    input_tab_last_at: Option<Instant>,
+    input_tab_last_query: String,
     search_query: String,
     search_focused: bool,
     search_dirty: bool,
@@ -695,6 +710,8 @@ impl App {
             pending_action: None,
             input: String::new(),
             input_focused: false,
+            input_tab_last_at: None,
+            input_tab_last_query: String::new(),
             search_query: String::new(),
             search_focused: false,
             search_dirty: false,
@@ -1324,6 +1341,7 @@ impl App {
         self.pending_action = Some(action);
         self.input.clear();
         self.input_focused = true;
+        self.clear_input_completion_cycle();
         self.search_focused = false;
         self.status = match action {
             Action::Move => String::from("Move: enter target project path and press Enter"),
@@ -1337,6 +1355,7 @@ impl App {
         self.pending_action = None;
         self.input.clear();
         self.input_focused = false;
+        self.clear_input_completion_cycle();
         self.status = String::from("Action cancelled");
     }
 
@@ -1380,8 +1399,94 @@ impl App {
         self.pending_action = None;
         self.input.clear();
         self.input_focused = false;
+        self.clear_input_completion_cycle();
         self.reload()?;
         Ok(())
+    }
+
+    fn clear_input_completion_cycle(&mut self) {
+        self.input_tab_last_at = None;
+        self.input_tab_last_query.clear();
+    }
+
+    fn tab_complete_input_path(&mut self) {
+        let query = self.input.clone();
+        let now = Instant::now();
+        let repeated = self
+            .input_tab_last_at
+            .is_some_and(|at| now.duration_since(at) <= Duration::from_millis(800))
+            && self.input_tab_last_query == query;
+        self.input_tab_last_at = Some(now);
+        self.input_tab_last_query = query.clone();
+
+        let (dir_part, prefix) = if query.ends_with('/') {
+            (query.as_str(), "")
+        } else if let Some(pos) = query.rfind('/') {
+            (&query[..=pos], &query[pos + 1..])
+        } else {
+            ("", query.as_str())
+        };
+
+        let dir_path = if dir_part.is_empty() {
+            PathBuf::from(".")
+        } else {
+            expand_tilde(dir_part)
+        };
+
+        let mut matches = Vec::new();
+        let read_dir = fs::read_dir(&dir_path);
+        let Ok(entries) = read_dir else {
+            self.status = format!("Cannot read directory: {}", dir_path.display());
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(prefix) {
+                matches.push(name);
+            }
+        }
+        matches.sort();
+
+        if matches.is_empty() {
+            self.status = format!("No directory matches for '{}'", query);
+            return;
+        }
+
+        if matches.len() == 1 {
+            self.input = format!("{dir_part}{}/", matches[0]);
+            self.status = format!("Completed: {}", self.input);
+            return;
+        }
+
+        let lcp = longest_common_prefix(&matches);
+        if lcp.chars().count() > prefix.chars().count() {
+            self.input = format!("{dir_part}{lcp}");
+            self.status = format!("{} matches", matches.len());
+            return;
+        }
+
+        if repeated {
+            let shown = matches
+                .iter()
+                .take(12)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("  ");
+            if matches.len() > 12 {
+                self.status = format!("Matches: {shown}  ... (+{} more)", matches.len() - 12);
+            } else {
+                self.status = format!("Matches: {shown}");
+            }
+        } else {
+            self.status = format!("{} matches (Tab again to list)", matches.len());
+        }
     }
 }
 
@@ -1783,7 +1888,18 @@ fn ansi_index_to_rgb(idx: u8) -> (u8, u8, u8) {
 }
 
 fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
-    let key_line = if app.focus == Focus::Preview && app.mode == Mode::Normal {
+    let key_line = if app.mode == Mode::Input {
+        Line::from(vec![
+            Span::styled("tab", Style::default().fg(Color::Cyan)),
+            Span::raw(" path-complete  "),
+            Span::styled("tab tab", Style::default().fg(Color::Cyan)),
+            Span::raw(" list dirs  "),
+            Span::styled("enter", Style::default().fg(Color::Green)),
+            Span::raw(" apply  "),
+            Span::styled("esc", Style::default().fg(Color::Red)),
+            Span::raw(" cancel"),
+        ])
+    } else if app.focus == Focus::Preview && app.mode == Mode::Normal {
         Line::from(vec![
             Span::styled("↑/↓", Style::default().fg(Color::Cyan)),
             Span::raw(" block prev/next  "),
@@ -1887,10 +2003,25 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
         };
 
         let focus_mark = if app.input_focused { "*" } else { " " };
+        let blink_on = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| (d.as_millis() / 500) % 2 == 0)
+            .unwrap_or(true);
+        let cursor = if app.input_focused && blink_on {
+            "█"
+        } else {
+            " "
+        };
         lines.push(Line::from(format!(
-            "{focus_mark} {action} target> {}",
-            app.input
+            "{focus_mark} {action} target> {}{cursor}",
+            app.input,
         )));
+        if !app.status.trim().is_empty() {
+            lines.push(Line::from(Span::styled(
+                app.status.clone(),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
     } else {
         lines.push(Line::from(app.status.clone()));
     }
@@ -2359,6 +2490,27 @@ fn slice_chars(s: &str, start: usize, end_exclusive: usize) -> String {
     let start = start.min(s.chars().count());
     let end = end_exclusive.min(s.chars().count()).max(start);
     s.chars().skip(start).take(end - start).collect()
+}
+
+fn longest_common_prefix(items: &[String]) -> String {
+    let Some(first) = items.first() else {
+        return String::new();
+    };
+    let mut prefix = first.clone();
+    for item in items.iter().skip(1) {
+        let mut next = String::new();
+        for (a, b) in prefix.chars().zip(item.chars()) {
+            if a != b {
+                break;
+            }
+            next.push(a);
+        }
+        prefix = next;
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    prefix
 }
 
 fn summarize_event_line(v: &Value) -> String {
@@ -2913,6 +3065,46 @@ mod tests {
         .join("\n")
     }
 
+    fn empty_test_app() -> App {
+        App {
+            sessions_root: PathBuf::from("/tmp"),
+            all_projects: Vec::new(),
+            projects: Vec::new(),
+            project_idx: 0,
+            session_idx: 0,
+            focus: Focus::Projects,
+            mode: Mode::Normal,
+            pending_action: None,
+            input: String::new(),
+            input_focused: false,
+            input_tab_last_at: None,
+            input_tab_last_query: String::new(),
+            search_query: String::new(),
+            search_focused: false,
+            search_dirty: false,
+            preview_mode: PreviewMode::Chat,
+            preview_selecting: false,
+            preview_mouse_down_pos: None,
+            drag_target: None,
+            scroll_drag: None,
+            status: String::new(),
+            panes: PaneLayout::default(),
+            project_width_pct: 20,
+            session_width_pct: 36,
+            project_scroll: 0,
+            session_scroll: 0,
+            preview_scroll: 0,
+            preview_content_len: 0,
+            preview_selection: None,
+            preview_rendered_lines: Vec::new(),
+            preview_focus_turn: None,
+            preview_cache: HashMap::new(),
+            preview_folded: HashMap::new(),
+            preview_header_rows: Vec::new(),
+            preview_session_path: None,
+        }
+    }
+
     #[test]
     fn extract_chat_turns_normalizes_developer_role() {
         let turns = extract_chat_turns(&sample_chat_jsonl());
@@ -2953,6 +3145,54 @@ mod tests {
     }
 
     #[test]
+    fn longest_common_prefix_finds_shared_prefix() {
+        let items = vec![
+            String::from("alpha"),
+            String::from("alpine"),
+            String::from("alps"),
+        ];
+        assert_eq!(longest_common_prefix(&items), "alp");
+    }
+
+    #[test]
+    fn tab_complete_path_single_match_appends_slash() {
+        let base = std::env::temp_dir().join(format!("cse-tab-{}", Uuid::new_v4()));
+        fs::create_dir_all(base.join("alpha")).expect("mkdir alpha");
+        fs::create_dir_all(base.join("beta")).expect("mkdir beta");
+
+        let base_s = base.to_string_lossy().replace('\\', "/");
+        let mut app = empty_test_app();
+        app.mode = Mode::Input;
+        app.input_focused = true;
+        app.input = format!("{base_s}/al");
+
+        app.tab_complete_input_path();
+        assert_eq!(app.input, format!("{base_s}/alpha/"));
+    }
+
+    #[test]
+    fn tab_complete_path_double_tab_lists_matches() {
+        let base = std::env::temp_dir().join(format!("cse-tab-list-{}", Uuid::new_v4()));
+        fs::create_dir_all(base.join("alpha")).expect("mkdir alpha");
+        fs::create_dir_all(base.join("alto")).expect("mkdir alto");
+        fs::create_dir_all(base.join("alps")).expect("mkdir alps");
+
+        let base_s = base.to_string_lossy().replace('\\', "/");
+        let mut app = empty_test_app();
+        app.mode = Mode::Input;
+        app.input_focused = true;
+        app.input = format!("{base_s}/al");
+
+        app.tab_complete_input_path();
+        assert!(app.status.contains("Tab again to list"));
+        app.tab_complete_input_path();
+        assert!(app.status.starts_with("Matches: "));
+        assert!(app.status.contains("alpha"));
+        assert!(app.status.contains("alto"));
+        assert!(app.status.contains("alps"));
+    }
+
+    #[test]
     fn preview_selected_text_uses_character_bounds() {
         let app = App {
             sessions_root: PathBuf::from("/tmp"),
@@ -2965,6 +3205,8 @@ mod tests {
             pending_action: None,
             input: String::new(),
             input_focused: false,
+            input_tab_last_at: None,
+            input_tab_last_query: String::new(),
             search_query: String::new(),
             search_focused: false,
             search_dirty: false,
@@ -3282,6 +3524,8 @@ mod tests {
             pending_action: None,
             input: String::new(),
             input_focused: false,
+            input_tab_last_at: None,
+            input_tab_last_query: String::new(),
             search_query: String::from("alpha"),
             search_focused: true,
             search_dirty: true,
@@ -3325,6 +3569,8 @@ mod tests {
             pending_action: None,
             input: String::new(),
             input_focused: false,
+            input_tab_last_at: None,
+            input_tab_last_query: String::new(),
             search_query: String::new(),
             search_focused: false,
             search_dirty: false,
