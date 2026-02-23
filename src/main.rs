@@ -67,6 +67,25 @@ fn run_app(tui: &mut Tui, app: &mut App) -> Result<()> {
 fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            if is_on_splitter(
+                mouse.column,
+                mouse.row,
+                app.panes.projects,
+                app.panes.sessions,
+            ) {
+                app.drag_target = Some(DragTarget::LeftSplitter);
+                return;
+            }
+            if is_on_splitter(
+                mouse.column,
+                mouse.row,
+                app.panes.sessions,
+                app.panes.preview,
+            ) {
+                app.drag_target = Some(DragTarget::RightSplitter);
+                return;
+            }
+
             if point_in_rect(mouse.column, mouse.row, app.panes.search) {
                 app.search_focused = true;
                 app.input_focused = false;
@@ -107,6 +126,14 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
                 handle_status_click(mouse.column, mouse.row, app);
             }
         }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(target) = app.drag_target {
+                app.resize_from_mouse(target, mouse.column);
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            app.drag_target = None;
+        }
         MouseEventKind::ScrollUp => {
             if point_in_rect(mouse.column, mouse.row, app.panes.projects) {
                 app.focus = Focus::Projects;
@@ -133,6 +160,18 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
         }
         _ => {}
     }
+}
+
+fn is_on_splitter(
+    x: u16,
+    y: u16,
+    left: ratatui::layout::Rect,
+    right: ratatui::layout::Rect,
+) -> bool {
+    let splitter_x = right.x;
+    let y0 = left.y;
+    let y1 = left.y.saturating_add(left.height);
+    y >= y0 && y < y1 && (x == splitter_x || x.saturating_add(1) == splitter_x)
 }
 
 fn handle_status_click(x: u16, y: u16, app: &mut App) {
@@ -340,6 +379,12 @@ enum PreviewMode {
     Events,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DragTarget {
+    LeftSplitter,
+    RightSplitter,
+}
+
 #[derive(Clone)]
 struct SessionSummary {
     path: PathBuf,
@@ -380,6 +425,7 @@ struct App {
     search_query: String,
     search_focused: bool,
     preview_mode: PreviewMode,
+    drag_target: Option<DragTarget>,
     status: String,
     panes: PaneLayout,
     project_width_pct: u16,
@@ -408,6 +454,7 @@ impl App {
             search_query: String::new(),
             search_focused: false,
             preview_mode: PreviewMode::Chat,
+            drag_target: None,
             status: String::from("Press q to quit, g to refresh"),
             panes: PaneLayout::default(),
             project_width_pct: 28,
@@ -655,6 +702,66 @@ impl App {
         self.session_width_pct = s as u16;
     }
 
+    fn resize_from_mouse(&mut self, target: DragTarget, mouse_x: u16) {
+        let total_width = self
+            .panes
+            .projects
+            .width
+            .saturating_add(self.panes.sessions.width)
+            .saturating_add(self.panes.preview.width);
+        if total_width == 0 {
+            return;
+        }
+
+        let x0 = self.panes.projects.x;
+        let x1 = self.panes.sessions.x;
+        let x2 = self.panes.preview.x;
+        let right = x0.saturating_add(total_width);
+
+        let mut split1 = x1;
+        let mut split2 = x2;
+
+        match target {
+            DragTarget::LeftSplitter => {
+                split1 = mouse_x.clamp(x0.saturating_add(8), split2.saturating_sub(8));
+            }
+            DragTarget::RightSplitter => {
+                split2 = mouse_x.clamp(split1.saturating_add(8), right.saturating_sub(8));
+            }
+        }
+
+        let p = split1.saturating_sub(x0) as f32 / total_width as f32 * 100.0;
+        let s = split2.saturating_sub(split1) as f32 / total_width as f32 * 100.0;
+        let mut p_pct = p.round() as i16;
+        let mut s_pct = s.round() as i16;
+        let min = 15i16;
+        let mut r_pct = 100 - p_pct - s_pct;
+
+        if p_pct < min {
+            let d = min - p_pct;
+            p_pct += d;
+            r_pct -= d;
+        }
+        if s_pct < min {
+            let d = min - s_pct;
+            s_pct += d;
+            r_pct -= d;
+        }
+        if r_pct < min {
+            let d = min - r_pct;
+            if target == DragTarget::LeftSplitter {
+                p_pct -= d;
+            } else {
+                s_pct -= d;
+            }
+        }
+
+        if p_pct >= min && s_pct >= min && (100 - p_pct - s_pct) >= min {
+            self.project_width_pct = p_pct as u16;
+            self.session_width_pct = s_pct as u16;
+        }
+    }
+
     fn current_project(&self) -> Option<&ProjectBucket> {
         self.projects.get(self.project_idx)
     }
@@ -782,16 +889,8 @@ fn render_search(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
         Style::default()
     };
 
-    let mode = match app.preview_mode {
-        PreviewMode::Chat => "chat",
-        PreviewMode::Events => "events",
-    };
     let query_prefix = if app.search_focused { ">" } else { " " };
-    let right = format!(
-        "  [/] focus-search  [v] preview:{mode}  matches:{} ",
-        app.projects.len()
-    );
-    let content = format!("{} {}{}", query_prefix, app.search_query, right);
+    let content = format!("{query_prefix} {}", app.search_query);
 
     let para = Paragraph::new(Line::from(vec![
         Span::styled("Search ", Style::default().fg(Color::Cyan)),
@@ -925,6 +1024,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
         Span::raw(" preview-mode  "),
         Span::styled("h/l", Style::default().fg(Color::Cyan)),
         Span::raw(" resize-pane  "),
+        Span::styled("drag", Style::default().fg(Color::Cyan)),
+        Span::raw(" splitter  "),
         Span::styled("m/c/f", Style::default().fg(Color::Green)),
         Span::raw(" move/copy/fork  "),
         Span::styled("g", Style::default().fg(Color::Yellow)),
