@@ -105,7 +105,7 @@ jobs:
           npm pack
 
       - name: Publish to npm
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
@@ -114,4 +114,7 @@ jobs:
             echo "NPM_TOKEN is not set; skipping npm publish."
             exit 0
           fi
-          npm publish --access public
+          npm publish --access public || {
+            echo "npm publish failed. Checking if version already exists..."
+            npm view @avikalpa/codex-session-explorer@$(node -p "require('./package.json').version") version
+          }
