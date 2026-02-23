@@ -17,6 +17,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use pulldown_cmark::{Event as MdEvent, Options as MdOptions, Parser as MdParser, Tag, TagEnd};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -695,8 +696,8 @@ impl App {
             scroll_drag: None,
             status: String::from("Press q to quit, g to refresh"),
             panes: PaneLayout::default(),
-            project_width_pct: 25,
-            session_width_pct: 37,
+            project_width_pct: 22,
+            session_width_pct: 36,
             project_scroll: 0,
             session_scroll: 0,
             preview_scroll: 0,
@@ -2062,48 +2063,159 @@ fn render_markdown_lines(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![String::new()];
     }
-    let mut out = Vec::new();
-    let mut in_code_block = false;
-    for raw in text.lines() {
-        let trimmed_start = raw.trim_start();
-        if trimmed_start.starts_with("```") {
-            in_code_block = !in_code_block;
-            out.push(raw.to_string());
-            continue;
-        }
+    let mut options = MdOptions::empty();
+    options.insert(MdOptions::ENABLE_STRIKETHROUGH);
+    options.insert(MdOptions::ENABLE_TABLES);
+    options.insert(MdOptions::ENABLE_TASKLISTS);
 
+    #[derive(Clone, Copy)]
+    enum ListKind {
+        Bullet,
+        Ordered(u64),
+    }
+
+    let mut raw_lines = Vec::new();
+    let mut line = String::new();
+    let mut quote_depth = 0usize;
+    let mut list_stack: Vec<ListKind> = Vec::new();
+    let mut in_code_block = false;
+
+    let flush_line = |line: &mut String, raw_lines: &mut Vec<String>| {
+        if !line.is_empty() {
+            raw_lines.push(std::mem::take(line));
+        }
+    };
+
+    for event in MdParser::new_ext(text, options) {
         if in_code_block {
-            if raw.is_empty() {
-                out.push(String::new());
-            } else {
-                out.extend(chunk_by_width(raw, width));
+            match event {
+                MdEvent::End(TagEnd::CodeBlock) => {
+                    in_code_block = false;
+                    raw_lines.push(String::new());
+                }
+                MdEvent::Text(t) | MdEvent::Code(t) => {
+                    for code_line in t.lines() {
+                        raw_lines.push(format!("    {code_line}"));
+                    }
+                }
+                MdEvent::SoftBreak | MdEvent::HardBreak => raw_lines.push(String::new()),
+                _ => {}
             }
             continue;
         }
 
-        if raw.trim().is_empty() {
+        match event {
+            MdEvent::Start(tag) => match tag {
+                Tag::Paragraph => {}
+                Tag::Heading { .. } => {
+                    flush_line(&mut line, &mut raw_lines);
+                }
+                Tag::BlockQuote(_) => {
+                    flush_line(&mut line, &mut raw_lines);
+                    quote_depth = quote_depth.saturating_add(1);
+                }
+                Tag::List(start) => {
+                    flush_line(&mut line, &mut raw_lines);
+                    match start {
+                        Some(n) => list_stack.push(ListKind::Ordered(n)),
+                        None => list_stack.push(ListKind::Bullet),
+                    }
+                }
+                Tag::Item => {
+                    flush_line(&mut line, &mut raw_lines);
+                    for _ in 0..quote_depth {
+                        line.push_str("> ");
+                    }
+                    if let Some(kind) = list_stack.last_mut() {
+                        match kind {
+                            ListKind::Bullet => line.push_str("- "),
+                            ListKind::Ordered(n) => {
+                                line.push_str(&format!("{n}. "));
+                                *n += 1;
+                            }
+                        }
+                    }
+                }
+                Tag::CodeBlock(_) => {
+                    flush_line(&mut line, &mut raw_lines);
+                    in_code_block = true;
+                }
+                _ => {}
+            },
+            MdEvent::End(tag_end) => match tag_end {
+                TagEnd::Paragraph | TagEnd::Heading(_) => {
+                    flush_line(&mut line, &mut raw_lines);
+                    raw_lines.push(String::new());
+                }
+                TagEnd::BlockQuote(_) => {
+                    flush_line(&mut line, &mut raw_lines);
+                    quote_depth = quote_depth.saturating_sub(1);
+                    raw_lines.push(String::new());
+                }
+                TagEnd::List(_) => {
+                    flush_line(&mut line, &mut raw_lines);
+                    let _ = list_stack.pop();
+                    raw_lines.push(String::new());
+                }
+                TagEnd::Item => {
+                    flush_line(&mut line, &mut raw_lines);
+                }
+                _ => {}
+            },
+            MdEvent::Text(t) | MdEvent::Code(t) => line.push_str(&t),
+            MdEvent::SoftBreak => line.push(' '),
+            MdEvent::HardBreak => flush_line(&mut line, &mut raw_lines),
+            MdEvent::Rule => {
+                flush_line(&mut line, &mut raw_lines);
+                raw_lines.push("─".repeat(width.min(48)));
+            }
+            MdEvent::Html(_) | MdEvent::InlineHtml(_) => {}
+            MdEvent::InlineMath(t) | MdEvent::DisplayMath(t) => line.push_str(&t),
+            _ => {}
+        }
+    }
+    flush_line(&mut line, &mut raw_lines);
+
+    while raw_lines.last().is_some_and(|l| l.is_empty()) {
+        raw_lines.pop();
+    }
+
+    let mut out = Vec::new();
+    for raw in raw_lines {
+        if raw.is_empty() {
             out.push(String::new());
             continue;
         }
-
-        let (prefix, body) = split_markdown_prefix(raw);
+        if let Some(code) = raw.strip_prefix("    ") {
+            let chunks = chunk_by_width(code, width.saturating_sub(4).max(1));
+            if chunks.is_empty() {
+                out.push(String::from("    "));
+            } else {
+                for chunk in chunks {
+                    out.push(format!("    {chunk}"));
+                }
+            }
+            continue;
+        }
+        let (prefix, body) = split_markdown_prefix(&raw);
         if body.trim().is_empty() {
             out.push(prefix);
             continue;
         }
         let wrapped = wrap_text_lines(body.trim(), width.saturating_sub(prefix.chars().count()));
-        for (idx, line) in wrapped.iter().enumerate() {
+        for (idx, l) in wrapped.iter().enumerate() {
             if idx == 0 {
-                out.push(format!("{prefix}{line}"));
+                out.push(format!("{prefix}{l}"));
             } else {
-                out.push(format!("{}{}", " ".repeat(prefix.chars().count()), line));
+                out.push(format!("{}{}", " ".repeat(prefix.chars().count()), l));
             }
         }
     }
     if out.is_empty() {
-        out.push(String::new());
+        vec![String::new()]
+    } else {
+        out
     }
-    out
 }
 
 fn split_markdown_prefix(raw: &str) -> (String, &str) {
@@ -2950,10 +3062,10 @@ mod tests {
         let md = "## Header\n\n- one two three four five\n\n```rust\nlet a = 1;\n```";
         let rendered = render_markdown_lines(md, 20);
         let joined = rendered.join("\n");
-        assert!(joined.contains("## Header"));
+        assert!(joined.contains("Header"));
         assert!(joined.contains("- one two three"));
-        assert!(joined.contains("```rust"));
         assert!(joined.contains("let a = 1;"));
+        assert!(!joined.contains("```"));
     }
 
     #[test]
