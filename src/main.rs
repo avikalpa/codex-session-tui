@@ -1552,6 +1552,11 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
             .find(|(turn_idx, _, _)| *turn_idx == focused_turn)
             .copied()
     {
+        let header_row = app
+            .preview_header_rows
+            .iter()
+            .find(|(_, turn_idx)| *turn_idx == focused_turn)
+            .map(|(row, _)| *row);
         let vis_start = start.max(scroll);
         let vis_end = end.min(scroll + inner_h.saturating_sub(1));
         if vis_start <= vis_end && inner_w >= 2 {
@@ -1560,7 +1565,10 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
             let edge = Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM);
             for row in vis_start..=vis_end {
                 let y = inner_y + (row - scroll) as u16;
-                frame.buffer_mut().set_string(left_x, y, "│", edge);
+                // Preserve the expand/collapse marker at column 0 on header row.
+                if Some(row) != header_row {
+                    frame.buffer_mut().set_string(left_x, y, "│", edge);
+                }
                 frame.buffer_mut().set_string(right_x, y, "│", edge);
             }
             let top_y = inner_y + (vis_start - scroll) as u16;
