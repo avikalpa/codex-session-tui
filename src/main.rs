@@ -61,7 +61,31 @@ fn run_app(tui: &mut Tui, app: &mut App) -> Result<()> {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
+                if app.mode == Mode::Normal && key.code == KeyCode::Char('M') {
+                    if app.mouse_capture_enabled {
+                        tui.set_mouse_capture(false)?;
+                        app.mouse_capture_enabled = false;
+                        app.selection_mode = false;
+                        app.preview_selection = None;
+                        app.scroll_drag = None;
+                        app.drag_target = None;
+                        app.status = String::from(
+                            "Mouse UI OFF: terminal copy/paste and right-click enabled",
+                        );
+                    } else {
+                        tui.set_mouse_capture(true)?;
+                        app.mouse_capture_enabled = true;
+                        app.status = String::from(
+                            "Mouse UI ON: pane drag, scrollbar drag, click actions enabled",
+                        );
+                    }
+                    continue;
+                }
                 if app.mode == Mode::Normal && key.code == KeyCode::Char('S') {
+                    if !app.mouse_capture_enabled {
+                        app.status = String::from("Enable mouse UI first with M, then press S");
+                        continue;
+                    }
                     if app.selection_mode {
                         app.selection_mode = false;
                         app.preview_selection = None;
@@ -504,8 +528,7 @@ impl Tui {
     fn new() -> Result<Self> {
         enable_raw_mode().context("failed to enable raw mode")?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-            .context("failed to enter alternate screen")?;
+        execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend).context("failed to create terminal")?;
         Ok(Self { terminal })
@@ -560,6 +583,17 @@ impl Tui {
             LeaveAlternateScreen
         )
         .context("failed to leave alternate screen")?;
+        Ok(())
+    }
+
+    fn set_mouse_capture(&mut self, enabled: bool) -> Result<()> {
+        if enabled {
+            execute!(self.terminal.backend_mut(), EnableMouseCapture)
+                .context("failed to enable mouse capture")?;
+        } else {
+            execute!(self.terminal.backend_mut(), DisableMouseCapture)
+                .context("failed to disable mouse capture")?;
+        }
         Ok(())
     }
 }
@@ -644,6 +678,7 @@ struct App {
     search_focused: bool,
     search_dirty: bool,
     preview_mode: PreviewMode,
+    mouse_capture_enabled: bool,
     selection_mode: bool,
     drag_target: Option<DragTarget>,
     scroll_drag: Option<ScrollTarget>,
@@ -691,12 +726,13 @@ impl App {
             search_focused: false,
             search_dirty: false,
             preview_mode: PreviewMode::Chat,
+            mouse_capture_enabled: false,
             selection_mode: false,
             drag_target: None,
             scroll_drag: None,
             status: String::from("Press q to quit, g to refresh"),
             panes: PaneLayout::default(),
-            project_width_pct: 22,
+            project_width_pct: 20,
             session_width_pct: 36,
             project_scroll: 0,
             session_scroll: 0,
@@ -1722,6 +1758,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" toggle all blocks  "),
             Span::styled("S", Style::default().fg(Color::Cyan)),
             Span::raw(" select-copy  "),
+            Span::styled("M", Style::default().fg(Color::Cyan)),
+            Span::raw(" mouse-ui on/off  "),
             Span::styled("drag", Style::default().fg(Color::Cyan)),
             Span::raw(" pane/scrollbar"),
         ])
@@ -1743,6 +1781,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" splitter  "),
             Span::styled("S", Style::default().fg(Color::Cyan)),
             Span::raw(" select-copy  "),
+            Span::styled("M", Style::default().fg(Color::Cyan)),
+            Span::raw(" mouse-ui on/off  "),
             Span::styled("m/c/f", Style::default().fg(Color::Green)),
             Span::raw(" move/copy/fork  "),
             Span::styled("g", Style::default().fg(Color::Yellow)),
@@ -1770,7 +1810,13 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
         app.session_width_pct,
         app.preview_width_pct(),
         preview_mode,
-        if app.selection_mode { "select" } else { "ui" }
+        if !app.mouse_capture_enabled {
+            "off"
+        } else if app.selection_mode {
+            "select"
+        } else {
+            "ui"
+        }
     );
     let meta_line = Line::from(vec![
         Span::styled(search_meta, Style::default().fg(Color::DarkGray)),
@@ -3162,6 +3208,7 @@ mod tests {
             search_focused: true,
             search_dirty: true,
             preview_mode: PreviewMode::Chat,
+            mouse_capture_enabled: false,
             selection_mode: false,
             drag_target: None,
             scroll_drag: None,
@@ -3204,6 +3251,7 @@ mod tests {
             search_focused: false,
             search_dirty: false,
             preview_mode: PreviewMode::Chat,
+            mouse_capture_enabled: false,
             selection_mode: false,
             drag_target: None,
             scroll_drag: None,
