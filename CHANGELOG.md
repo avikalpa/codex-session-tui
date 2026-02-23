@@ -2,6 +2,11 @@
 
 All notable changes to `codex-session-explorer` are documented in this file.
 
+## [0.2.1] - 2026-02-23
+
+### Fixed
+- CI release workflow now uses a supported macOS Intel runner label for `x86_64-apple-darwin` builds.
+
 ## [0.2.0] - 2026-02-23
 
 ### Added
