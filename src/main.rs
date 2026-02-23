@@ -116,6 +116,7 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
                 if idx < app.projects.len() {
                     app.project_idx = idx;
                     app.clamp_session_idx();
+                    app.session_select_anchor = None;
                     app.preview_scroll = 0;
                     app.ensure_selection_visible();
                 }
@@ -129,7 +130,12 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
                 let idx =
                     app.session_scroll + (mouse_row_to_index(mouse.row, app.panes.sessions) / 2);
                 if idx < len {
-                    app.session_idx = idx;
+                    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                        app.select_session_range_to(idx);
+                    } else {
+                        app.session_idx = idx;
+                        app.session_select_anchor = Some(idx);
+                    }
                     app.preview_scroll = 0;
                     app.ensure_selection_visible();
                 }
@@ -257,33 +263,86 @@ fn is_on_splitter(
     y >= y0 && y < y1 && (x == splitter_x || x.saturating_add(1) == splitter_x)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StatusButton {
+    Apply,
+    Cancel,
+    Move,
+    Copy,
+    Fork,
+    ProjectRename,
+    ProjectCopy,
+    Refresh,
+    Quit,
+}
+
+fn status_buttons(app: &App) -> Vec<StatusButton> {
+    if app.mode == Mode::Input {
+        return vec![StatusButton::Apply, StatusButton::Cancel];
+    }
+    if app.focus == Focus::Projects {
+        return vec![
+            StatusButton::ProjectRename,
+            StatusButton::ProjectCopy,
+            StatusButton::Refresh,
+            StatusButton::Quit,
+        ];
+    }
+    vec![
+        StatusButton::Move,
+        StatusButton::Copy,
+        StatusButton::Fork,
+        StatusButton::Refresh,
+        StatusButton::Quit,
+    ]
+}
+
+fn status_button_label(button: StatusButton) -> &'static str {
+    match button {
+        StatusButton::Apply => "[Apply]",
+        StatusButton::Cancel => "[Cancel]",
+        StatusButton::Move => "[Move]",
+        StatusButton::Copy => "[Copy]",
+        StatusButton::Fork => "[Fork]",
+        StatusButton::ProjectRename => "[Rename Folder]",
+        StatusButton::ProjectCopy => "[Copy Folder]",
+        StatusButton::Refresh => "[Refresh]",
+        StatusButton::Quit => "[Quit]",
+    }
+}
+
+fn trigger_status_button(button: StatusButton, app: &mut App) {
+    match button {
+        StatusButton::Apply => {
+            let _ = app.submit_input();
+        }
+        StatusButton::Cancel => app.cancel_input(),
+        StatusButton::Move => app.start_action(Action::Move),
+        StatusButton::Copy => app.start_action(Action::Copy),
+        StatusButton::Fork => app.start_action(Action::Fork),
+        StatusButton::ProjectRename => app.start_action(Action::ProjectRename),
+        StatusButton::ProjectCopy => app.start_action(Action::ProjectCopy),
+        StatusButton::Refresh => {
+            let _ = app.reload();
+        }
+        StatusButton::Quit => app.status = String::from("Use q to quit"),
+    }
+}
+
 fn handle_status_click(x: u16, y: u16, app: &mut App) {
     let content_y = app.panes.status.y.saturating_add(1);
     let controls_y = content_y.saturating_add(2);
     if y == controls_y {
-        // Second status content row: pseudo-buttons.
-        if app.mode == Mode::Input {
-            // [Apply] [Cancel]
-            let rel_x = x.saturating_sub(app.panes.status.x.saturating_add(1));
-            if rel_x <= 6 {
-                let _ = app.submit_input();
-            } else if (8..=15).contains(&rel_x) {
-                app.cancel_input();
+        let mut cursor = 0u16;
+        let rel_x = x.saturating_sub(app.panes.status.x.saturating_add(1));
+        for button in status_buttons(app) {
+            let label = status_button_label(button);
+            let width = label.chars().count() as u16;
+            if rel_x >= cursor && rel_x < cursor.saturating_add(width) {
+                trigger_status_button(button, app);
+                break;
             }
-        } else {
-            // [Move] [Copy] [Fork] [Refresh] [Quit]
-            let rel_x = x.saturating_sub(app.panes.status.x.saturating_add(1));
-            if rel_x <= 5 {
-                app.start_action(Action::Move);
-            } else if (7..=12).contains(&rel_x) {
-                app.start_action(Action::Copy);
-            } else if (14..=19).contains(&rel_x) {
-                app.start_action(Action::Fork);
-            } else if (21..=29).contains(&rel_x) {
-                let _ = app.reload();
-            } else if (31..=36).contains(&rel_x) {
-                app.status = String::from("Use q to quit");
-            }
+            cursor = cursor.saturating_add(width + 1);
         }
     }
 
@@ -423,6 +482,11 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
         KeyCode::Char('/') => {
             app.search_focused = true;
         }
+        KeyCode::Char(' ') => {
+            if app.focus == Focus::Sessions {
+                app.toggle_current_session_selection();
+            }
+        }
         KeyCode::Tab => {
             if app.focus == Focus::Preview {
                 app.toggle_fold_focused_preview_turn();
@@ -462,9 +526,37 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
             }
         }
         KeyCode::Char('g') => app.reload()?,
-        KeyCode::Char('m') => app.start_action(Action::Move),
-        KeyCode::Char('c') => app.start_action(Action::Copy),
-        KeyCode::Char('f') => app.start_action(Action::Fork),
+        KeyCode::Char('m') => {
+            if app.focus == Focus::Projects {
+                app.start_action(Action::ProjectRename);
+            } else {
+                app.start_action(Action::Move);
+            }
+        }
+        KeyCode::Char('c') => {
+            if app.focus == Focus::Projects {
+                app.start_action(Action::ProjectCopy);
+            } else {
+                app.start_action(Action::Copy);
+            }
+        }
+        KeyCode::Char('f') => {
+            if app.focus == Focus::Projects {
+                app.status = String::from("Project scope supports rename/copy");
+            } else {
+                app.start_action(Action::Fork);
+            }
+        }
+        KeyCode::Char('r') => {
+            if app.focus == Focus::Projects {
+                app.start_action(Action::ProjectRename);
+            }
+        }
+        KeyCode::Char('y') => {
+            if app.focus == Focus::Projects {
+                app.start_action(Action::ProjectCopy);
+            }
+        }
         KeyCode::Char('v') => app.toggle_preview_mode(),
         KeyCode::Char('z') => app.toggle_fold_at_scroll(),
         KeyCode::Char('H') | KeyCode::Char('h') => app.resize_focused_pane(-2),
@@ -596,6 +688,8 @@ enum Action {
     Move,
     Copy,
     Fork,
+    ProjectRename,
+    ProjectCopy,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -655,6 +749,8 @@ struct App {
     projects: Vec<ProjectBucket>,
     project_idx: usize,
     session_idx: usize,
+    selected_sessions: HashSet<PathBuf>,
+    session_select_anchor: Option<usize>,
     focus: Focus,
     mode: Mode,
     pending_action: Option<Action>,
@@ -705,6 +801,8 @@ impl App {
             projects: Vec::new(),
             project_idx: 0,
             session_idx: 0,
+            selected_sessions: HashSet::new(),
+            session_select_anchor: None,
             focus: Focus::Projects,
             mode: Mode::Normal,
             pending_action: None,
@@ -743,6 +841,7 @@ impl App {
 
     fn reload(&mut self) -> Result<()> {
         self.all_projects = scan_sessions(&self.sessions_root)?;
+        self.prune_selected_sessions();
         self.apply_search_filter();
 
         if self.projects.is_empty() {
@@ -768,6 +867,15 @@ impl App {
         Ok(())
     }
 
+    fn prune_selected_sessions(&mut self) {
+        let valid = self
+            .all_projects
+            .iter()
+            .flat_map(|project| project.sessions.iter().map(|s| s.path.clone()))
+            .collect::<HashSet<_>>();
+        self.selected_sessions.retain(|p| valid.contains(p));
+    }
+
     fn next_focus(&mut self) {
         self.focus = match self.focus {
             Focus::Projects => Focus::Sessions,
@@ -791,6 +899,7 @@ impl App {
                     self.project_idx -= 1;
                 }
                 self.clamp_session_idx();
+                self.session_select_anchor = None;
                 self.preview_scroll = 0;
                 self.ensure_selection_visible();
             }
@@ -818,6 +927,7 @@ impl App {
                     self.project_idx += 1;
                 }
                 self.clamp_session_idx();
+                self.session_select_anchor = None;
                 self.preview_scroll = 0;
                 self.ensure_selection_visible();
             }
@@ -1331,9 +1441,92 @@ impl App {
             .and_then(|project| project.sessions.get(self.session_idx))
     }
 
-    fn start_action(&mut self, action: Action) {
-        if self.current_session().is_none() {
+    fn selected_sessions_in_current_project(&self) -> Vec<SessionSummary> {
+        let Some(project) = self.current_project() else {
+            return Vec::new();
+        };
+        project
+            .sessions
+            .iter()
+            .filter(|s| self.selected_sessions.contains(&s.path))
+            .cloned()
+            .collect()
+    }
+
+    fn selected_count_current_project(&self) -> usize {
+        self.selected_sessions_in_current_project().len()
+    }
+
+    fn toggle_current_session_selection(&mut self) {
+        let Some(session) = self.current_session().cloned() else {
             self.status = String::from("No session selected");
+            return;
+        };
+        if self.selected_sessions.contains(&session.path) {
+            self.selected_sessions.remove(&session.path);
+        } else {
+            self.selected_sessions.insert(session.path.clone());
+        }
+        self.session_select_anchor = Some(self.session_idx);
+        self.status = format!(
+            "Selected {} session(s)",
+            self.selected_count_current_project()
+        );
+    }
+
+    fn select_session_range_to(&mut self, idx: usize) {
+        let Some(project) = self.current_project() else {
+            return;
+        };
+        if project.sessions.is_empty() {
+            return;
+        }
+        let end = idx.min(project.sessions.len().saturating_sub(1));
+        let anchor = self
+            .session_select_anchor
+            .unwrap_or(self.session_idx)
+            .min(project.sessions.len().saturating_sub(1));
+        let lo = anchor.min(end);
+        let hi = anchor.max(end);
+        let paths = project.sessions[lo..=hi]
+            .iter()
+            .map(|s| s.path.clone())
+            .collect::<Vec<_>>();
+        self.session_idx = end;
+        self.session_select_anchor = Some(anchor);
+        for path in paths {
+            self.selected_sessions.insert(path);
+        }
+        self.status = format!(
+            "Selected {} session(s)",
+            self.selected_count_current_project()
+        );
+    }
+
+    fn action_targets(&self, action: Action) -> Vec<SessionSummary> {
+        match action {
+            Action::ProjectRename | Action::ProjectCopy => self
+                .current_project()
+                .map(|p| p.sessions.clone())
+                .unwrap_or_default(),
+            Action::Move | Action::Copy | Action::Fork => {
+                let selected = self.selected_sessions_in_current_project();
+                if !selected.is_empty() {
+                    selected
+                } else {
+                    self.current_session().cloned().into_iter().collect()
+                }
+            }
+        }
+    }
+
+    fn start_action(&mut self, action: Action) {
+        let targets = self.action_targets(action);
+        if targets.is_empty() {
+            self.status = match action {
+                Action::ProjectRename | Action::ProjectCopy => String::from("No project selected"),
+                _ => String::from("No session selected"),
+            };
             return;
         }
 
@@ -1344,9 +1537,26 @@ impl App {
         self.clear_input_completion_cycle();
         self.search_focused = false;
         self.status = match action {
-            Action::Move => String::from("Move: enter target project path and press Enter"),
-            Action::Copy => String::from("Copy: enter target project path and press Enter"),
-            Action::Fork => String::from("Fork: enter target project path and press Enter"),
+            Action::Move => format!(
+                "Move {} session(s): enter target project path and press Enter",
+                targets.len()
+            ),
+            Action::Copy => format!(
+                "Copy {} session(s): enter target project path and press Enter",
+                targets.len()
+            ),
+            Action::Fork => format!(
+                "Fork {} session(s): enter target project path and press Enter",
+                targets.len()
+            ),
+            Action::ProjectRename => format!(
+                "Rename folder sessions ({}) to target path and press Enter",
+                targets.len()
+            ),
+            Action::ProjectCopy => format!(
+                "Copy folder sessions ({}) to target path and press Enter",
+                targets.len()
+            ),
         };
     }
 
@@ -1371,27 +1581,38 @@ impl App {
             return Ok(());
         }
 
-        let session = self
-            .current_session()
-            .cloned()
-            .ok_or_else(|| anyhow!("no selected session"))?;
-
+        let targets = self.action_targets(action);
+        if targets.is_empty() {
+            self.status = String::from("No applicable sessions for this action");
+            return Ok(());
+        }
         let target_str = target.to_string_lossy().to_string();
+        let mut ok = 0usize;
+        let mut skipped = 0usize;
+        let mut failures = Vec::new();
 
-        match action {
-            Action::Move => {
-                rewrite_session_file(&session.path, &target_str, false)?;
-                self.status = format!("Moved {} -> {}", session.file_name, target_str);
-            }
-            Action::Copy => {
-                let new_path =
-                    duplicate_session_file(&self.sessions_root, &session, &target_str, false)?;
-                self.status = format!("Copied to {}", new_path.display());
-            }
-            Action::Fork => {
-                let new_path =
-                    duplicate_session_file(&self.sessions_root, &session, &target_str, true)?;
-                self.status = format!("Forked to {}", new_path.display());
+        for session in &targets {
+            let result = match action {
+                Action::Move | Action::ProjectRename => {
+                    if session.cwd == target_str {
+                        skipped += 1;
+                        Ok(())
+                    } else {
+                        rewrite_session_file(&session.path, &target_str, false)
+                    }
+                }
+                Action::Copy | Action::ProjectCopy => {
+                    duplicate_session_file(&self.sessions_root, session, &target_str, false)
+                        .map(|_| ())
+                }
+                Action::Fork => {
+                    duplicate_session_file(&self.sessions_root, session, &target_str, true)
+                        .map(|_| ())
+                }
+            };
+            match result {
+                Ok(()) => ok += 1,
+                Err(err) => failures.push(format!("{}: {}", session.file_name, err)),
             }
         }
 
@@ -1400,7 +1621,38 @@ impl App {
         self.input.clear();
         self.input_focused = false;
         self.clear_input_completion_cycle();
-        self.reload()?;
+
+        if ok > 0 || skipped > 0 {
+            self.reload()?;
+        }
+        self.selected_sessions.clear();
+        self.session_select_anchor = None;
+
+        let action_name = match action {
+            Action::Move => "moved",
+            Action::Copy => "copied",
+            Action::Fork => "forked",
+            Action::ProjectRename => "renamed",
+            Action::ProjectCopy => "copied",
+        };
+        self.status = if failures.is_empty() {
+            if skipped > 0 {
+                format!(
+                    "{action_name} {ok} session(s), skipped {skipped} unchanged -> {target_str}"
+                )
+            } else {
+                format!("{action_name} {ok} session(s) -> {target_str}")
+            }
+        } else {
+            let first = failures
+                .first()
+                .cloned()
+                .unwrap_or_else(|| String::from("unknown error"));
+            format!(
+                "{action_name} {ok} session(s), {} failed, skipped {skipped}. First error: {first}",
+                failures.len()
+            )
+        };
         Ok(())
     }
 
@@ -1515,7 +1767,7 @@ fn render_projects(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app:
     let list = List::new(items)
         .block(
             Block::default()
-                .title("Projects (cwd)")
+                .title("Projects (cwd) [m/r rename] [c/y copy]")
                 .borders(Borders::ALL)
                 .border_style(focus_style)
                 .style(Style::default().add_modifier(Modifier::DIM)),
@@ -1570,10 +1822,24 @@ fn render_sessions(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app:
     let items: Vec<ListItem> = sessions
         .iter()
         .map(|session| {
+            let selected = app.selected_sessions.contains(&session.path);
             let (line1, line2) = format_session_item_lines(session);
+            let mark = if selected { "[x]" } else { "[ ]" };
+            let line1_style = if selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let line2_style = if selected {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
             ListItem::new(vec![
-                Line::from(line1),
-                Line::from(Span::styled(line2, Style::default().fg(Color::DarkGray))),
+                Line::from(Span::styled(format!("{mark} {line1}"), line1_style)),
+                Line::from(Span::styled(format!("    {line2}"), line2_style)),
             ])
         })
         .collect();
@@ -1593,7 +1859,10 @@ fn render_sessions(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app:
     let list = List::new(items)
         .block(
             Block::default()
-                .title("Sessions")
+                .title(format!(
+                    "Sessions [{} selected] (Space toggle, Shift+click range)",
+                    app.selected_count_current_project()
+                ))
                 .borders(Borders::ALL)
                 .border_style(focus_style)
                 .style(Style::default()),
@@ -1887,6 +2156,33 @@ fn ansi_index_to_rgb(idx: u8) -> (u8, u8, u8) {
     (gray, gray, gray)
 }
 
+fn status_button_style(button: StatusButton) -> Style {
+    match button {
+        StatusButton::Apply
+        | StatusButton::Move
+        | StatusButton::Copy
+        | StatusButton::Fork
+        | StatusButton::ProjectRename
+        | StatusButton::ProjectCopy => Style::default().fg(Color::Green),
+        StatusButton::Cancel | StatusButton::Quit => Style::default().fg(Color::Red),
+        StatusButton::Refresh => Style::default().fg(Color::Yellow),
+    }
+}
+
+fn tab_match_status_style() -> Style {
+    if infer_dark_theme_from_env().unwrap_or(true) {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Rgb(220, 228, 242))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Rgb(34, 46, 64))
+            .add_modifier(Modifier::BOLD)
+    }
+}
+
 fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
     let key_line = if app.mode == Mode::Input {
         Line::from(vec![
@@ -1913,6 +2209,32 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" preview-select+copy  "),
             Span::styled("drag", Style::default().fg(Color::Cyan)),
             Span::raw(" splitter/scrollbar"),
+        ])
+    } else if app.focus == Focus::Projects && app.mode == Mode::Normal {
+        Line::from(vec![
+            Span::styled("j/k", Style::default().fg(Color::Cyan)),
+            Span::raw(" project nav  "),
+            Span::styled("m or r", Style::default().fg(Color::Green)),
+            Span::raw(" rename folder sessions  "),
+            Span::styled("c or y", Style::default().fg(Color::Green)),
+            Span::raw(" copy folder sessions  "),
+            Span::styled("/", Style::default().fg(Color::Cyan)),
+            Span::raw(" search  "),
+            Span::styled("q", Style::default().fg(Color::Red)),
+            Span::raw(" quit"),
+        ])
+    } else if app.focus == Focus::Sessions && app.mode == Mode::Normal {
+        Line::from(vec![
+            Span::styled("j/k", Style::default().fg(Color::Cyan)),
+            Span::raw(" nav  "),
+            Span::styled("space", Style::default().fg(Color::Yellow)),
+            Span::raw(" toggle-select  "),
+            Span::styled("shift+click", Style::default().fg(Color::Yellow)),
+            Span::raw(" range-select  "),
+            Span::styled("m/c/f", Style::default().fg(Color::Green)),
+            Span::raw(" move/copy/fork selection  "),
+            Span::styled("/", Style::default().fg(Color::Cyan)),
+            Span::raw(" search"),
         ])
     } else {
         Line::from(vec![
@@ -1969,27 +2291,23 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
         Span::styled(pane_meta, Style::default().fg(Color::DarkGray)),
     ]);
 
-    let mut lines = if app.mode == Mode::Input {
-        vec![Line::from(vec![
-            Span::styled("[Apply]", Style::default().fg(Color::Green)),
-            Span::raw(" "),
-            Span::styled("[Cancel]", Style::default().fg(Color::Red)),
-            Span::raw("  (click buttons or press Enter/Esc)"),
-        ])]
+    let mut controls_spans = Vec::new();
+    let buttons = status_buttons(app);
+    for (idx, button) in buttons.iter().enumerate() {
+        controls_spans.push(Span::styled(
+            status_button_label(*button),
+            status_button_style(*button),
+        ));
+        if idx + 1 < buttons.len() {
+            controls_spans.push(Span::raw(" "));
+        }
+    }
+    controls_spans.push(Span::raw(if app.mode == Mode::Input {
+        "  (click buttons or press Enter/Esc)"
     } else {
-        vec![Line::from(vec![
-            Span::styled("[Move]", Style::default().fg(Color::Green)),
-            Span::raw(" "),
-            Span::styled("[Copy]", Style::default().fg(Color::Green)),
-            Span::raw(" "),
-            Span::styled("[Fork]", Style::default().fg(Color::Green)),
-            Span::raw(" "),
-            Span::styled("[Refresh]", Style::default().fg(Color::Yellow)),
-            Span::raw(" "),
-            Span::styled("[Quit]", Style::default().fg(Color::Red)),
-            Span::raw("  wheel scrolls panes"),
-        ])]
-    };
+        "  wheel scrolls panes"
+    }));
+    let mut lines = vec![Line::from(controls_spans)];
 
     lines.insert(0, meta_line);
     lines.insert(0, key_line);
@@ -1999,6 +2317,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Some(Action::Move) => "MOVE",
             Some(Action::Copy) => "COPY",
             Some(Action::Fork) => "FORK",
+            Some(Action::ProjectRename) => "RENAME FOLDER",
+            Some(Action::ProjectCopy) => "COPY FOLDER",
             None => "ACTION",
         };
 
@@ -2017,10 +2337,12 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             app.input,
         )));
         if !app.status.trim().is_empty() {
-            lines.push(Line::from(Span::styled(
-                app.status.clone(),
-                Style::default().fg(Color::DarkGray),
-            )));
+            let status_style = if app.status.starts_with("Matches:") {
+                tab_match_status_style()
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            lines.push(Line::from(Span::styled(app.status.clone(), status_style)));
         }
     } else {
         lines.push(Line::from(app.status.clone()));
@@ -3072,6 +3394,8 @@ mod tests {
             projects: Vec::new(),
             project_idx: 0,
             session_idx: 0,
+            selected_sessions: HashSet::new(),
+            session_select_anchor: None,
             focus: Focus::Projects,
             mode: Mode::Normal,
             pending_action: None,
@@ -3102,6 +3426,18 @@ mod tests {
             preview_folded: HashMap::new(),
             preview_header_rows: Vec::new(),
             preview_session_path: None,
+        }
+    }
+
+    fn sample_session(path: &str, cwd: &str, id: &str) -> SessionSummary {
+        SessionSummary {
+            path: PathBuf::from(path),
+            file_name: format!("{id}.jsonl"),
+            id: String::from(id),
+            cwd: String::from(cwd),
+            started_at: String::from("2026-01-01T00:00:00Z"),
+            event_count: 1,
+            search_blob: String::new(),
         }
     }
 
@@ -3193,6 +3529,84 @@ mod tests {
     }
 
     #[test]
+    fn toggle_current_session_selection_tracks_current_project() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/repo"),
+            sessions: vec![
+                sample_session("/tmp/a.jsonl", "/repo", "a"),
+                sample_session("/tmp/b.jsonl", "/repo", "b"),
+            ],
+        }];
+        app.focus = Focus::Sessions;
+        app.session_idx = 1;
+
+        app.toggle_current_session_selection();
+        assert_eq!(app.selected_count_current_project(), 1);
+        assert!(
+            app.selected_sessions
+                .contains(&PathBuf::from("/tmp/b.jsonl"))
+        );
+
+        app.toggle_current_session_selection();
+        assert_eq!(app.selected_count_current_project(), 0);
+    }
+
+    #[test]
+    fn select_session_range_adds_full_span() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/repo"),
+            sessions: vec![
+                sample_session("/tmp/a.jsonl", "/repo", "a"),
+                sample_session("/tmp/b.jsonl", "/repo", "b"),
+                sample_session("/tmp/c.jsonl", "/repo", "c"),
+            ],
+        }];
+        app.focus = Focus::Sessions;
+        app.session_idx = 0;
+        app.session_select_anchor = Some(0);
+
+        app.select_session_range_to(2);
+        assert_eq!(app.selected_count_current_project(), 3);
+        assert_eq!(app.session_idx, 2);
+    }
+
+    #[test]
+    fn action_targets_prefers_selected_sessions() {
+        let mut app = empty_test_app();
+        app.focus = Focus::Sessions;
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/repo"),
+            sessions: vec![
+                sample_session("/tmp/a.jsonl", "/repo", "a"),
+                sample_session("/tmp/b.jsonl", "/repo", "b"),
+            ],
+        }];
+        app.session_idx = 0;
+        app.selected_sessions.insert(PathBuf::from("/tmp/b.jsonl"));
+
+        let targets = app.action_targets(Action::Move);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].id, "b");
+    }
+
+    #[test]
+    fn project_actions_target_all_project_sessions() {
+        let mut app = empty_test_app();
+        app.focus = Focus::Projects;
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/repo"),
+            sessions: vec![
+                sample_session("/tmp/a.jsonl", "/repo", "a"),
+                sample_session("/tmp/b.jsonl", "/repo", "b"),
+            ],
+        }];
+        let targets = app.action_targets(Action::ProjectCopy);
+        assert_eq!(targets.len(), 2);
+    }
+
+    #[test]
     fn preview_selected_text_uses_character_bounds() {
         let app = App {
             sessions_root: PathBuf::from("/tmp"),
@@ -3200,6 +3614,8 @@ mod tests {
             projects: Vec::new(),
             project_idx: 0,
             session_idx: 0,
+            selected_sessions: HashSet::new(),
+            session_select_anchor: None,
             focus: Focus::Preview,
             mode: Mode::Normal,
             pending_action: None,
@@ -3519,6 +3935,8 @@ mod tests {
             projects: Vec::new(),
             project_idx: 0,
             session_idx: 0,
+            selected_sessions: HashSet::new(),
+            session_select_anchor: None,
             focus: Focus::Projects,
             mode: Mode::Normal,
             pending_action: None,
@@ -3564,6 +3982,8 @@ mod tests {
             projects: Vec::new(),
             project_idx: 0,
             session_idx: 0,
+            selected_sessions: HashSet::new(),
+            session_select_anchor: None,
             focus: Focus::Preview,
             mode: Mode::Normal,
             pending_action: None,

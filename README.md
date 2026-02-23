@@ -21,8 +21,11 @@ This tool exists to recover and remap those sessions safely.
   - `Move`: rewrite `cwd` in-place (backup + atomic write)
   - `Copy`: duplicate to a new session file with a new `cwd`
   - `Fork`: duplicate with new id/timestamp + new `cwd`
+  - Project-scope `Rename Folder`: rewrite `cwd` for all sessions in a project
+  - Project-scope `Copy Folder`: duplicate all sessions in a project to a new `cwd`
 - Foldable preview blocks with keyboard navigation.
 - Fuzzy search over session metadata/content.
+- Multi-select sessions (`Space` toggle, `Shift+click` range select).
 - Mouse QoL:
   - drag splitters to resize panes
   - drag scrollbars to jump/scrub
@@ -37,7 +40,11 @@ This tool exists to recover and remap those sessions safely.
 - `/`: open search
 - `v`: toggle preview mode (`chat` / `events`)
 - `h/l`: resize focused pane
-- `m/c/f`: move/copy/fork selected session
+- `Space` (Sessions pane): toggle session selection
+- `Shift+click` (Sessions pane): range select sessions
+- `m/c/f` (Sessions/Preview focus): move/copy/fork selected sessions (or current session)
+- `m` or `r` (Projects focus): rename folder sessions
+- `c` or `y` (Projects focus): copy folder sessions
 - `g`: refresh
 - `Esc`: cancel input
 - `q`: quit
