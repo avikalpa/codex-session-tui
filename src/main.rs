@@ -38,6 +38,12 @@ fn main() -> Result<()> {
 
 fn run_app(tui: &mut Tui, app: &mut App) -> Result<()> {
     loop {
+        // Debounce expensive search filtering: apply only when event queue is idle.
+        if app.search_dirty && !event::poll(Duration::from_millis(0))? {
+            app.apply_search_filter();
+            app.search_dirty = false;
+        }
+
         tui.draw(app)?;
 
         if !event::poll(Duration::from_millis(150))? {
@@ -232,11 +238,11 @@ fn handle_normal_mode(code: KeyCode, app: &mut App) -> Result<bool> {
             }
             KeyCode::Backspace => {
                 app.search_query.pop();
-                app.apply_search_filter();
+                app.search_dirty = true;
             }
             KeyCode::Char(ch) => {
                 app.search_query.push(ch);
-                app.apply_search_filter();
+                app.search_dirty = true;
             }
             _ => {}
         }
@@ -424,6 +430,7 @@ struct App {
     input_focused: bool,
     search_query: String,
     search_focused: bool,
+    search_dirty: bool,
     preview_mode: PreviewMode,
     drag_target: Option<DragTarget>,
     status: String,
@@ -453,6 +460,7 @@ impl App {
             input_focused: false,
             search_query: String::new(),
             search_focused: false,
+            search_dirty: false,
             preview_mode: PreviewMode::Chat,
             drag_target: None,
             status: String::from("Press q to quit, g to refresh"),
@@ -604,6 +612,7 @@ impl App {
             self.project_scroll = 0;
             self.session_scroll = 0;
             self.preview_scroll = 0;
+            self.search_dirty = false;
             return;
         }
 
@@ -655,6 +664,7 @@ impl App {
             self.search_query,
             self.projects.len()
         );
+        self.search_dirty = false;
     }
 
     fn toggle_preview_mode(&mut self) {
