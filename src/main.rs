@@ -695,8 +695,8 @@ impl App {
             scroll_drag: None,
             status: String::from("Press q to quit, g to refresh"),
             panes: PaneLayout::default(),
-            project_width_pct: 28,
-            session_width_pct: 38,
+            project_width_pct: 25,
+            session_width_pct: 37,
             project_scroll: 0,
             session_scroll: 0,
             preview_scroll: 0,
@@ -1627,7 +1627,7 @@ fn block_tone_style(tone: BlockTone) -> Style {
     // This avoids warm/darker shifts while still creating a distinct user block.
     let (bg, _) = terminal_bg_rgb().unwrap_or(((0, 0, 0), true));
     let accent = ansi_index_to_rgb(12); // BrightBlue from ANSI palette.
-    let accented = blend_rgb(bg, accent, 0.20);
+    let accented = blend_rgb(bg, accent, 0.16);
     let softened = blend_rgb(bg, accented, 0.55);
     Style::default().bg(Color::Rgb(softened.0, softened.1, softened.2))
 }
