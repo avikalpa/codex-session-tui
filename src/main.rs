@@ -10,8 +10,8 @@ use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
-    MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -61,52 +61,13 @@ fn run_app(tui: &mut Tui, app: &mut App) -> Result<()> {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                if app.mode == Mode::Normal && key.code == KeyCode::Char('M') {
-                    if app.mouse_capture_enabled {
-                        tui.set_mouse_capture(false)?;
-                        app.mouse_capture_enabled = false;
-                        app.selection_mode = false;
-                        app.preview_selection = None;
-                        app.scroll_drag = None;
-                        app.drag_target = None;
-                        app.status = String::from(
-                            "Mouse UI OFF: terminal copy/paste and right-click enabled",
-                        );
-                    } else {
-                        tui.set_mouse_capture(true)?;
-                        app.mouse_capture_enabled = true;
-                        app.status = String::from(
-                            "Mouse UI ON: pane drag, scrollbar drag, click actions enabled",
-                        );
-                    }
-                    continue;
-                }
-                if app.mode == Mode::Normal && key.code == KeyCode::Char('S') {
-                    if !app.mouse_capture_enabled {
-                        app.status = String::from("Enable mouse UI first with M, then press S");
-                        continue;
-                    }
-                    if app.selection_mode {
-                        app.selection_mode = false;
-                        app.preview_selection = None;
-                        app.scroll_drag = None;
-                        app.status = String::from("Selection mode OFF");
-                    } else {
-                        app.selection_mode = true;
-                        app.drag_target = None;
-                        app.status = String::from(
-                            "Selection mode ON: drag in preview to select; release to copy",
-                        );
-                    }
-                    continue;
-                }
                 match app.mode {
                     Mode::Normal => {
-                        if handle_normal_mode(key.code, app)? {
+                        if handle_normal_mode(key, app)? {
                             return Ok(());
                         }
                     }
-                    Mode::Input => handle_input_mode(key.code, app)?,
+                    Mode::Input => handle_input_mode(key, app)?,
                 }
             }
             Event::Mouse(mouse) => handle_mouse_event(mouse, app),
@@ -116,11 +77,6 @@ fn run_app(tui: &mut Tui, app: &mut App) -> Result<()> {
 }
 
 fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
-    if app.selection_mode {
-        handle_preview_selection_mouse(mouse, app);
-        return;
-    }
-
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(target) = scrollbar_target_at(mouse.column, mouse.row, app) {
@@ -192,11 +148,17 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
                 {
                     app.preview_focus_turn = Some(*turn_idx);
                 }
-                app.toggle_fold_by_row(row);
+                app.preview_mouse_down_row = Some(row);
+                app.preview_selecting = false;
+                app.preview_selection = Some((row, row));
             } else if point_in_rect(mouse.column, mouse.row, app.panes.status) {
                 app.search_focused = false;
                 handle_status_click(mouse.column, mouse.row, app);
             }
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            // Intentionally do nothing. Some terminals can still show context menus
+            // even with mouse reporting enabled depending on configuration.
         }
         MouseEventKind::Drag(MouseButton::Left) => {
             if let Some(target) = app.scroll_drag {
@@ -205,9 +167,50 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
             }
             if let Some(target) = app.drag_target {
                 app.resize_from_mouse(target, mouse.column);
+                return;
+            }
+            if let Some(start) = app.preview_mouse_down_row
+                && point_in_rect(mouse.column, mouse.row, app.panes.preview)
+            {
+                let row = app.preview_scroll + mouse_row_to_index(mouse.row, app.panes.preview);
+                let row = row.min(app.preview_content_len.saturating_sub(1));
+                app.preview_selection = Some((start, row));
+                app.preview_selecting = true;
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
+            if app.scroll_drag.is_some() || app.drag_target.is_some() {
+                app.scroll_drag = None;
+                app.drag_target = None;
+                return;
+            }
+            if let Some(start) = app.preview_mouse_down_row.take() {
+                let row = app.preview_scroll + mouse_row_to_index(mouse.row, app.panes.preview);
+                let row = row.min(app.preview_content_len.saturating_sub(1));
+                if app.preview_selecting {
+                    app.preview_selection = Some((start, row));
+                    if let Some((a, b)) = app.preview_selection {
+                        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+                        if let Some(text) = app.preview_selected_text(start, end) {
+                            if copy_to_clipboard_osc52(&text).is_ok() {
+                                app.status = format!(
+                                    "Copied {} preview lines to clipboard",
+                                    end - start + 1
+                                );
+                            } else {
+                                app.status =
+                                    String::from("Selection captured (clipboard copy failed)");
+                            }
+                        }
+                    }
+                } else if point_in_rect(mouse.column, mouse.row, app.panes.preview) {
+                    app.preview_selection = None;
+                    app.toggle_fold_by_row(row);
+                } else {
+                    app.preview_selection = None;
+                }
+            }
+            app.preview_selecting = false;
             app.scroll_drag = None;
             app.drag_target = None;
         }
@@ -234,49 +237,6 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
                 app.focus = Focus::Preview;
                 app.move_down();
             }
-        }
-        _ => {}
-    }
-}
-
-fn handle_preview_selection_mouse(mouse: MouseEvent, app: &mut App) {
-    match mouse.kind {
-        MouseEventKind::Down(MouseButton::Left) => {
-            if !point_in_rect(mouse.column, mouse.row, app.panes.preview) {
-                return;
-            }
-            app.focus = Focus::Preview;
-            let row = app.preview_scroll + mouse_row_to_index(mouse.row, app.panes.preview);
-            let row = row.min(app.preview_content_len.saturating_sub(1));
-            app.preview_selection = Some((row, row));
-        }
-        MouseEventKind::Drag(MouseButton::Left) => {
-            if let Some((start, _)) = app.preview_selection {
-                let row = app.preview_scroll + mouse_row_to_index(mouse.row, app.panes.preview);
-                let row = row.min(app.preview_content_len.saturating_sub(1));
-                app.preview_selection = Some((start, row));
-            }
-        }
-        MouseEventKind::Up(MouseButton::Left) => {
-            if let Some((a, b)) = app.preview_selection {
-                let (start, end) = if a <= b { (a, b) } else { (b, a) };
-                if let Some(text) = app.preview_selected_text(start, end) {
-                    if copy_to_clipboard_osc52(&text).is_ok() {
-                        app.status =
-                            format!("Copied {} preview lines to clipboard", end - start + 1);
-                    } else {
-                        app.status = String::from("Selection captured (clipboard copy failed)");
-                    }
-                }
-            }
-        }
-        MouseEventKind::ScrollUp => {
-            app.focus = Focus::Preview;
-            app.move_up();
-        }
-        MouseEventKind::ScrollDown => {
-            app.focus = Focus::Preview;
-            app.move_down();
         }
         _ => {}
     }
@@ -421,9 +381,10 @@ fn copy_to_clipboard_osc52(text: &str) -> Result<()> {
     Ok(())
 }
 
-fn handle_normal_mode(code: KeyCode, app: &mut App) -> Result<bool> {
+fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
+    let disallowed_mods = KeyModifiers::CONTROL | KeyModifiers::ALT;
     if app.search_focused {
-        match code {
+        match key.code {
             KeyCode::Esc => {
                 app.search_focused = false;
             }
@@ -435,15 +396,21 @@ fn handle_normal_mode(code: KeyCode, app: &mut App) -> Result<bool> {
                 app.search_dirty = true;
             }
             KeyCode::Char(ch) => {
-                app.search_query.push(ch);
-                app.search_dirty = true;
+                if !key.modifiers.intersects(disallowed_mods) {
+                    app.search_query.push(ch);
+                    app.search_dirty = true;
+                }
             }
             _ => {}
         }
         return Ok(false);
     }
 
-    match code {
+    if key.modifiers.intersects(disallowed_mods) {
+        return Ok(false);
+    }
+
+    match key.code {
         KeyCode::Char('q') => return Ok(true),
         KeyCode::Char('/') => {
             app.search_focused = true;
@@ -500,8 +467,9 @@ fn handle_normal_mode(code: KeyCode, app: &mut App) -> Result<bool> {
     Ok(false)
 }
 
-fn handle_input_mode(code: KeyCode, app: &mut App) -> Result<()> {
-    match code {
+fn handle_input_mode(key: KeyEvent, app: &mut App) -> Result<()> {
+    let disallowed_mods = KeyModifiers::CONTROL | KeyModifiers::ALT;
+    match key.code {
         KeyCode::Esc => app.cancel_input(),
         KeyCode::Enter => app.submit_input()?,
         KeyCode::Backspace => {
@@ -510,7 +478,7 @@ fn handle_input_mode(code: KeyCode, app: &mut App) -> Result<()> {
             }
         }
         KeyCode::Char(ch) => {
-            if app.input_focused {
+            if app.input_focused && !key.modifiers.intersects(disallowed_mods) {
                 app.input.push(ch);
             }
         }
@@ -529,6 +497,12 @@ impl Tui {
         enable_raw_mode().context("failed to enable raw mode")?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
+        // Match edit's conservative mouse tracking (1002 + SGR 1006) instead of
+        // crossterm's default capture set, which also enables 1003.
+        write!(stdout, "\x1b[?1002;1006h").context("failed to enable mouse reporting")?;
+        stdout
+            .flush()
+            .context("failed to flush mouse reporting setup")?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend).context("failed to create terminal")?;
         Ok(Self { terminal })
@@ -577,23 +551,14 @@ impl Tui {
 
     fn restore(&mut self) -> Result<()> {
         disable_raw_mode().context("failed to disable raw mode")?;
-        execute!(
-            self.terminal.backend_mut(),
-            DisableMouseCapture,
-            LeaveAlternateScreen
-        )
-        .context("failed to leave alternate screen")?;
-        Ok(())
-    }
-
-    fn set_mouse_capture(&mut self, enabled: bool) -> Result<()> {
-        if enabled {
-            execute!(self.terminal.backend_mut(), EnableMouseCapture)
-                .context("failed to enable mouse capture")?;
-        } else {
-            execute!(self.terminal.backend_mut(), DisableMouseCapture)
-                .context("failed to disable mouse capture")?;
-        }
+        write!(self.terminal.backend_mut(), "\x1b[?1006;1002l")
+            .context("failed to disable mouse reporting")?;
+        self.terminal
+            .backend_mut()
+            .flush()
+            .context("failed to flush mouse reporting disable")?;
+        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)
+            .context("failed to leave alternate screen")?;
         Ok(())
     }
 }
@@ -678,8 +643,8 @@ struct App {
     search_focused: bool,
     search_dirty: bool,
     preview_mode: PreviewMode,
-    mouse_capture_enabled: bool,
-    selection_mode: bool,
+    preview_selecting: bool,
+    preview_mouse_down_row: Option<usize>,
     drag_target: Option<DragTarget>,
     scroll_drag: Option<ScrollTarget>,
     status: String,
@@ -726,8 +691,8 @@ impl App {
             search_focused: false,
             search_dirty: false,
             preview_mode: PreviewMode::Chat,
-            mouse_capture_enabled: false,
-            selection_mode: false,
+            preview_selecting: false,
+            preview_mouse_down_row: None,
             drag_target: None,
             scroll_drag: None,
             status: String::from("Press q to quit, g to refresh"),
@@ -1756,12 +1721,10 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" toggle block  "),
             Span::styled("shift+tab", Style::default().fg(Color::Cyan)),
             Span::raw(" toggle all blocks  "),
-            Span::styled("S", Style::default().fg(Color::Cyan)),
-            Span::raw(" select-copy  "),
-            Span::styled("M", Style::default().fg(Color::Cyan)),
-            Span::raw(" mouse-ui on/off  "),
             Span::styled("drag", Style::default().fg(Color::Cyan)),
-            Span::raw(" pane/scrollbar"),
+            Span::raw(" preview-select+copy  "),
+            Span::styled("drag", Style::default().fg(Color::Cyan)),
+            Span::raw(" splitter/scrollbar"),
         ])
     } else {
         Line::from(vec![
@@ -1778,11 +1741,7 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::styled("h/l", Style::default().fg(Color::Cyan)),
             Span::raw(" resize-pane  "),
             Span::styled("drag", Style::default().fg(Color::Cyan)),
-            Span::raw(" splitter  "),
-            Span::styled("S", Style::default().fg(Color::Cyan)),
-            Span::raw(" select-copy  "),
-            Span::styled("M", Style::default().fg(Color::Cyan)),
-            Span::raw(" mouse-ui on/off  "),
+            Span::raw(" splitter  preview-select "),
             Span::styled("m/c/f", Style::default().fg(Color::Green)),
             Span::raw(" move/copy/fork  "),
             Span::styled("g", Style::default().fg(Color::Yellow)),
@@ -1810,9 +1769,7 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
         app.session_width_pct,
         app.preview_width_pct(),
         preview_mode,
-        if !app.mouse_capture_enabled {
-            "off"
-        } else if app.selection_mode {
+        if app.preview_selecting {
             "select"
         } else {
             "ui"
@@ -3208,8 +3165,8 @@ mod tests {
             search_focused: true,
             search_dirty: true,
             preview_mode: PreviewMode::Chat,
-            mouse_capture_enabled: false,
-            selection_mode: false,
+            preview_selecting: false,
+            preview_mouse_down_row: None,
             drag_target: None,
             scroll_drag: None,
             status: String::new(),
@@ -3251,8 +3208,8 @@ mod tests {
             search_focused: false,
             search_dirty: false,
             preview_mode: PreviewMode::Chat,
-            mouse_capture_enabled: false,
-            selection_mode: false,
+            preview_selecting: false,
+            preview_mouse_down_row: None,
             drag_target: None,
             scroll_drag: None,
             status: String::new(),
