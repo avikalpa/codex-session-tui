@@ -18,8 +18,10 @@ This project exists to make those sessions visible and editable so you can:
 - Reads JSONL session files and groups them by recorded `cwd`.
 - Provides a 3-pane, keyboard-first TUI:
   - left: project paths (`cwd`) and counts
-  - center: sessions for selected project
-  - right: parsed chat transcript preview (user/assistant turns)
+  - center: sessions in a pretty 2-line layout (timestamp/events + id/file)
+  - right: parsed chat transcript preview (user/assistant turns) with wrapping/reflow
+- Uses terminal-adaptive styling (no hardcoded pane backgrounds) for better theme compatibility.
+- Shows thin scrollbars in project, session, and preview panes when content exceeds viewport.
 - Supports actions on selected session:
   - `m` Move: rewrite `cwd` fields in-place (creates backup first)
   - `c` Copy: duplicate session file to current date bucket with new target `cwd`
@@ -42,6 +44,7 @@ This project exists to make those sessions visible and editable so you can:
 Mouse:
 - left click: select project/session, focus preview
 - wheel: scroll selection in lists or scroll chat preview
+- drag pane splitters: resize pane widths interactively
 - status buttons: click `Move/Copy/Fork/Refresh`; in input mode click `Apply/Cancel`
 
 ## Build and run

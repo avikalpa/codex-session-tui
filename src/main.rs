@@ -20,7 +20,10 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Wrap,
+};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -115,7 +118,8 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
                 }
                 app.focus = Focus::Sessions;
                 let len = app.current_project().map(|p| p.sessions.len()).unwrap_or(0);
-                let idx = app.session_scroll + mouse_row_to_index(mouse.row, app.panes.sessions);
+                let idx =
+                    app.session_scroll + (mouse_row_to_index(mouse.row, app.panes.sessions) / 2);
                 if idx < len {
                     app.session_idx = idx;
                     app.preview_scroll = 0;
@@ -440,6 +444,14 @@ struct App {
     project_scroll: usize,
     session_scroll: usize,
     preview_scroll: usize,
+    preview_cache: HashMap<PathBuf, CachedPreviewSource>,
+}
+
+#[derive(Clone)]
+struct CachedPreviewSource {
+    mtime: SystemTime,
+    turns: Vec<ChatTurn>,
+    events: Vec<String>,
 }
 
 impl App {
@@ -470,6 +482,7 @@ impl App {
             project_scroll: 0,
             session_scroll: 0,
             preview_scroll: 0,
+            preview_cache: HashMap::new(),
         };
 
         app.reload()?;
@@ -584,19 +597,20 @@ impl App {
         self.session_idx = self.session_idx.min(len.saturating_sub(1));
     }
 
-    fn visible_rows(pane_height: u16) -> usize {
-        pane_height.saturating_sub(2) as usize
+    fn visible_rows(pane_height: u16, item_height: usize) -> usize {
+        let rows = pane_height.saturating_sub(2) as usize;
+        (rows / item_height.max(1)).max(1)
     }
 
     fn ensure_selection_visible(&mut self) {
-        let project_visible = Self::visible_rows(self.panes.projects.height).max(1);
+        let project_visible = Self::visible_rows(self.panes.projects.height, 1);
         if self.project_idx < self.project_scroll {
             self.project_scroll = self.project_idx;
         } else if self.project_idx >= self.project_scroll + project_visible {
             self.project_scroll = self.project_idx + 1 - project_visible;
         }
 
-        let session_visible = Self::visible_rows(self.panes.sessions.height).max(1);
+        let session_visible = Self::visible_rows(self.panes.sessions.height, 2);
         if self.session_idx < self.session_scroll {
             self.session_scroll = self.session_idx;
         } else if self.session_idx >= self.session_scroll + session_visible {
@@ -772,6 +786,56 @@ impl App {
         }
     }
 
+    fn preview_for_session(
+        &mut self,
+        session: &SessionSummary,
+        mode: PreviewMode,
+        inner_width: usize,
+    ) -> Result<PreviewData> {
+        let meta = fs::metadata(&session.path)
+            .with_context(|| format!("failed metadata {}", session.path.display()))?;
+        let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+
+        let stale = self
+            .preview_cache
+            .get(&session.path)
+            .is_none_or(|cached| cached.mtime < mtime);
+
+        if stale {
+            let content = fs::read_to_string(&session.path)
+                .with_context(|| format!("failed to read {}", session.path.display()))?;
+            let turns = extract_chat_turns(&content);
+            let events = content
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| {
+                    serde_json::from_str::<Value>(line)
+                        .map(|v| summarize_event_line(&v))
+                        .unwrap_or_else(|_| String::from("<invalid event>"))
+                })
+                .collect::<Vec<_>>();
+            self.preview_cache.insert(
+                session.path.clone(),
+                CachedPreviewSource {
+                    mtime,
+                    turns,
+                    events,
+                },
+            );
+        }
+
+        let cached = self
+            .preview_cache
+            .get(&session.path)
+            .ok_or_else(|| anyhow!("preview cache missing"))?;
+        Ok(build_preview_from_cached(
+            session,
+            mode,
+            inner_width,
+            cached,
+        ))
+    }
+
     fn current_project(&self) -> Option<&ProjectBucket> {
         self.projects.get(self.project_idx)
     }
@@ -879,17 +943,24 @@ fn render_projects(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app:
             Block::default()
                 .title("Projects (cwd)")
                 .borders(Borders::ALL)
-                .border_style(focus_style),
+                .border_style(focus_style)
+                .style(Style::default().add_modifier(Modifier::DIM)),
         )
         .highlight_style(
             Style::default()
-                .bg(Color::Rgb(44, 54, 84))
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
         )
         .highlight_symbol(" > ");
 
     frame.render_stateful_widget(list, area, &mut state);
+    render_thin_scrollbar(
+        frame,
+        area,
+        app.project_scroll,
+        app.projects.len(),
+        App::visible_rows(area.height, 1),
+    );
 }
 
 fn render_search(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
@@ -925,11 +996,11 @@ fn render_sessions(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app:
     let items: Vec<ListItem> = sessions
         .iter()
         .map(|session| {
-            let label = format!(
-                "{} | {} events | {}",
-                session.started_at, session.event_count, session.file_name
-            );
-            ListItem::new(label)
+            let (line1, line2) = format_session_item_lines(session);
+            ListItem::new(vec![
+                Line::from(line1),
+                Line::from(Span::styled(line2, Style::default().fg(Color::DarkGray))),
+            ])
         })
         .collect();
 
@@ -950,23 +1021,37 @@ fn render_sessions(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app:
             Block::default()
                 .title("Sessions")
                 .borders(Borders::ALL)
-                .border_style(focus_style),
+                .border_style(focus_style)
+                .style(Style::default()),
         )
         .highlight_style(
             Style::default()
-                .bg(Color::Rgb(39, 62, 84))
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
         )
         .highlight_symbol(" > ");
 
     frame.render_stateful_widget(list, area, &mut state);
+    render_thin_scrollbar(
+        frame,
+        area,
+        app.session_scroll,
+        sessions.len(),
+        App::visible_rows(area.height, 2),
+    );
 }
 
-fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
-    let preview = if let Some(session) = app.current_session() {
+fn format_session_item_lines(session: &SessionSummary) -> (String, String) {
+    let line1 = format!("{} | {} events", session.started_at, session.event_count);
+    let short_id: String = session.id.chars().take(8).collect();
+    let line2 = format!("{} | {}", short_id, session.file_name);
+    (line1, line2)
+}
+
+fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut App) {
+    let preview = if let Some(session) = app.current_session().cloned() {
         let inner_width = area.width.saturating_sub(2) as usize;
-        match build_preview(session, app.preview_mode, inner_width) {
+        match app.preview_for_session(&session, app.preview_mode, inner_width) {
             Ok(preview) => preview,
             Err(err) => PreviewData {
                 lines: vec![Line::from(format!("Preview error: {err:#}"))],
@@ -1021,6 +1106,35 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
                 .add_modifier(Modifier::DIM | Modifier::REVERSED),
         );
     }
+
+    render_thin_scrollbar(
+        frame,
+        area,
+        app.preview_scroll,
+        preview.lines.len(),
+        area.height.saturating_sub(2) as usize,
+    );
+}
+
+fn render_thin_scrollbar(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    offset: usize,
+    content_len: usize,
+    viewport_len: usize,
+) {
+    if viewport_len == 0 || content_len <= viewport_len {
+        return;
+    }
+
+    let mut state = ScrollbarState::new(content_len).position(offset.min(content_len - 1));
+    let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .thumb_symbol("▐")
+        .track_symbol(Some("│"))
+        .begin_symbol(None)
+        .end_symbol(None)
+        .style(Style::default().fg(Color::DarkGray));
+    frame.render_stateful_widget(bar, area, &mut state);
 }
 
 fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
@@ -1118,6 +1232,7 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
     frame.render_widget(para, area);
 }
 
+#[cfg(test)]
 fn build_preview(
     session: &SessionSummary,
     mode: PreviewMode,
@@ -1125,7 +1240,35 @@ fn build_preview(
 ) -> Result<PreviewData> {
     let content = fs::read_to_string(&session.path)
         .with_context(|| format!("failed to read {}", session.path.display()))?;
+    let turns = extract_chat_turns(&content);
+    let events = content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str::<Value>(line)
+                .map(|v| summarize_event_line(&v))
+                .unwrap_or_else(|_| String::from("<invalid event>"))
+        })
+        .collect::<Vec<_>>();
+    let cached = CachedPreviewSource {
+        mtime: SystemTime::UNIX_EPOCH,
+        turns,
+        events,
+    };
+    Ok(build_preview_from_cached(
+        session,
+        mode,
+        inner_width,
+        &cached,
+    ))
+}
 
+fn build_preview_from_cached(
+    session: &SessionSummary,
+    mode: PreviewMode,
+    inner_width: usize,
+    cached: &CachedPreviewSource,
+) -> PreviewData {
     let mut lines = vec![
         Line::from(vec![
             Span::styled("Session ", Style::default().fg(Color::Cyan)),
@@ -1154,8 +1297,8 @@ fn build_preview(
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )));
-        append_event_preview(&mut lines, &content);
-        return Ok(PreviewData { lines, user_rows });
+        append_event_preview_from_lines(&mut lines, &cached.events);
+        return PreviewData { lines, user_rows };
     }
 
     lines.push(Line::from(Span::styled(
@@ -1165,73 +1308,61 @@ fn build_preview(
             .add_modifier(Modifier::BOLD),
     )));
 
-    let turns = extract_chat_turns(&content);
-    if turns.is_empty() {
+    if cached.turns.is_empty() {
         lines.push(Line::from(
             "No user/assistant chat messages found in this session.",
         ));
-        return Ok(PreviewData { lines, user_rows });
+        return PreviewData { lines, user_rows };
     }
 
     const MAX_TURNS: usize = 120;
-    let start = turns.len().saturating_sub(MAX_TURNS);
+    let start = cached.turns.len().saturating_sub(MAX_TURNS);
     if start > 0 {
         lines.push(Line::from(format!(
             "... showing last {} of {} turns ...",
             MAX_TURNS,
-            turns.len()
+            cached.turns.len()
         )));
         lines.push(Line::from(String::new()));
     }
 
-    for turn in turns.into_iter().skip(start) {
+    for turn in cached.turns.iter().skip(start) {
         let role_style = match turn.role.as_str() {
-            "user" => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            "user" => Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
             "assistant" => Style::default()
                 .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-            "developer" => Style::default()
-                .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),
             _ => Style::default()
                 .fg(Color::Gray)
                 .add_modifier(Modifier::BOLD),
         };
-        let display_role = if turn.role == "developer" {
-            String::from("USER")
-        } else {
-            turn.role.to_uppercase()
-        };
         lines.push(Line::from(vec![
-            Span::styled(format!(" {} ", display_role), role_style),
+            Span::styled(format!(" {} ", turn.role.to_uppercase()), role_style),
             Span::raw(" "),
-            Span::styled(turn.timestamp, Style::default().fg(Color::DarkGray)),
+            Span::styled(turn.timestamp.clone(), Style::default().fg(Color::DarkGray)),
         ]));
-        if turn.role == "user" || turn.role == "developer" {
+        if turn.role == "user" {
             user_rows.push(lines.len().saturating_sub(1));
         }
 
-        for body_line in turn.text.lines() {
-            lines.push(Line::from(format!("  {body_line}")));
-            if turn.role == "user" || turn.role == "developer" {
+        for wrapped in wrap_text_lines(&turn.text, inner_width.saturating_sub(2)) {
+            lines.push(Line::from(format!("  {wrapped}")));
+            if turn.role == "user" {
                 user_rows.push(lines.len().saturating_sub(1));
             }
         }
         lines.push(Line::from(String::new()));
-        if turn.role == "user" || turn.role == "developer" {
+        if turn.role == "user" {
             user_rows.push(lines.len().saturating_sub(1));
         }
     }
 
-    let _ = inner_width;
-    Ok(PreviewData { lines, user_rows })
+    PreviewData { lines, user_rows }
 }
 
-fn append_event_preview(lines: &mut Vec<Line<'static>>, content: &str) {
-    let all: Vec<&str> = content
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .collect();
+fn append_event_preview_from_lines(lines: &mut Vec<Line<'static>>, all: &[String]) {
     let start = all.len().saturating_sub(220);
     if start > 0 {
         lines.push(Line::from(format!(
@@ -1241,13 +1372,71 @@ fn append_event_preview(lines: &mut Vec<Line<'static>>, content: &str) {
         )));
         lines.push(Line::from(String::new()));
     }
-
-    for raw in all.into_iter().skip(start) {
-        let Ok(v) = serde_json::from_str::<Value>(raw) else {
-            continue;
-        };
-        lines.push(Line::from(summarize_event_line(&v)));
+    for entry in all.iter().skip(start) {
+        lines.push(Line::from(entry.clone()));
     }
+}
+
+fn wrap_text_lines(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let mut current = String::new();
+        for word in raw.split_whitespace() {
+            if current.is_empty() {
+                if word.chars().count() <= width {
+                    current.push_str(word);
+                } else {
+                    for chunk in chunk_by_width(word, width) {
+                        out.push(chunk);
+                    }
+                }
+                continue;
+            }
+            let next_len = current.chars().count() + 1 + word.chars().count();
+            if next_len <= width {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                out.push(current);
+                current = String::new();
+                if word.chars().count() <= width {
+                    current.push_str(word);
+                } else {
+                    for chunk in chunk_by_width(word, width) {
+                        out.push(chunk);
+                    }
+                }
+            }
+        }
+        if !current.is_empty() {
+            out.push(current);
+        } else if raw.trim().is_empty() {
+            out.push(String::new());
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+fn chunk_by_width(input: &str, width: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut buf = String::new();
+    for ch in input.chars() {
+        buf.push(ch);
+        if buf.chars().count() >= width {
+            chunks.push(buf);
+            buf = String::new();
+        }
+    }
+    if !buf.is_empty() {
+        chunks.push(buf);
+    }
+    chunks
 }
 
 fn summarize_event_line(v: &Value) -> String {
@@ -1811,6 +2000,32 @@ mod tests {
     }
 
     #[test]
+    fn wrap_text_lines_reflows_for_smaller_width() {
+        let text = "this is a long sentence for wrapping";
+        let wide = wrap_text_lines(text, 40);
+        let narrow = wrap_text_lines(text, 10);
+        assert_eq!(wide.len(), 1);
+        assert!(narrow.len() > 1);
+        assert!(narrow.iter().all(|line| line.chars().count() <= 10));
+    }
+
+    #[test]
+    fn session_item_lines_are_two_line_pretty_format() {
+        let s = SessionSummary {
+            path: PathBuf::from("/tmp/a.jsonl"),
+            file_name: String::from("rollout-a.jsonl"),
+            id: String::from("123456789abcdef"),
+            cwd: String::from("/tmp"),
+            started_at: String::from("2026-01-01T00:00:00Z"),
+            event_count: 42,
+            search_blob: String::new(),
+        };
+        let (a, b) = format_session_item_lines(&s);
+        assert!(a.contains("| 42 events"));
+        assert!(b.starts_with("12345678 | "));
+    }
+
+    #[test]
     fn build_preview_marks_only_user_rows() {
         let dir = std::env::temp_dir().join(format!("cse-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&dir).expect("mkdir");
@@ -1832,6 +2047,38 @@ mod tests {
         assert_eq!(preview.user_rows.len(), 6);
         assert!(!preview.user_rows.is_empty());
         assert!(preview.user_rows.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn build_preview_wraps_long_message_to_width() {
+        let dir = std::env::temp_dir().join(format!("cse-wrap-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("w.jsonl");
+        let data = [
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"x","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"alpha beta gamma delta epsilon zeta eta theta iota kappa"}]}}"#,
+        ]
+        .join("\n");
+        fs::write(&path, data).expect("write");
+        let s = SessionSummary {
+            path,
+            file_name: String::from("w.jsonl"),
+            id: String::from("x"),
+            cwd: String::from("/tmp"),
+            started_at: String::from("2026-01-01T00:00:00Z"),
+            event_count: 2,
+            search_blob: String::new(),
+        };
+        let preview = build_preview(&s, PreviewMode::Chat, 24).expect("preview");
+        let joined = preview
+            .lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("alpha beta gamma"));
+        assert!(joined.contains("kappa"));
+        assert!(preview.user_rows.len() >= 4);
     }
 
     #[test]
@@ -1887,6 +2134,7 @@ mod tests {
             project_scroll: 0,
             session_scroll: 0,
             preview_scroll: 0,
+            preview_cache: HashMap::new(),
         };
 
         app.apply_search_filter();
