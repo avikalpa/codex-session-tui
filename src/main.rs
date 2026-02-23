@@ -1149,6 +1149,7 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
     let inner_w = area.width.saturating_sub(2);
     let inner_h = area.height.saturating_sub(2) as usize;
     let scroll = app.preview_scroll;
+    let user_style = user_block_style();
 
     for row in preview.user_rows {
         if row < scroll || row >= scroll + inner_h {
@@ -1162,7 +1163,7 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
                 width: inner_w,
                 height: 1,
             },
-            Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
+            user_style,
         );
     }
 
@@ -1194,6 +1195,24 @@ fn render_thin_scrollbar(
         .end_symbol(None)
         .style(Style::default().fg(Color::DarkGray));
     frame.render_stateful_widget(bar, area, &mut state);
+}
+
+fn user_block_style() -> Style {
+    match infer_dark_theme_from_env() {
+        Some(true) => Style::default().bg(Color::Indexed(236)),
+        Some(false) => Style::default().bg(Color::Indexed(252)),
+        None => Style::default().bg(Color::Indexed(236)),
+    }
+}
+
+fn infer_dark_theme_from_env() -> Option<bool> {
+    let raw = env::var("COLORFGBG").ok()?;
+    let bg = parse_colorfgbg_bg_index(&raw)?;
+    Some(bg <= 6 || bg == 8)
+}
+
+fn parse_colorfgbg_bg_index(raw: &str) -> Option<u8> {
+    raw.split(';').next_back()?.trim().parse::<u8>().ok()
 }
 
 fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
@@ -1386,6 +1405,26 @@ fn build_preview_from_cached(
             header_rows,
         };
     }
+
+    let user_count = cached.turns.iter().filter(|t| t.role == "user").count();
+    let assistant_count = cached
+        .turns
+        .iter()
+        .filter(|t| t.role == "assistant")
+        .count();
+    lines.push(Line::from(format!(
+        "Turns: user={} assistant={} total={}",
+        user_count,
+        assistant_count,
+        cached.turns.len()
+    )));
+    if assistant_count == 0 {
+        lines.push(Line::from(Span::styled(
+            "Warning: no assistant messages detected in this session.",
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    lines.push(Line::from(String::new()));
 
     for (turn_idx, turn) in cached.turns.iter().enumerate() {
         let role_style = match turn.role.as_str() {
@@ -2082,6 +2121,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_colorfgbg_bg_index_works() {
+        assert_eq!(parse_colorfgbg_bg_index("15;0"), Some(0));
+        assert_eq!(parse_colorfgbg_bg_index("0;15"), Some(15));
+        assert_eq!(parse_colorfgbg_bg_index("bad"), None);
+    }
+
+    #[test]
     fn session_item_lines_are_two_line_pretty_format() {
         let s = SessionSummary {
             path: PathBuf::from("/tmp/a.jsonl"),
@@ -2211,6 +2257,44 @@ mod tests {
             .join("\n");
         assert!(all.contains("▶"));
         assert!(!all.contains("line one"));
+    }
+
+    #[test]
+    fn preview_includes_assistant_count_line() {
+        let cached = CachedPreviewSource {
+            mtime: SystemTime::UNIX_EPOCH,
+            turns: vec![
+                ChatTurn {
+                    role: String::from("user"),
+                    timestamp: String::from("t1"),
+                    text: String::from("u"),
+                },
+                ChatTurn {
+                    role: String::from("assistant"),
+                    timestamp: String::from("t2"),
+                    text: String::from("a"),
+                },
+            ],
+            events: Vec::new(),
+        };
+        let s = SessionSummary {
+            path: PathBuf::from("/tmp/c.jsonl"),
+            file_name: String::from("c.jsonl"),
+            id: String::from("x"),
+            cwd: String::from("/tmp"),
+            started_at: String::from("t0"),
+            event_count: 2,
+            search_blob: String::new(),
+        };
+        let preview =
+            build_preview_from_cached(&s, PreviewMode::Chat, 40, &cached, &HashSet::new());
+        let joined = preview
+            .lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("assistant=1"));
     }
 
     #[test]
