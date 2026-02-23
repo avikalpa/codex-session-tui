@@ -275,6 +275,7 @@ enum StatusButton {
     Move,
     Copy,
     Fork,
+    Delete,
     ProjectRename,
     ProjectCopy,
     Refresh,
@@ -300,6 +301,7 @@ fn status_buttons(app: &App) -> Vec<StatusButton> {
             StatusButton::Move,
             StatusButton::Copy,
             StatusButton::Fork,
+            StatusButton::Delete,
             StatusButton::Refresh,
             StatusButton::Quit,
         ];
@@ -308,6 +310,7 @@ fn status_buttons(app: &App) -> Vec<StatusButton> {
         StatusButton::Move,
         StatusButton::Copy,
         StatusButton::Fork,
+        StatusButton::Delete,
         StatusButton::Refresh,
         StatusButton::Quit,
     ]
@@ -322,6 +325,7 @@ fn status_button_label(button: StatusButton) -> &'static str {
         StatusButton::Move => "[Move]",
         StatusButton::Copy => "[Copy]",
         StatusButton::Fork => "[Fork]",
+        StatusButton::Delete => "[Delete]",
         StatusButton::ProjectRename => "[Rename Folder]",
         StatusButton::ProjectCopy => "[Copy Folder]",
         StatusButton::Refresh => "[Refresh]",
@@ -340,6 +344,7 @@ fn trigger_status_button(button: StatusButton, app: &mut App) {
         StatusButton::Move => app.start_action(Action::Move),
         StatusButton::Copy => app.start_action(Action::Copy),
         StatusButton::Fork => app.start_action(Action::Fork),
+        StatusButton::Delete => app.start_action(Action::Delete),
         StatusButton::ProjectRename => app.start_action(Action::ProjectRename),
         StatusButton::ProjectCopy => app.start_action(Action::ProjectCopy),
         StatusButton::Refresh => {
@@ -585,6 +590,11 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
                 app.start_action(Action::Fork);
             }
         }
+        KeyCode::Char('d') | KeyCode::Delete => {
+            if app.focus != Focus::Projects {
+                app.start_action(Action::Delete);
+            }
+        }
         KeyCode::Char('r') => {
             if app.focus == Focus::Projects {
                 app.start_action(Action::ProjectRename);
@@ -726,6 +736,7 @@ enum Action {
     Move,
     Copy,
     Fork,
+    Delete,
     ProjectRename,
     ProjectCopy,
 }
@@ -1566,7 +1577,7 @@ impl App {
                 .current_project()
                 .map(|p| p.sessions.clone())
                 .unwrap_or_default(),
-            Action::Move | Action::Copy | Action::Fork => {
+            Action::Move | Action::Copy | Action::Fork | Action::Delete => {
                 let selected = self.selected_sessions_in_current_project();
                 if !selected.is_empty() {
                     selected
@@ -1606,6 +1617,10 @@ impl App {
                 "Fork {} session(s): enter target project path and press Enter",
                 targets.len()
             ),
+            Action::Delete => format!(
+                "Delete {} session(s): type DELETE and press Enter",
+                targets.len()
+            ),
             Action::ProjectRename => format!(
                 "Rename folder sessions ({}) to target path and press Enter",
                 targets.len()
@@ -1632,18 +1647,25 @@ impl App {
             return Ok(());
         };
 
-        let target = expand_tilde(self.input.trim());
-        if target.as_os_str().is_empty() {
-            self.status = String::from("Target path is empty");
-            return Ok(());
-        }
-
         let targets = self.action_targets(action);
         if targets.is_empty() {
             self.status = String::from("No applicable sessions for this action");
             return Ok(());
         }
-        let target_str = target.to_string_lossy().to_string();
+        let target_str = if action == Action::Delete {
+            if !delete_confirmation_valid(&self.input) {
+                self.status = String::from("Delete cancelled: type DELETE to confirm");
+                return Ok(());
+            }
+            String::new()
+        } else {
+            let target = expand_tilde(self.input.trim());
+            if target.as_os_str().is_empty() {
+                self.status = String::from("Target path is empty");
+                return Ok(());
+            }
+            target.to_string_lossy().to_string()
+        };
         let mut ok = 0usize;
         let mut skipped = 0usize;
         let mut failures = Vec::new();
@@ -1666,6 +1688,7 @@ impl App {
                     duplicate_session_file(&self.sessions_root, session, &target_str, true)
                         .map(|_| ())
                 }
+                Action::Delete => delete_session_file(&session.path),
             };
             match result {
                 Ok(()) => ok += 1,
@@ -1689,11 +1712,14 @@ impl App {
             Action::Move => "moved",
             Action::Copy => "copied",
             Action::Fork => "forked",
+            Action::Delete => "deleted",
             Action::ProjectRename => "renamed",
             Action::ProjectCopy => "copied",
         };
         self.status = if failures.is_empty() {
-            if skipped > 0 {
+            if action == Action::Delete {
+                format!("{action_name} {ok} session(s)")
+            } else if skipped > 0 {
                 format!(
                     "{action_name} {ok} session(s), skipped {skipped} unchanged -> {target_str}"
                 )
@@ -2221,6 +2247,7 @@ fn status_button_style(button: StatusButton) -> Style {
         | StatusButton::Fork
         | StatusButton::ProjectRename
         | StatusButton::ProjectCopy => Style::default().fg(Color::Green),
+        StatusButton::Delete => Style::default().fg(Color::Red),
         StatusButton::SelectAll | StatusButton::Invert => Style::default().fg(Color::Yellow),
         StatusButton::Cancel | StatusButton::Quit => Style::default().fg(Color::Red),
         StatusButton::Refresh => Style::default().fg(Color::Yellow),
@@ -2293,8 +2320,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" select-all  "),
             Span::styled("i", Style::default().fg(Color::Yellow)),
             Span::raw(" invert  "),
-            Span::styled("m/c/f", Style::default().fg(Color::Green)),
-            Span::raw(" move/copy/fork selection  "),
+            Span::styled("m/c/f/d", Style::default().fg(Color::Green)),
+            Span::raw(" move/copy/fork/delete selection  "),
             Span::styled("/", Style::default().fg(Color::Cyan)),
             Span::raw(" search"),
         ])
@@ -2314,8 +2341,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" resize-pane  "),
             Span::styled("drag", Style::default().fg(Color::Cyan)),
             Span::raw(" splitter  preview-select "),
-            Span::styled("m/c/f", Style::default().fg(Color::Green)),
-            Span::raw(" move/copy/fork  "),
+            Span::styled("m/c/f/d", Style::default().fg(Color::Green)),
+            Span::raw(" move/copy/fork/delete  "),
             Span::styled("g", Style::default().fg(Color::Yellow)),
             Span::raw(" refresh  "),
             Span::styled("q", Style::default().fg(Color::Red)),
@@ -2379,6 +2406,7 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Some(Action::Move) => "MOVE",
             Some(Action::Copy) => "COPY",
             Some(Action::Fork) => "FORK",
+            Some(Action::Delete) => "DELETE",
             Some(Action::ProjectRename) => "RENAME FOLDER",
             Some(Action::ProjectCopy) => "COPY FOLDER",
             None => "ACTION",
@@ -3350,6 +3378,16 @@ fn rewrite_session_start_timestamp(value: &mut Value) {
     payload_obj.insert("timestamp".to_string(), Value::String(now));
 }
 
+fn delete_confirmation_valid(input: &str) -> bool {
+    input == "DELETE"
+}
+
+fn delete_session_file(path: &Path) -> Result<()> {
+    backup_file(path)?;
+    fs::remove_file(path).with_context(|| format!("failed deleting {}", path.display()))?;
+    Ok(())
+}
+
 fn backup_file(path: &Path) -> Result<()> {
     let ts = Utc::now().format("%Y%m%d%H%M%S");
     let backup = path.with_extension(format!("jsonl.bak.{ts}"));
@@ -3652,6 +3690,32 @@ mod tests {
         let targets = app.action_targets(Action::Move);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].id, "b");
+    }
+
+    #[test]
+    fn delete_targets_prefers_selected_sessions() {
+        let mut app = empty_test_app();
+        app.focus = Focus::Sessions;
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/repo"),
+            sessions: vec![
+                sample_session("/tmp/a.jsonl", "/repo", "a"),
+                sample_session("/tmp/b.jsonl", "/repo", "b"),
+            ],
+        }];
+        app.session_idx = 0;
+        app.selected_sessions.insert(PathBuf::from("/tmp/b.jsonl"));
+
+        let targets = app.action_targets(Action::Delete);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].id, "b");
+    }
+
+    #[test]
+    fn delete_confirmation_is_strict() {
+        assert!(delete_confirmation_valid("DELETE"));
+        assert!(!delete_confirmation_valid("delete"));
+        assert!(!delete_confirmation_valid(" DELETE "));
     }
 
     #[test]

@@ -21,6 +21,7 @@ This tool exists to recover and remap those sessions safely.
   - `Move`: rewrite `cwd` in-place (backup + atomic write)
   - `Copy`: duplicate to a new session file with a new `cwd`
   - `Fork`: duplicate with new id/timestamp + new `cwd`
+  - `Delete`: backup then remove selected/current sessions (requires `DELETE` confirmation)
   - Project-scope `Rename Folder`: rewrite `cwd` for all sessions in a project
   - Project-scope `Copy Folder`: duplicate all sessions in a project to a new `cwd`
 - Foldable preview blocks with keyboard navigation.
@@ -44,7 +45,7 @@ This tool exists to recover and remap those sessions safely.
 - checkbox click (Sessions pane): toggle selection on that session
 - `a` (Sessions pane): select all sessions in current project
 - `i` (Sessions pane): invert selection in current project
-- `m/c/f` (Sessions/Preview focus): move/copy/fork selected sessions (or current session)
+- `m/c/f/d` (Sessions/Preview focus): move/copy/fork/delete selected sessions (or current session)
 - `m` or `r` (Projects focus): rename folder sessions
 - `c` or `y` (Projects focus): copy folder sessions
 - `g`: refresh
