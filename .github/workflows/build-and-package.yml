@@ -105,9 +105,13 @@ jobs:
           npm pack
 
       - name: Publish to npm
-        if: github.event_name == 'release' && secrets.NPM_TOKEN != ''
+        if: github.event_name == 'release'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           cd npm
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "NPM_TOKEN is not set; skipping npm publish."
+            exit 0
+          fi
           npm publish --access public
