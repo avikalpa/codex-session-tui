@@ -130,8 +130,18 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
                 let idx =
                     app.session_scroll + (mouse_row_to_index(mouse.row, app.panes.sessions) / 2);
                 if idx < len {
-                    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
-                        app.select_session_range_to(idx);
+                    let checkbox_hit =
+                        is_sessions_checkbox_hit(mouse.column, mouse.row, app.panes.sessions);
+                    if checkbox_hit {
+                        if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                            app.select_session_range_to(idx);
+                        } else if app.session_select_anchor.is_some_and(|a| a != idx) {
+                            // Terminal-safe range select fallback: click checkbox on another row.
+                            app.select_session_range_to(idx);
+                        } else {
+                            app.session_idx = idx;
+                            app.toggle_current_session_selection();
+                        }
                     } else {
                         app.session_idx = idx;
                         app.session_select_anchor = Some(idx);
@@ -438,6 +448,14 @@ fn mouse_row_to_index(y: u16, pane: ratatui::layout::Rect) -> usize {
 fn mouse_col_to_index(x: u16, pane: ratatui::layout::Rect) -> usize {
     // Exclude the left border.
     x.saturating_sub(pane.x.saturating_add(1)) as usize
+}
+
+fn is_sessions_checkbox_hit(x: u16, y: u16, pane: ratatui::layout::Rect) -> bool {
+    let row = mouse_row_to_index(y, pane);
+    let col = mouse_col_to_index(x, pane);
+    // Session items are 2 rows high. Checkbox is rendered on the first row and
+    // appears after list's highlight gutter, so allow a small left-column band.
+    row.is_multiple_of(2) && col <= 7
 }
 
 fn copy_to_clipboard_osc52(text: &str) -> Result<()> {
@@ -821,7 +839,7 @@ impl App {
             status: String::from("Press q to quit, g to refresh"),
             panes: PaneLayout::default(),
             project_width_pct: 20,
-            session_width_pct: 36,
+            session_width_pct: 38,
             project_scroll: 0,
             session_scroll: 0,
             preview_scroll: 0,
@@ -2231,6 +2249,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" toggle-select  "),
             Span::styled("shift+click", Style::default().fg(Color::Yellow)),
             Span::raw(" range-select  "),
+            Span::styled("checkbox click", Style::default().fg(Color::Yellow)),
+            Span::raw(" toggle/range  "),
             Span::styled("m/c/f", Style::default().fg(Color::Green)),
             Span::raw(" move/copy/fork selection  "),
             Span::styled("/", Style::default().fg(Color::Cyan)),
