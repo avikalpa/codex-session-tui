@@ -995,8 +995,7 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
         .border_style(focus_style);
     let para = Paragraph::new(preview.lines.clone())
         .block(block)
-        .scroll((app.preview_scroll as u16, 0))
-        .wrap(Wrap { trim: false });
+        .scroll((app.preview_scroll as u16, 0));
     frame.render_widget(para, area);
 
     let inner_x = area.x.saturating_add(1);
@@ -1017,7 +1016,9 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
                 width: inner_w,
                 height: 1,
             },
-            Style::default().add_modifier(Modifier::DIM | Modifier::REVERSED),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM | Modifier::REVERSED),
         );
     }
 }
@@ -1185,9 +1186,7 @@ fn build_preview(
 
     for turn in turns.into_iter().skip(start) {
         let role_style = match turn.role.as_str() {
-            "user" => Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+            "user" => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             "assistant" => Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
@@ -1779,4 +1778,119 @@ fn expand_tilde(input: &str) -> PathBuf {
     }
 
     PathBuf::from(input)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_chat_jsonl() -> String {
+        [
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"abc","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/x"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"world"}]}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"normalized user"}]}}"#,
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn extract_chat_turns_normalizes_developer_role() {
+        let turns = extract_chat_turns(&sample_chat_jsonl());
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[1].role, "assistant");
+        assert_eq!(turns[2].role, "user");
+    }
+
+    #[test]
+    fn fuzzy_score_prefers_compact_match() {
+        let a = fuzzy_score("abc", "a_b_c").unwrap_or(i64::MIN);
+        let b = fuzzy_score("abc", "alphabet-bucket-code").unwrap_or(i64::MIN);
+        assert!(a > b);
+    }
+
+    #[test]
+    fn build_preview_marks_only_user_rows() {
+        let dir = std::env::temp_dir().join(format!("cse-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("sample.jsonl");
+        fs::write(&path, sample_chat_jsonl()).expect("write");
+
+        let session = SessionSummary {
+            path: path.clone(),
+            file_name: String::from("sample.jsonl"),
+            id: String::from("abc"),
+            cwd: String::from("/tmp/x"),
+            started_at: String::from("2026-01-01T00:00:00Z"),
+            event_count: 4,
+            search_blob: String::from("hello world normalized user"),
+        };
+        let preview = build_preview(&session, PreviewMode::Chat, 80).expect("preview");
+
+        // USER blocks are header+body+separator, twice => 6 rows.
+        assert_eq!(preview.user_rows.len(), 6);
+        assert!(!preview.user_rows.is_empty());
+        assert!(preview.user_rows.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn apply_search_filter_reduces_to_matching_sessions() {
+        let s1 = SessionSummary {
+            path: PathBuf::from("/tmp/a.jsonl"),
+            file_name: String::from("a.jsonl"),
+            id: String::from("a"),
+            cwd: String::from("/repo/a"),
+            started_at: String::from("2026-01-01T00:00:00Z"),
+            event_count: 1,
+            search_blob: String::from("deploy fix alpha"),
+        };
+        let s2 = SessionSummary {
+            path: PathBuf::from("/tmp/b.jsonl"),
+            file_name: String::from("b.jsonl"),
+            id: String::from("b"),
+            cwd: String::from("/repo/b"),
+            started_at: String::from("2026-01-01T00:00:00Z"),
+            event_count: 1,
+            search_blob: String::from("unrelated text"),
+        };
+
+        let mut app = App {
+            sessions_root: PathBuf::from("/tmp"),
+            all_projects: vec![
+                ProjectBucket {
+                    cwd: String::from("/repo/a"),
+                    sessions: vec![s1],
+                },
+                ProjectBucket {
+                    cwd: String::from("/repo/b"),
+                    sessions: vec![s2],
+                },
+            ],
+            projects: Vec::new(),
+            project_idx: 0,
+            session_idx: 0,
+            focus: Focus::Projects,
+            mode: Mode::Normal,
+            pending_action: None,
+            input: String::new(),
+            input_focused: false,
+            search_query: String::from("alpha"),
+            search_focused: true,
+            search_dirty: true,
+            preview_mode: PreviewMode::Chat,
+            drag_target: None,
+            status: String::new(),
+            panes: PaneLayout::default(),
+            project_width_pct: 28,
+            session_width_pct: 38,
+            project_scroll: 0,
+            session_scroll: 0,
+            preview_scroll: 0,
+        };
+
+        app.apply_search_filter();
+        assert_eq!(app.projects.len(), 1);
+        assert_eq!(app.projects[0].cwd, "/repo/a");
+    }
 }
