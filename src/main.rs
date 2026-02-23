@@ -133,15 +133,8 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
                     let checkbox_hit =
                         is_sessions_checkbox_hit(mouse.column, mouse.row, app.panes.sessions);
                     if checkbox_hit {
-                        if mouse.modifiers.contains(KeyModifiers::SHIFT) {
-                            app.select_session_range_to(idx);
-                        } else if app.session_select_anchor.is_some_and(|a| a != idx) {
-                            // Terminal-safe range select fallback: click checkbox on another row.
-                            app.select_session_range_to(idx);
-                        } else {
-                            app.session_idx = idx;
-                            app.toggle_current_session_selection();
-                        }
+                        app.session_idx = idx;
+                        app.toggle_current_session_selection();
                     } else {
                         app.session_idx = idx;
                         app.session_select_anchor = Some(idx);
@@ -277,6 +270,8 @@ fn is_on_splitter(
 enum StatusButton {
     Apply,
     Cancel,
+    SelectAll,
+    Invert,
     Move,
     Copy,
     Fork,
@@ -298,6 +293,17 @@ fn status_buttons(app: &App) -> Vec<StatusButton> {
             StatusButton::Quit,
         ];
     }
+    if app.focus == Focus::Sessions {
+        return vec![
+            StatusButton::SelectAll,
+            StatusButton::Invert,
+            StatusButton::Move,
+            StatusButton::Copy,
+            StatusButton::Fork,
+            StatusButton::Refresh,
+            StatusButton::Quit,
+        ];
+    }
     vec![
         StatusButton::Move,
         StatusButton::Copy,
@@ -311,6 +317,8 @@ fn status_button_label(button: StatusButton) -> &'static str {
     match button {
         StatusButton::Apply => "[Apply]",
         StatusButton::Cancel => "[Cancel]",
+        StatusButton::SelectAll => "[Select All]",
+        StatusButton::Invert => "[Invert]",
         StatusButton::Move => "[Move]",
         StatusButton::Copy => "[Copy]",
         StatusButton::Fork => "[Fork]",
@@ -327,6 +335,8 @@ fn trigger_status_button(button: StatusButton, app: &mut App) {
             let _ = app.submit_input();
         }
         StatusButton::Cancel => app.cancel_input(),
+        StatusButton::SelectAll => app.select_all_sessions_current_project(),
+        StatusButton::Invert => app.invert_sessions_selection_current_project(),
         StatusButton::Move => app.start_action(Action::Move),
         StatusButton::Copy => app.start_action(Action::Copy),
         StatusButton::Fork => app.start_action(Action::Fork),
@@ -503,6 +513,16 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
         KeyCode::Char(' ') => {
             if app.focus == Focus::Sessions {
                 app.toggle_current_session_selection();
+            }
+        }
+        KeyCode::Char('a') => {
+            if app.focus == Focus::Sessions {
+                app.select_all_sessions_current_project();
+            }
+        }
+        KeyCode::Char('i') => {
+            if app.focus == Focus::Sessions {
+                app.invert_sessions_selection_current_project();
             }
         }
         KeyCode::Tab => {
@@ -1492,28 +1512,47 @@ impl App {
         );
     }
 
-    fn select_session_range_to(&mut self, idx: usize) {
+    fn select_all_sessions_current_project(&mut self) {
         let Some(project) = self.current_project() else {
             return;
         };
-        if project.sessions.is_empty() {
-            return;
-        }
-        let end = idx.min(project.sessions.len().saturating_sub(1));
-        let anchor = self
-            .session_select_anchor
-            .unwrap_or(self.session_idx)
-            .min(project.sessions.len().saturating_sub(1));
-        let lo = anchor.min(end);
-        let hi = anchor.max(end);
-        let paths = project.sessions[lo..=hi]
+        let paths = project
+            .sessions
             .iter()
             .map(|s| s.path.clone())
             .collect::<Vec<_>>();
-        self.session_idx = end;
-        self.session_select_anchor = Some(anchor);
+        let project_len = project.sessions.len();
         for path in paths {
             self.selected_sessions.insert(path);
+        }
+        if project_len > 0 {
+            self.session_select_anchor = Some(self.session_idx.min(project_len - 1));
+        }
+        self.status = format!(
+            "Selected {} session(s)",
+            self.selected_count_current_project()
+        );
+    }
+
+    fn invert_sessions_selection_current_project(&mut self) {
+        let Some(project) = self.current_project() else {
+            return;
+        };
+        let paths = project
+            .sessions
+            .iter()
+            .map(|s| s.path.clone())
+            .collect::<Vec<_>>();
+        let project_len = project.sessions.len();
+        for path in paths {
+            if self.selected_sessions.contains(&path) {
+                self.selected_sessions.remove(&path);
+            } else {
+                self.selected_sessions.insert(path);
+            }
+        }
+        if project_len > 0 {
+            self.session_select_anchor = Some(self.session_idx.min(project_len - 1));
         }
         self.status = format!(
             "Selected {} session(s)",
@@ -1878,7 +1917,7 @@ fn render_sessions(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app:
         .block(
             Block::default()
                 .title(format!(
-                    "Sessions [{} selected] (Space toggle, Shift+click range)",
+                    "Sessions [{} selected] (Space/checkbox toggle, a all, i invert)",
                     app.selected_count_current_project()
                 ))
                 .borders(Borders::ALL)
@@ -2182,6 +2221,7 @@ fn status_button_style(button: StatusButton) -> Style {
         | StatusButton::Fork
         | StatusButton::ProjectRename
         | StatusButton::ProjectCopy => Style::default().fg(Color::Green),
+        StatusButton::SelectAll | StatusButton::Invert => Style::default().fg(Color::Yellow),
         StatusButton::Cancel | StatusButton::Quit => Style::default().fg(Color::Red),
         StatusButton::Refresh => Style::default().fg(Color::Yellow),
     }
@@ -2247,10 +2287,12 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" nav  "),
             Span::styled("space", Style::default().fg(Color::Yellow)),
             Span::raw(" toggle-select  "),
-            Span::styled("shift+click", Style::default().fg(Color::Yellow)),
-            Span::raw(" range-select  "),
             Span::styled("checkbox click", Style::default().fg(Color::Yellow)),
-            Span::raw(" toggle/range  "),
+            Span::raw(" toggle  "),
+            Span::styled("a", Style::default().fg(Color::Yellow)),
+            Span::raw(" select-all  "),
+            Span::styled("i", Style::default().fg(Color::Yellow)),
+            Span::raw(" invert  "),
             Span::styled("m/c/f", Style::default().fg(Color::Green)),
             Span::raw(" move/copy/fork selection  "),
             Span::styled("/", Style::default().fg(Color::Cyan)),
@@ -3573,7 +3615,7 @@ mod tests {
     }
 
     #[test]
-    fn select_session_range_adds_full_span() {
+    fn select_all_and_invert_sessions_work() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
             cwd: String::from("/repo"),
@@ -3584,12 +3626,13 @@ mod tests {
             ],
         }];
         app.focus = Focus::Sessions;
-        app.session_idx = 0;
-        app.session_select_anchor = Some(0);
+        app.session_idx = 1;
 
-        app.select_session_range_to(2);
+        app.select_all_sessions_current_project();
         assert_eq!(app.selected_count_current_project(), 3);
-        assert_eq!(app.session_idx, 2);
+
+        app.invert_sessions_selection_current_project();
+        assert_eq!(app.selected_count_current_project(), 0);
     }
 
     #[test]

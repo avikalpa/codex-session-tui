@@ -25,7 +25,7 @@ This tool exists to recover and remap those sessions safely.
   - Project-scope `Copy Folder`: duplicate all sessions in a project to a new `cwd`
 - Foldable preview blocks with keyboard navigation.
 - Fuzzy search over session metadata/content.
-- Multi-select sessions (`Space` toggle, `Shift+click` range select).
+- Multi-select sessions (`Space` toggle, mouse checkbox click, select-all/invert).
 - Mouse QoL:
   - drag splitters to resize panes
   - drag scrollbars to jump/scrub
@@ -41,7 +41,9 @@ This tool exists to recover and remap those sessions safely.
 - `v`: toggle preview mode (`chat` / `events`)
 - `h/l`: resize focused pane
 - `Space` (Sessions pane): toggle session selection
-- `Shift+click` (Sessions pane): range select sessions
+- checkbox click (Sessions pane): toggle selection on that session
+- `a` (Sessions pane): select all sessions in current project
+- `i` (Sessions pane): invert selection in current project
 - `m/c/f` (Sessions/Preview focus): move/copy/fork selected sessions (or current session)
 - `m` or `r` (Projects focus): rename folder sessions
 - `c` or `y` (Projects focus): copy folder sessions
