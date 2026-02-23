@@ -1112,14 +1112,14 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
             Ok(preview) => preview,
             Err(err) => PreviewData {
                 lines: vec![Line::from(format!("Preview error: {err:#}"))],
-                user_rows: Vec::new(),
+                tone_rows: Vec::new(),
                 header_rows: Vec::new(),
             },
         }
     } else {
         PreviewData {
             lines: vec![Line::from("No session selected")],
-            user_rows: Vec::new(),
+            tone_rows: Vec::new(),
             header_rows: Vec::new(),
         }
     };
@@ -1149,9 +1149,7 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
     let inner_w = area.width.saturating_sub(2);
     let inner_h = area.height.saturating_sub(2) as usize;
     let scroll = app.preview_scroll;
-    let user_style = user_block_style();
-
-    for row in preview.user_rows {
+    for (row, tone) in preview.tone_rows {
         if row < scroll || row >= scroll + inner_h {
             continue;
         }
@@ -1163,7 +1161,7 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
                 width: inner_w,
                 height: 1,
             },
-            user_style,
+            block_tone_style(tone),
         );
     }
 
@@ -1197,12 +1195,13 @@ fn render_thin_scrollbar(
     frame.render_stateful_widget(bar, area, &mut state);
 }
 
-fn user_block_style() -> Style {
-    match infer_dark_theme_from_env() {
-        Some(true) => Style::default().bg(Color::Indexed(236)),
-        Some(false) => Style::default().bg(Color::Indexed(252)),
-        None => Style::default().bg(Color::Indexed(236)),
+fn block_tone_style(tone: BlockTone) -> Style {
+    if tone == BlockTone::Assistant {
+        return Style::default();
     }
+    let (bg, is_dark) = terminal_bg_rgb().unwrap_or(((0, 0, 0), true));
+    let transformed = transform_bg(bg, if is_dark { 0.30 } else { -0.30 });
+    Style::default().bg(Color::Rgb(transformed.0, transformed.1, transformed.2))
 }
 
 fn infer_dark_theme_from_env() -> Option<bool> {
@@ -1213,6 +1212,61 @@ fn infer_dark_theme_from_env() -> Option<bool> {
 
 fn parse_colorfgbg_bg_index(raw: &str) -> Option<u8> {
     raw.split(';').next_back()?.trim().parse::<u8>().ok()
+}
+
+fn terminal_bg_rgb() -> Option<((u8, u8, u8), bool)> {
+    let raw = env::var("COLORFGBG").ok()?;
+    let idx = parse_colorfgbg_bg_index(&raw)?;
+    let rgb = ansi_index_to_rgb(idx);
+    let dark = infer_dark_theme_from_env().unwrap_or(true);
+    Some((rgb, dark))
+}
+
+fn transform_bg(bg: (u8, u8, u8), delta: f32) -> (u8, u8, u8) {
+    let tweak = |c: u8| -> u8 {
+        let v = c as f32;
+        let out = if delta >= 0.0 {
+            v + (255.0 - v) * delta
+        } else {
+            v * (1.0 + delta)
+        };
+        out.clamp(0.0, 255.0) as u8
+    };
+    (tweak(bg.0), tweak(bg.1), tweak(bg.2))
+}
+
+fn ansi_index_to_rgb(idx: u8) -> (u8, u8, u8) {
+    const BASIC: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (205, 0, 0),
+        (0, 205, 0),
+        (205, 205, 0),
+        (0, 0, 238),
+        (205, 0, 205),
+        (0, 205, 205),
+        (229, 229, 229),
+        (127, 127, 127),
+        (255, 0, 0),
+        (0, 255, 0),
+        (255, 255, 0),
+        (92, 92, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 255),
+    ];
+    if idx < 16 {
+        return BASIC[idx as usize];
+    }
+    if (16..=231).contains(&idx) {
+        let i = idx - 16;
+        let r = i / 36;
+        let g = (i % 36) / 6;
+        let b = i % 6;
+        let step = [0, 95, 135, 175, 215, 255];
+        return (step[r as usize], step[g as usize], step[b as usize]);
+    }
+    let gray = 8 + (idx.saturating_sub(232)) * 10;
+    (gray, gray, gray)
 }
 
 fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
@@ -1370,7 +1424,7 @@ fn build_preview_from_cached(
         ]),
         Line::from(String::new()),
     ];
-    let mut user_rows = Vec::new();
+    let mut tone_rows = Vec::new();
     let mut header_rows = Vec::new();
 
     if mode == PreviewMode::Events {
@@ -1383,7 +1437,7 @@ fn build_preview_from_cached(
         append_event_preview_from_lines(&mut lines, &cached.events);
         return PreviewData {
             lines,
-            user_rows,
+            tone_rows,
             header_rows,
         };
     }
@@ -1401,7 +1455,7 @@ fn build_preview_from_cached(
         ));
         return PreviewData {
             lines,
-            user_rows,
+            tone_rows,
             header_rows,
         };
     }
@@ -1427,6 +1481,11 @@ fn build_preview_from_cached(
     lines.push(Line::from(String::new()));
 
     for (turn_idx, turn) in cached.turns.iter().enumerate() {
+        let tone = if turn.role == "user" {
+            BlockTone::User
+        } else {
+            BlockTone::Assistant
+        };
         let role_style = match turn.role.as_str() {
             "user" => Style::default()
                 .fg(Color::Cyan)
@@ -1440,6 +1499,8 @@ fn build_preview_from_cached(
         };
         let is_folded = folded.contains(&turn_idx);
         let marker = if is_folded { "▶" } else { "▼" };
+        lines.push(Line::from(String::new()));
+        tone_rows.push((lines.len().saturating_sub(1), tone));
         lines.push(Line::from(vec![
             Span::styled(format!("{marker} "), Style::default().fg(Color::DarkGray)),
             Span::styled(format!(" {} ", turn.role.to_uppercase()), role_style),
@@ -1447,27 +1508,21 @@ fn build_preview_from_cached(
             Span::styled(turn.timestamp.clone(), Style::default().fg(Color::DarkGray)),
         ]));
         header_rows.push((lines.len().saturating_sub(1), turn_idx));
-        if turn.role == "user" {
-            user_rows.push(lines.len().saturating_sub(1));
-        }
+        tone_rows.push((lines.len().saturating_sub(1), tone));
 
         if !is_folded {
-            for wrapped in wrap_text_lines(&turn.text, inner_width.saturating_sub(3)) {
+            for wrapped in render_markdown_lines(&turn.text, inner_width.saturating_sub(3)) {
                 lines.push(Line::from(format!("   {wrapped}")));
-                if turn.role == "user" {
-                    user_rows.push(lines.len().saturating_sub(1));
-                }
+                tone_rows.push((lines.len().saturating_sub(1), tone));
             }
         }
         lines.push(Line::from(String::new()));
-        if turn.role == "user" {
-            user_rows.push(lines.len().saturating_sub(1));
-        }
+        tone_rows.push((lines.len().saturating_sub(1), tone));
     }
 
     PreviewData {
         lines,
-        user_rows,
+        tone_rows,
         header_rows,
     }
 }
@@ -1533,6 +1588,92 @@ fn wrap_text_lines(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+fn render_markdown_lines(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    let mut out = Vec::new();
+    let mut in_code_block = false;
+    for raw in text.lines() {
+        let trimmed_start = raw.trim_start();
+        if trimmed_start.starts_with("```") {
+            in_code_block = !in_code_block;
+            out.push(raw.to_string());
+            continue;
+        }
+
+        if in_code_block {
+            if raw.is_empty() {
+                out.push(String::new());
+            } else {
+                out.extend(chunk_by_width(raw, width));
+            }
+            continue;
+        }
+
+        if raw.trim().is_empty() {
+            out.push(String::new());
+            continue;
+        }
+
+        let (prefix, body) = split_markdown_prefix(raw);
+        if body.trim().is_empty() {
+            out.push(prefix);
+            continue;
+        }
+        let wrapped = wrap_text_lines(body.trim(), width.saturating_sub(prefix.chars().count()));
+        for (idx, line) in wrapped.iter().enumerate() {
+            if idx == 0 {
+                out.push(format!("{prefix}{line}"));
+            } else {
+                out.push(format!("{}{}", " ".repeat(prefix.chars().count()), line));
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+fn split_markdown_prefix(raw: &str) -> (String, &str) {
+    let trimmed = raw.trim_start();
+    let indent_len = raw.len().saturating_sub(trimmed.len());
+    let indent = " ".repeat(indent_len);
+
+    if let Some(rest) = trimmed.strip_prefix("> ") {
+        return (format!("{indent}> "), rest);
+    }
+    if let Some(rest) = trimmed.strip_prefix("- ") {
+        return (format!("{indent}- "), rest);
+    }
+    if let Some(rest) = trimmed.strip_prefix("* ") {
+        return (format!("{indent}* "), rest);
+    }
+    if let Some(rest) = trimmed.strip_prefix("+ ") {
+        return (format!("{indent}+ "), rest);
+    }
+    if let Some((num, rest)) = split_ordered_list(trimmed) {
+        return (format!("{indent}{num}. "), rest);
+    }
+    if trimmed.starts_with('#') {
+        let hashes = trimmed.chars().take_while(|c| *c == '#').count();
+        let marker = &trimmed[..hashes];
+        let rest = trimmed[hashes..].trim_start();
+        return (format!("{indent}{marker} "), rest);
+    }
+    (indent, trimmed)
+}
+
+fn split_ordered_list(s: &str) -> Option<(&str, &str)> {
+    let dot = s.find('.')?;
+    if dot == 0 || !s[..dot].chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let rest = s[dot + 1..].strip_prefix(' ')?;
+    Some((&s[..dot], rest))
+}
+
 fn chunk_by_width(input: &str, width: usize) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut buf = String::new();
@@ -1579,8 +1720,14 @@ struct ChatTurn {
 #[derive(Clone)]
 struct PreviewData {
     lines: Vec<Line<'static>>,
-    user_rows: Vec<usize>,
+    tone_rows: Vec<(usize, BlockTone)>,
     header_rows: Vec<(usize, usize)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlockTone {
+    User,
+    Assistant,
 }
 
 fn extract_chat_turns(content: &str) -> Vec<ChatTurn> {
@@ -2144,7 +2291,7 @@ mod tests {
     }
 
     #[test]
-    fn build_preview_marks_only_user_rows() {
+    fn build_preview_marks_toned_rows() {
         let dir = std::env::temp_dir().join(format!("cse-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&dir).expect("mkdir");
         let path = dir.join("sample.jsonl");
@@ -2161,10 +2308,20 @@ mod tests {
         };
         let preview = build_preview(&session, PreviewMode::Chat, 80).expect("preview");
 
-        // USER blocks are header+body+separator, twice => 6 rows.
-        assert_eq!(preview.user_rows.len(), 6);
-        assert!(!preview.user_rows.is_empty());
-        assert!(preview.user_rows.windows(2).all(|w| w[0] < w[1]));
+        assert!(!preview.tone_rows.is_empty());
+        assert!(preview.tone_rows.windows(2).all(|w| w[0].0 < w[1].0));
+        let user_tone = preview
+            .tone_rows
+            .iter()
+            .filter(|(_, tone)| *tone == BlockTone::User)
+            .count();
+        let assistant_tone = preview
+            .tone_rows
+            .iter()
+            .filter(|(_, tone)| *tone == BlockTone::Assistant)
+            .count();
+        assert!(user_tone > 0);
+        assert!(assistant_tone > 0);
     }
 
     #[test]
@@ -2196,7 +2353,7 @@ mod tests {
             .join("\n");
         assert!(joined.contains("alpha beta gamma"));
         assert!(joined.contains("kappa"));
-        assert!(preview.user_rows.len() >= 4);
+        assert!(preview.tone_rows.len() >= 4);
     }
 
     #[test]
@@ -2295,6 +2452,17 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(joined.contains("assistant=1"));
+    }
+
+    #[test]
+    fn render_markdown_lines_preserves_code_fence_and_list_marker() {
+        let md = "## Header\n\n- one two three four five\n\n```rust\nlet a = 1;\n```";
+        let rendered = render_markdown_lines(md, 20);
+        let joined = rendered.join("\n");
+        assert!(joined.contains("## Header"));
+        assert!(joined.contains("- one two three"));
+        assert!(joined.contains("```rust"));
+        assert!(joined.contains("let a = 1;"));
     }
 
     #[test]
