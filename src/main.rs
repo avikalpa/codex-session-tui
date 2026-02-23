@@ -2,11 +2,12 @@ use std::collections::HashSet;
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
+use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
@@ -61,16 +62,15 @@ fn run_app(tui: &mut Tui, app: &mut App) -> Result<()> {
                 }
                 if app.mode == Mode::Normal && key.code == KeyCode::Char('S') {
                     if app.selection_mode {
-                        tui.set_mouse_capture(true)?;
                         app.selection_mode = false;
-                        app.status =
-                            String::from("Selection mode OFF: mouse interactions restored");
+                        app.preview_selection = None;
+                        app.scroll_drag = None;
+                        app.status = String::from("Selection mode OFF");
                     } else {
-                        tui.set_mouse_capture(false)?;
                         app.selection_mode = true;
                         app.drag_target = None;
                         app.status = String::from(
-                            "Selection mode ON: drag mouse to select/copy text (Shift+drag on some terminals)",
+                            "Selection mode ON: drag in preview to select; release to copy",
                         );
                     }
                     continue;
@@ -91,8 +91,18 @@ fn run_app(tui: &mut Tui, app: &mut App) -> Result<()> {
 }
 
 fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
+    if app.selection_mode {
+        handle_preview_selection_mouse(mouse, app);
+        return;
+    }
+
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(target) = scrollbar_target_at(mouse.column, mouse.row, app) {
+                app.scroll_drag = Some(target);
+                jump_to_scroll_from_mouse(target, mouse.row, app);
+                return;
+            }
             if is_on_splitter(
                 mouse.column,
                 mouse.row,
@@ -156,11 +166,16 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(target) = app.scroll_drag {
+                jump_to_scroll_from_mouse(target, mouse.row, app);
+                return;
+            }
             if let Some(target) = app.drag_target {
                 app.resize_from_mouse(target, mouse.column);
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
+            app.scroll_drag = None;
             app.drag_target = None;
         }
         MouseEventKind::ScrollUp => {
@@ -186,6 +201,49 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
                 app.focus = Focus::Preview;
                 app.move_down();
             }
+        }
+        _ => {}
+    }
+}
+
+fn handle_preview_selection_mouse(mouse: MouseEvent, app: &mut App) {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if !point_in_rect(mouse.column, mouse.row, app.panes.preview) {
+                return;
+            }
+            app.focus = Focus::Preview;
+            let row = app.preview_scroll + mouse_row_to_index(mouse.row, app.panes.preview);
+            let row = row.min(app.preview_content_len.saturating_sub(1));
+            app.preview_selection = Some((row, row));
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some((start, _)) = app.preview_selection {
+                let row = app.preview_scroll + mouse_row_to_index(mouse.row, app.panes.preview);
+                let row = row.min(app.preview_content_len.saturating_sub(1));
+                app.preview_selection = Some((start, row));
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if let Some((a, b)) = app.preview_selection {
+                let (start, end) = if a <= b { (a, b) } else { (b, a) };
+                if let Some(text) = app.preview_selected_text(start, end) {
+                    if copy_to_clipboard_osc52(&text).is_ok() {
+                        app.status =
+                            format!("Copied {} preview lines to clipboard", end - start + 1);
+                    } else {
+                        app.status = String::from("Selection captured (clipboard copy failed)");
+                    }
+                }
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            app.focus = Focus::Preview;
+            app.move_up();
+        }
+        MouseEventKind::ScrollDown => {
+            app.focus = Focus::Preview;
+            app.move_down();
         }
         _ => {}
     }
@@ -245,9 +303,89 @@ fn point_in_rect(x: u16, y: u16, rect: ratatui::layout::Rect) -> bool {
         && y < rect.y.saturating_add(rect.height)
 }
 
+fn scrollbar_target_at(x: u16, y: u16, app: &App) -> Option<ScrollTarget> {
+    if is_on_scrollbar(x, y, app.panes.projects) {
+        return Some(ScrollTarget::Projects);
+    }
+    if is_on_scrollbar(x, y, app.panes.sessions) {
+        return Some(ScrollTarget::Sessions);
+    }
+    if is_on_scrollbar(x, y, app.panes.preview) {
+        return Some(ScrollTarget::Preview);
+    }
+    None
+}
+
+fn is_on_scrollbar(x: u16, y: u16, pane: ratatui::layout::Rect) -> bool {
+    if pane.width < 2 || pane.height < 3 {
+        return false;
+    }
+    let bar_x = pane.x.saturating_add(pane.width.saturating_sub(1));
+    let y0 = pane.y.saturating_add(1);
+    let y1 = pane.y.saturating_add(pane.height.saturating_sub(1));
+    x == bar_x && y >= y0 && y < y1
+}
+
+fn scroll_offset_from_mouse_row(
+    y: u16,
+    pane: ratatui::layout::Rect,
+    content_len: usize,
+    viewport_len: usize,
+) -> usize {
+    if viewport_len == 0 || content_len <= viewport_len || pane.height <= 2 {
+        return 0;
+    }
+    let inner_h = pane.height.saturating_sub(2) as usize;
+    let rel = y.saturating_sub(pane.y.saturating_add(1)) as usize;
+    let rel = rel.min(inner_h.saturating_sub(1));
+    let max_off = content_len.saturating_sub(viewport_len);
+    if inner_h <= 1 {
+        return max_off;
+    }
+    ((rel as f32 / (inner_h.saturating_sub(1) as f32)) * max_off as f32).round() as usize
+}
+
+fn jump_to_scroll_from_mouse(target: ScrollTarget, y: u16, app: &mut App) {
+    match target {
+        ScrollTarget::Projects => {
+            let viewport = App::visible_rows(app.panes.projects.height, 1);
+            let off =
+                scroll_offset_from_mouse_row(y, app.panes.projects, app.projects.len(), viewport);
+            app.project_scroll = off;
+            app.focus = Focus::Projects;
+        }
+        ScrollTarget::Sessions => {
+            let len = app.current_project().map(|p| p.sessions.len()).unwrap_or(0);
+            let viewport = App::visible_rows(app.panes.sessions.height, 2);
+            let off = scroll_offset_from_mouse_row(y, app.panes.sessions, len, viewport);
+            app.session_scroll = off;
+            app.focus = Focus::Sessions;
+        }
+        ScrollTarget::Preview => {
+            let viewport = app.panes.preview.height.saturating_sub(2) as usize;
+            let off = scroll_offset_from_mouse_row(
+                y,
+                app.panes.preview,
+                app.preview_content_len,
+                viewport,
+            );
+            app.preview_scroll = off;
+            app.focus = Focus::Preview;
+        }
+    }
+}
+
 fn mouse_row_to_index(y: u16, pane: ratatui::layout::Rect) -> usize {
     // Exclude the top border/title row.
     y.saturating_sub(pane.y.saturating_add(1)) as usize
+}
+
+fn copy_to_clipboard_osc52(text: &str) -> Result<()> {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let mut out = io::stdout();
+    write!(out, "\x1b]52;c;{b64}\x07").context("failed OSC52 write")?;
+    out.flush().context("failed stdout flush")?;
+    Ok(())
 }
 
 fn handle_normal_mode(code: KeyCode, app: &mut App) -> Result<bool> {
@@ -381,17 +519,6 @@ impl Tui {
         .context("failed to leave alternate screen")?;
         Ok(())
     }
-
-    fn set_mouse_capture(&mut self, enabled: bool) -> Result<()> {
-        if enabled {
-            execute!(self.terminal.backend_mut(), EnableMouseCapture)
-                .context("failed to enable mouse capture")?;
-        } else {
-            execute!(self.terminal.backend_mut(), DisableMouseCapture)
-                .context("failed to disable mouse capture")?;
-        }
-        Ok(())
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -424,6 +551,13 @@ enum PreviewMode {
 enum DragTarget {
     LeftSplitter,
     RightSplitter,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScrollTarget {
+    Projects,
+    Sessions,
+    Preview,
 }
 
 #[derive(Clone)]
@@ -469,6 +603,7 @@ struct App {
     preview_mode: PreviewMode,
     selection_mode: bool,
     drag_target: Option<DragTarget>,
+    scroll_drag: Option<ScrollTarget>,
     status: String,
     panes: PaneLayout,
     project_width_pct: u16,
@@ -476,6 +611,9 @@ struct App {
     project_scroll: usize,
     session_scroll: usize,
     preview_scroll: usize,
+    preview_content_len: usize,
+    preview_selection: Option<(usize, usize)>,
+    preview_rendered_lines: Vec<String>,
     preview_cache: HashMap<PathBuf, CachedPreviewSource>,
     preview_folded: HashMap<PathBuf, HashSet<usize>>,
     preview_header_rows: Vec<(usize, usize)>,
@@ -511,6 +649,7 @@ impl App {
             preview_mode: PreviewMode::Chat,
             selection_mode: false,
             drag_target: None,
+            scroll_drag: None,
             status: String::from("Press q to quit, g to refresh"),
             panes: PaneLayout::default(),
             project_width_pct: 28,
@@ -518,6 +657,9 @@ impl App {
             project_scroll: 0,
             session_scroll: 0,
             preview_scroll: 0,
+            preview_content_len: 0,
+            preview_selection: None,
+            preview_rendered_lines: Vec::new(),
             preview_cache: HashMap::new(),
             preview_folded: HashMap::new(),
             preview_header_rows: Vec::new(),
@@ -922,6 +1064,15 @@ impl App {
         }
     }
 
+    fn preview_selected_text(&self, start: usize, end: usize) -> Option<String> {
+        if self.preview_rendered_lines.is_empty() || start > end {
+            return None;
+        }
+        let end = end.min(self.preview_rendered_lines.len().saturating_sub(1));
+        let start = start.min(end);
+        Some(self.preview_rendered_lines[start..=end].join("\n"))
+    }
+
     fn current_project(&self) -> Option<&ProjectBucket> {
         self.projects.get(self.project_idx)
     }
@@ -1152,6 +1303,11 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
             header_rows: Vec::new(),
         }
     };
+    app.preview_content_len = preview.lines.len();
+    app.preview_rendered_lines = preview.lines.iter().map(|l| l.to_string()).collect();
+    let viewport_len = area.height.saturating_sub(2) as usize;
+    let max_scroll = app.preview_content_len.saturating_sub(viewport_len);
+    app.preview_scroll = app.preview_scroll.min(max_scroll);
     app.preview_header_rows = preview.header_rows.clone();
     app.preview_session_path = app.current_session().map(|s| s.path.clone());
 
@@ -1193,13 +1349,31 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
             block_tone_style(tone),
         );
     }
+    if let Some((a, b)) = app.preview_selection {
+        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+        for row in start..=end {
+            if row < scroll || row >= scroll + inner_h {
+                continue;
+            }
+            let screen_y = inner_y + (row - scroll) as u16;
+            frame.buffer_mut().set_style(
+                ratatui::layout::Rect {
+                    x: inner_x,
+                    y: screen_y,
+                    width: inner_w,
+                    height: 1,
+                },
+                Style::default().add_modifier(Modifier::REVERSED),
+            );
+        }
+    }
 
     render_thin_scrollbar(
         frame,
         area,
         app.preview_scroll,
-        preview.lines.len(),
-        area.height.saturating_sub(2) as usize,
+        app.preview_content_len,
+        viewport_len,
     );
 }
 
@@ -1228,16 +1402,20 @@ fn block_tone_style(tone: BlockTone) -> Style {
     if tone == BlockTone::Assistant {
         return Style::default();
     }
-    let (bg, is_dark) = terminal_bg_rgb().unwrap_or(((0, 0, 0), true));
-    let transformed = transform_bg(bg, if is_dark { 0.30 } else { -0.30 });
-    let softened = blend_rgb(bg, transformed, 0.55);
+    let (bg, _) = terminal_bg_rgb().unwrap_or(((0, 0, 0), true));
+    // Always brighten for USER blocks and reduce saturation to avoid warm casts.
+    let lifted = transform_bg(bg, 0.30);
+    let neutral = desaturate_towards_gray(lifted, 0.35);
+    let softened = blend_rgb(bg, neutral, 0.45);
     Style::default().bg(Color::Rgb(softened.0, softened.1, softened.2))
 }
 
 fn infer_dark_theme_from_env() -> Option<bool> {
     let raw = env::var("COLORFGBG").ok()?;
-    let bg = parse_colorfgbg_bg_index(&raw)?;
-    Some(bg <= 6 || bg == 8)
+    let idx = parse_colorfgbg_bg_index(&raw)?;
+    let rgb = ansi_index_to_rgb(idx);
+    let luma = 0.2126 * rgb.0 as f32 + 0.7152 * rgb.1 as f32 + 0.0722 * rgb.2 as f32;
+    Some(luma < 140.0)
 }
 
 fn parse_colorfgbg_bg_index(raw: &str) -> Option<u8> {
@@ -1277,6 +1455,14 @@ fn blend_rgb(base: (u8, u8, u8), overlay: (u8, u8, u8), alpha: f32) -> (u8, u8, 
         mix(base.1, overlay.1),
         mix(base.2, overlay.2),
     )
+}
+
+fn desaturate_towards_gray(rgb: (u8, u8, u8), amount: f32) -> (u8, u8, u8) {
+    let a = amount.clamp(0.0, 1.0);
+    let gray = ((rgb.0 as f32 * 0.2126) + (rgb.1 as f32 * 0.7152) + (rgb.2 as f32 * 0.0722))
+        .round()
+        .clamp(0.0, 255.0) as u8;
+    blend_rgb(rgb, (gray, gray, gray), a)
 }
 
 fn ansi_index_to_rgb(idx: u8) -> (u8, u8, u8) {
@@ -2340,6 +2526,20 @@ mod tests {
     }
 
     #[test]
+    fn scroll_offset_from_mouse_maps_top_and_bottom() {
+        let pane = ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 12,
+        };
+        let top = scroll_offset_from_mouse_row(1, pane, 200, 10);
+        let bottom = scroll_offset_from_mouse_row(10, pane, 200, 10);
+        assert_eq!(top, 0);
+        assert!(bottom >= 185);
+    }
+
+    #[test]
     fn session_item_lines_are_two_line_pretty_format() {
         let s = SessionSummary {
             path: PathBuf::from("/tmp/a.jsonl"),
@@ -2618,6 +2818,7 @@ mod tests {
             preview_mode: PreviewMode::Chat,
             selection_mode: false,
             drag_target: None,
+            scroll_drag: None,
             status: String::new(),
             panes: PaneLayout::default(),
             project_width_pct: 28,
@@ -2625,6 +2826,9 @@ mod tests {
             project_scroll: 0,
             session_scroll: 0,
             preview_scroll: 0,
+            preview_content_len: 0,
+            preview_selection: None,
+            preview_rendered_lines: Vec::new(),
             preview_cache: HashMap::new(),
             preview_folded: HashMap::new(),
             preview_header_rows: Vec::new(),
