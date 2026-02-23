@@ -33,6 +33,7 @@ This project exists to make those sessions visible and editable so you can:
 - `j` / `k` or arrow keys: navigate
 - `/`: focus search bar (type to filter sessions by conversation/path/id)
 - `v`: toggle preview mode (`chat` / `events`)
+- `z`: toggle fold for the next visible preview block header
 - `H` / `L`: resize focused pane width
 - `m`: move selected session to a target path
 - `c`: copy selected session to a target path
@@ -43,6 +44,7 @@ This project exists to make those sessions visible and editable so you can:
 
 Mouse:
 - left click: select project/session, focus preview
+- left click on a preview block header: fold/unfold that block
 - wheel: scroll selection in lists or scroll chat preview
 - drag pane splitters: resize pane widths interactively
 - status buttons: click `Move/Copy/Fork/Refresh`; in input mode click `Apply/Cancel`

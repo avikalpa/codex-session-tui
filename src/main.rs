@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
@@ -131,6 +132,8 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
                     app.input_focused = false;
                 }
                 app.focus = Focus::Preview;
+                let row = app.preview_scroll + mouse_row_to_index(mouse.row, app.panes.preview);
+                app.toggle_fold_by_row(row);
             } else if point_in_rect(mouse.column, mouse.row, app.panes.status) {
                 app.search_focused = false;
                 handle_status_click(mouse.column, mouse.row, app);
@@ -267,6 +270,7 @@ fn handle_normal_mode(code: KeyCode, app: &mut App) -> Result<bool> {
         KeyCode::Char('c') => app.start_action(Action::Copy),
         KeyCode::Char('f') => app.start_action(Action::Fork),
         KeyCode::Char('v') => app.toggle_preview_mode(),
+        KeyCode::Char('z') => app.toggle_fold_at_scroll(),
         KeyCode::Char('H') | KeyCode::Char('h') => app.resize_focused_pane(-2),
         KeyCode::Char('L') | KeyCode::Char('l') => app.resize_focused_pane(2),
         _ => {}
@@ -445,6 +449,9 @@ struct App {
     session_scroll: usize,
     preview_scroll: usize,
     preview_cache: HashMap<PathBuf, CachedPreviewSource>,
+    preview_folded: HashMap<PathBuf, HashSet<usize>>,
+    preview_header_rows: Vec<(usize, usize)>,
+    preview_session_path: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -483,6 +490,9 @@ impl App {
             session_scroll: 0,
             preview_scroll: 0,
             preview_cache: HashMap::new(),
+            preview_folded: HashMap::new(),
+            preview_header_rows: Vec::new(),
+            preview_session_path: None,
         };
 
         app.reload()?;
@@ -828,12 +838,59 @@ impl App {
             .preview_cache
             .get(&session.path)
             .ok_or_else(|| anyhow!("preview cache missing"))?;
+        let folded = self
+            .preview_folded
+            .get(&session.path)
+            .cloned()
+            .unwrap_or_default();
         Ok(build_preview_from_cached(
             session,
             mode,
             inner_width,
             cached,
+            &folded,
         ))
+    }
+
+    fn toggle_fold_by_row(&mut self, row: usize) {
+        let Some(path) = self.preview_session_path.clone() else {
+            return;
+        };
+        let Some((_, turn_idx)) = self
+            .preview_header_rows
+            .iter()
+            .find(|(header_row, _)| *header_row == row)
+            .copied()
+        else {
+            return;
+        };
+
+        let entry = self.preview_folded.entry(path).or_default();
+        if entry.contains(&turn_idx) {
+            entry.remove(&turn_idx);
+        } else {
+            entry.insert(turn_idx);
+        }
+    }
+
+    fn toggle_fold_at_scroll(&mut self) {
+        if self.focus != Focus::Preview {
+            return;
+        }
+        let row = self.preview_scroll;
+        let target_row = self
+            .preview_header_rows
+            .iter()
+            .find(|(header_row, _)| *header_row >= row)
+            .map(|(header_row, _)| *header_row)
+            .or_else(|| {
+                self.preview_header_rows
+                    .last()
+                    .map(|(header_row, _)| *header_row)
+            });
+        if let Some(r) = target_row {
+            self.toggle_fold_by_row(r);
+        }
     }
 
     fn current_project(&self) -> Option<&ProjectBucket> {
@@ -1056,14 +1113,18 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
             Err(err) => PreviewData {
                 lines: vec![Line::from(format!("Preview error: {err:#}"))],
                 user_rows: Vec::new(),
+                header_rows: Vec::new(),
             },
         }
     } else {
         PreviewData {
             lines: vec![Line::from("No session selected")],
             user_rows: Vec::new(),
+            header_rows: Vec::new(),
         }
     };
+    app.preview_header_rows = preview.header_rows.clone();
+    app.preview_session_path = app.current_session().map(|s| s.path.clone());
 
     let focus_style = if app.focus == Focus::Preview && app.mode == Mode::Normal {
         Style::default().fg(Color::Yellow)
@@ -1101,9 +1162,7 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
                 width: inner_w,
                 height: 1,
             },
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM | Modifier::REVERSED),
+            Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
         );
     }
 
@@ -1147,6 +1206,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
         Span::raw(" search  "),
         Span::styled("v", Style::default().fg(Color::Cyan)),
         Span::raw(" preview-mode  "),
+        Span::styled("z", Style::default().fg(Color::Cyan)),
+        Span::raw(" fold  "),
         Span::styled("h/l", Style::default().fg(Color::Cyan)),
         Span::raw(" resize-pane  "),
         Span::styled("drag", Style::default().fg(Color::Cyan)),
@@ -1260,6 +1321,7 @@ fn build_preview(
         mode,
         inner_width,
         &cached,
+        &HashSet::new(),
     ))
 }
 
@@ -1268,6 +1330,7 @@ fn build_preview_from_cached(
     mode: PreviewMode,
     inner_width: usize,
     cached: &CachedPreviewSource,
+    folded: &HashSet<usize>,
 ) -> PreviewData {
     let mut lines = vec![
         Line::from(vec![
@@ -1289,6 +1352,7 @@ fn build_preview_from_cached(
         Line::from(String::new()),
     ];
     let mut user_rows = Vec::new();
+    let mut header_rows = Vec::new();
 
     if mode == PreviewMode::Events {
         lines.push(Line::from(Span::styled(
@@ -1298,7 +1362,11 @@ fn build_preview_from_cached(
                 .add_modifier(Modifier::BOLD),
         )));
         append_event_preview_from_lines(&mut lines, &cached.events);
-        return PreviewData { lines, user_rows };
+        return PreviewData {
+            lines,
+            user_rows,
+            header_rows,
+        };
     }
 
     lines.push(Line::from(Span::styled(
@@ -1312,21 +1380,14 @@ fn build_preview_from_cached(
         lines.push(Line::from(
             "No user/assistant chat messages found in this session.",
         ));
-        return PreviewData { lines, user_rows };
+        return PreviewData {
+            lines,
+            user_rows,
+            header_rows,
+        };
     }
 
-    const MAX_TURNS: usize = 120;
-    let start = cached.turns.len().saturating_sub(MAX_TURNS);
-    if start > 0 {
-        lines.push(Line::from(format!(
-            "... showing last {} of {} turns ...",
-            MAX_TURNS,
-            cached.turns.len()
-        )));
-        lines.push(Line::from(String::new()));
-    }
-
-    for turn in cached.turns.iter().skip(start) {
+    for (turn_idx, turn) in cached.turns.iter().enumerate() {
         let role_style = match turn.role.as_str() {
             "user" => Style::default()
                 .fg(Color::Cyan)
@@ -1338,19 +1399,25 @@ fn build_preview_from_cached(
                 .fg(Color::Gray)
                 .add_modifier(Modifier::BOLD),
         };
+        let is_folded = folded.contains(&turn_idx);
+        let marker = if is_folded { "▶" } else { "▼" };
         lines.push(Line::from(vec![
+            Span::styled(format!("{marker} "), Style::default().fg(Color::DarkGray)),
             Span::styled(format!(" {} ", turn.role.to_uppercase()), role_style),
             Span::raw(" "),
             Span::styled(turn.timestamp.clone(), Style::default().fg(Color::DarkGray)),
         ]));
+        header_rows.push((lines.len().saturating_sub(1), turn_idx));
         if turn.role == "user" {
             user_rows.push(lines.len().saturating_sub(1));
         }
 
-        for wrapped in wrap_text_lines(&turn.text, inner_width.saturating_sub(2)) {
-            lines.push(Line::from(format!("  {wrapped}")));
-            if turn.role == "user" {
-                user_rows.push(lines.len().saturating_sub(1));
+        if !is_folded {
+            for wrapped in wrap_text_lines(&turn.text, inner_width.saturating_sub(3)) {
+                lines.push(Line::from(format!("   {wrapped}")));
+                if turn.role == "user" {
+                    user_rows.push(lines.len().saturating_sub(1));
+                }
             }
         }
         lines.push(Line::from(String::new()));
@@ -1359,7 +1426,11 @@ fn build_preview_from_cached(
         }
     }
 
-    PreviewData { lines, user_rows }
+    PreviewData {
+        lines,
+        user_rows,
+        header_rows,
+    }
 }
 
 fn append_event_preview_from_lines(lines: &mut Vec<Line<'static>>, all: &[String]) {
@@ -1470,6 +1541,7 @@ struct ChatTurn {
 struct PreviewData {
     lines: Vec<Line<'static>>,
     user_rows: Vec<usize>,
+    header_rows: Vec<(usize, usize)>,
 }
 
 fn extract_chat_turns(content: &str) -> Vec<ChatTurn> {
@@ -2082,6 +2154,66 @@ mod tests {
     }
 
     #[test]
+    fn build_preview_does_not_truncate_turns() {
+        let mut lines = Vec::new();
+        lines.push(r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"x","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}}"#.to_string());
+        for i in 0..140 {
+            lines.push(format!(
+                r#"{{"timestamp":"2026-01-01T00:00:{i:02}Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"turn {i}"}}]}}}}"#
+            ));
+        }
+        let content = lines.join("\n");
+        let dir = std::env::temp_dir().join(format!("cse-all-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("all.jsonl");
+        fs::write(&path, content).expect("write");
+        let s = SessionSummary {
+            path,
+            file_name: String::from("all.jsonl"),
+            id: String::from("x"),
+            cwd: String::from("/tmp"),
+            started_at: String::from("2026-01-01T00:00:00Z"),
+            event_count: 141,
+            search_blob: String::new(),
+        };
+        let preview = build_preview(&s, PreviewMode::Chat, 60).expect("preview");
+        assert_eq!(preview.header_rows.len(), 140);
+    }
+
+    #[test]
+    fn folded_turn_hides_body_lines() {
+        let cached = CachedPreviewSource {
+            mtime: SystemTime::UNIX_EPOCH,
+            turns: vec![ChatTurn {
+                role: String::from("user"),
+                timestamp: String::from("2026-01-01T00:00:00Z"),
+                text: String::from("line one line two"),
+            }],
+            events: Vec::new(),
+        };
+        let s = SessionSummary {
+            path: PathBuf::from("/tmp/fold.jsonl"),
+            file_name: String::from("fold.jsonl"),
+            id: String::from("x"),
+            cwd: String::from("/tmp"),
+            started_at: String::from("2026-01-01T00:00:00Z"),
+            event_count: 2,
+            search_blob: String::new(),
+        };
+        let mut folded = HashSet::new();
+        folded.insert(0usize);
+        let preview = build_preview_from_cached(&s, PreviewMode::Chat, 40, &cached, &folded);
+        let all = preview
+            .lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("▶"));
+        assert!(!all.contains("line one"));
+    }
+
+    #[test]
     fn apply_search_filter_reduces_to_matching_sessions() {
         let s1 = SessionSummary {
             path: PathBuf::from("/tmp/a.jsonl"),
@@ -2135,6 +2267,9 @@ mod tests {
             session_scroll: 0,
             preview_scroll: 0,
             preview_cache: HashMap::new(),
+            preview_folded: HashMap::new(),
+            preview_header_rows: Vec::new(),
+            preview_session_path: None,
         };
 
         app.apply_search_filter();
