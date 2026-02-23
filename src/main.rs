@@ -218,8 +218,8 @@ fn handle_normal_mode(code: KeyCode, app: &mut App) -> Result<bool> {
         KeyCode::Char('c') => app.start_action(Action::Copy),
         KeyCode::Char('f') => app.start_action(Action::Fork),
         KeyCode::Char('v') => app.toggle_preview_mode(),
-        KeyCode::Char('H') => app.resize_focused_pane(-2),
-        KeyCode::Char('L') => app.resize_focused_pane(2),
+        KeyCode::Char('H') | KeyCode::Char('h') => app.resize_focused_pane(-2),
+        KeyCode::Char('L') | KeyCode::Char('l') => app.resize_focused_pane(2),
         _ => {}
     }
 
@@ -855,14 +855,20 @@ fn render_sessions(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app:
 }
 
 fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
-    let text = if let Some(session) = app.current_session() {
+    let preview = if let Some(session) = app.current_session() {
         let inner_width = area.width.saturating_sub(2) as usize;
         match build_preview(session, app.preview_mode, inner_width) {
-            Ok(lines) => lines,
-            Err(err) => vec![Line::from(format!("Preview error: {err:#}"))],
+            Ok(preview) => preview,
+            Err(err) => PreviewData {
+                lines: vec![Line::from(format!("Preview error: {err:#}"))],
+                user_rows: Vec::new(),
+            },
         }
     } else {
-        vec![Line::from("No session selected")]
+        PreviewData {
+            lines: vec![Line::from("No session selected")],
+            user_rows: Vec::new(),
+        }
     };
 
     let focus_style = if app.focus == Focus::Preview && app.mode == Mode::Normal {
@@ -878,11 +884,33 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
         .title(format!("Preview ({mode_name})"))
         .borders(Borders::ALL)
         .border_style(focus_style);
-    let para = Paragraph::new(text)
+    let para = Paragraph::new(preview.lines.clone())
         .block(block)
         .scroll((app.preview_scroll as u16, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(para, area);
+
+    let inner_x = area.x.saturating_add(1);
+    let inner_y = area.y.saturating_add(1);
+    let inner_w = area.width.saturating_sub(2);
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let scroll = app.preview_scroll;
+
+    for row in preview.user_rows {
+        if row < scroll || row >= scroll + inner_h {
+            continue;
+        }
+        let screen_y = inner_y + (row - scroll) as u16;
+        frame.buffer_mut().set_style(
+            ratatui::layout::Rect {
+                x: inner_x,
+                y: screen_y,
+                width: inner_w,
+                height: 1,
+            },
+            Style::default().add_modifier(Modifier::REVERSED),
+        );
+    }
 }
 
 fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
@@ -895,7 +923,7 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
         Span::raw(" search  "),
         Span::styled("v", Style::default().fg(Color::Cyan)),
         Span::raw(" preview-mode  "),
-        Span::styled("H/L", Style::default().fg(Color::Cyan)),
+        Span::styled("h/l", Style::default().fg(Color::Cyan)),
         Span::raw(" resize-pane  "),
         Span::styled("m/c/f", Style::default().fg(Color::Green)),
         Span::raw(" move/copy/fork  "),
@@ -982,7 +1010,7 @@ fn build_preview(
     session: &SessionSummary,
     mode: PreviewMode,
     inner_width: usize,
-) -> Result<Vec<Line<'static>>> {
+) -> Result<PreviewData> {
     let content = fs::read_to_string(&session.path)
         .with_context(|| format!("failed to read {}", session.path.display()))?;
 
@@ -1005,6 +1033,7 @@ fn build_preview(
         ]),
         Line::from(String::new()),
     ];
+    let mut user_rows = Vec::new();
 
     if mode == PreviewMode::Events {
         lines.push(Line::from(Span::styled(
@@ -1014,7 +1043,7 @@ fn build_preview(
                 .add_modifier(Modifier::BOLD),
         )));
         append_event_preview(&mut lines, &content);
-        return Ok(lines);
+        return Ok(PreviewData { lines, user_rows });
     }
 
     lines.push(Line::from(Span::styled(
@@ -1029,7 +1058,7 @@ fn build_preview(
         lines.push(Line::from(
             "No user/assistant chat messages found in this session.",
         ));
-        return Ok(lines);
+        return Ok(PreviewData { lines, user_rows });
     }
 
     const MAX_TURNS: usize = 120;
@@ -1058,39 +1087,34 @@ fn build_preview(
                 .fg(Color::Gray)
                 .add_modifier(Modifier::BOLD),
         };
-        let body_style = if turn.role == "user" {
-            Style::default().add_modifier(Modifier::REVERSED)
+        let display_role = if turn.role == "developer" {
+            String::from("USER")
         } else {
-            Style::default()
+            turn.role.to_uppercase()
         };
-        let header = format!(" {}  {}", turn.role.to_uppercase(), turn.timestamp);
-        if turn.role == "user" {
-            lines.push(fill_row_with_style(&header, body_style, inner_width));
-        } else {
-            lines.push(Line::from(vec![
-                Span::styled(format!(" {} ", turn.role.to_uppercase()), role_style),
-                Span::raw(" "),
-                Span::styled(turn.timestamp, Style::default().fg(Color::DarkGray)),
-            ]));
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {} ", display_role), role_style),
+            Span::raw(" "),
+            Span::styled(turn.timestamp, Style::default().fg(Color::DarkGray)),
+        ]));
+        if turn.role == "user" || turn.role == "developer" {
+            user_rows.push(lines.len().saturating_sub(1));
         }
 
         for body_line in turn.text.lines() {
-            let row = format!("  {body_line}");
-            lines.push(fill_row_with_style(&row, body_style, inner_width));
+            lines.push(Line::from(format!("  {body_line}")));
+            if turn.role == "user" || turn.role == "developer" {
+                user_rows.push(lines.len().saturating_sub(1));
+            }
         }
         lines.push(Line::from(String::new()));
+        if turn.role == "user" || turn.role == "developer" {
+            user_rows.push(lines.len().saturating_sub(1));
+        }
     }
 
-    Ok(lines)
-}
-
-fn fill_row_with_style(text: &str, style: Style, width: usize) -> Line<'static> {
-    let len = text.chars().count();
-    let mut s = String::from(text);
-    if len < width {
-        s.push_str(&" ".repeat(width - len));
-    }
-    Line::from(Span::styled(s, style))
+    let _ = inner_width;
+    Ok(PreviewData { lines, user_rows })
 }
 
 fn append_event_preview(lines: &mut Vec<Line<'static>>, content: &str) {
@@ -1143,6 +1167,12 @@ struct ChatTurn {
     text: String,
 }
 
+#[derive(Clone)]
+struct PreviewData {
+    lines: Vec<Line<'static>>,
+    user_rows: Vec<usize>,
+}
+
 fn extract_chat_turns(content: &str) -> Vec<ChatTurn> {
     let mut turns = Vec::new();
     for line in content.lines().filter(|line| !line.trim().is_empty()) {
@@ -1159,10 +1189,14 @@ fn extract_chat_turns(content: &str) -> Vec<ChatTurn> {
             continue;
         }
 
-        let role = payload
+        let mut role = payload
             .get("role")
             .and_then(Value::as_str)
-            .unwrap_or("unknown");
+            .unwrap_or("unknown")
+            .to_string();
+        if role == "developer" {
+            role = String::from("user");
+        }
 
         let timestamp = value
             .get("timestamp")
@@ -1191,7 +1225,7 @@ fn extract_chat_turns(content: &str) -> Vec<ChatTurn> {
         }
 
         turns.push(ChatTurn {
-            role: role.to_string(),
+            role,
             timestamp,
             text: text_parts.join("\n"),
         });
