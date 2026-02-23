@@ -9,7 +9,7 @@ When a project folder is renamed or moved, those old sessions still point to the
 
 This project exists to make those sessions visible and editable so you can:
 - browse sessions by project-like `cwd`
-- inspect session metadata and raw event previews
+- inspect session metadata and chat/event previews
 - move, copy, or fork conversations from one folder context to another
 
 ## What it does
@@ -29,8 +29,9 @@ This project exists to make those sessions visible and editable so you can:
 
 - `Tab` / `Shift+Tab`: switch focus between projects, sessions, and preview
 - `j` / `k` or arrow keys: navigate
-- `/`: focus fuzzy search bar (type to filter sessions by conversation/path/id)
+- `/`: focus search bar (type to filter sessions by conversation/path/id)
 - `v`: toggle preview mode (`chat` / `events`)
+- `H` / `L`: resize focused pane width
 - `m`: move selected session to a target path
 - `c`: copy selected session to a target path
 - `f`: fork selected session to a target path

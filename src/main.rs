@@ -1063,12 +1063,16 @@ fn build_preview(
         } else {
             Style::default()
         };
-
-        lines.push(Line::from(vec![
-            Span::styled(format!(" {} ", turn.role.to_uppercase()), role_style),
-            Span::raw(" "),
-            Span::styled(turn.timestamp, Style::default().fg(Color::DarkGray)),
-        ]));
+        let header = format!(" {}  {}", turn.role.to_uppercase(), turn.timestamp);
+        if turn.role == "user" {
+            lines.push(fill_row_with_style(&header, body_style, inner_width));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {} ", turn.role.to_uppercase()), role_style),
+                Span::raw(" "),
+                Span::styled(turn.timestamp, Style::default().fg(Color::DarkGray)),
+            ]));
+        }
 
         for body_line in turn.text.lines() {
             let row = format!("  {body_line}");
