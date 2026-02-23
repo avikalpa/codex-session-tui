@@ -1485,6 +1485,7 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
                 lines: vec![Line::from(format!("Preview error: {err:#}"))],
                 tone_rows: Vec::new(),
                 header_rows: Vec::new(),
+                block_ranges: Vec::new(),
             },
         }
     } else {
@@ -1492,6 +1493,7 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
             lines: vec![Line::from("No session selected")],
             tone_rows: Vec::new(),
             header_rows: Vec::new(),
+            block_ranges: Vec::new(),
         }
     };
     app.preview_content_len = preview.lines.len();
@@ -1543,24 +1545,30 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
     }
     if app.focus == Focus::Preview
         && let Some(focused_turn) = app.preview_focus_turn
-        && let Some((row, _)) = app
-            .preview_header_rows
+        && let Some((_, start, end)) = preview
+            .block_ranges
             .iter()
-            .find(|(_, t)| *t == focused_turn)
+            .find(|(turn_idx, _, _)| *turn_idx == focused_turn)
             .copied()
-        && row >= scroll
-        && row < scroll + inner_h
     {
-        let screen_y = inner_y + (row - scroll) as u16;
-        frame.buffer_mut().set_style(
-            ratatui::layout::Rect {
-                x: inner_x,
-                y: screen_y,
-                width: inner_w,
-                height: 1,
-            },
-            Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        );
+        let vis_start = start.max(scroll);
+        let vis_end = end.min(scroll + inner_h.saturating_sub(1));
+        if vis_start <= vis_end && inner_w >= 2 {
+            let left_x = inner_x;
+            let right_x = inner_x + inner_w.saturating_sub(1);
+            let edge = Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM);
+            for row in vis_start..=vis_end {
+                let y = inner_y + (row - scroll) as u16;
+                frame.buffer_mut().set_string(left_x, y, "│", edge);
+                frame.buffer_mut().set_string(right_x, y, "│", edge);
+            }
+            let top_y = inner_y + (vis_start - scroll) as u16;
+            let bottom_y = inner_y + (vis_end - scroll) as u16;
+            frame.buffer_mut().set_string(left_x, top_y, "┌", edge);
+            frame.buffer_mut().set_string(right_x, top_y, "┐", edge);
+            frame.buffer_mut().set_string(left_x, bottom_y, "└", edge);
+            frame.buffer_mut().set_string(right_x, bottom_y, "┘", edge);
+        }
     }
     if let Some((a, b)) = app.preview_selection {
         let (start, end) = if a <= b { (a, b) } else { (b, a) };
@@ -1869,6 +1877,7 @@ fn build_preview_from_cached(
     ];
     let mut tone_rows = Vec::new();
     let mut header_rows = Vec::new();
+    let mut block_ranges = Vec::new();
 
     if mode == PreviewMode::Events {
         lines.push(Line::from(Span::styled(
@@ -1882,6 +1891,7 @@ fn build_preview_from_cached(
             lines,
             tone_rows,
             header_rows,
+            block_ranges,
         };
     }
 
@@ -1900,6 +1910,7 @@ fn build_preview_from_cached(
             lines,
             tone_rows,
             header_rows,
+            block_ranges,
         };
     }
 
@@ -1942,6 +1953,7 @@ fn build_preview_from_cached(
         };
         let is_folded = folded.contains(&turn_idx);
         let marker = if is_folded { "▶" } else { "▼" };
+        let block_start = lines.len();
         lines.push(Line::from(String::new()));
         tone_rows.push((lines.len().saturating_sub(1), tone));
         lines.push(Line::from(vec![
@@ -1961,6 +1973,8 @@ fn build_preview_from_cached(
         }
         lines.push(Line::from(String::new()));
         tone_rows.push((lines.len().saturating_sub(1), tone));
+        let block_end = lines.len().saturating_sub(1);
+        block_ranges.push((turn_idx, block_start, block_end));
         if turn_idx + 1 < cached.turns.len() {
             if tone == BlockTone::User {
                 // Ensure a terminal-bg hairline gap between USER blocks.
@@ -1979,6 +1993,7 @@ fn build_preview_from_cached(
         lines,
         tone_rows,
         header_rows,
+        block_ranges,
     }
 }
 
@@ -2177,6 +2192,7 @@ struct PreviewData {
     lines: Vec<Line<'static>>,
     tone_rows: Vec<(usize, BlockTone)>,
     header_rows: Vec<(usize, usize)>,
+    block_ranges: Vec<(usize, usize, usize)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
