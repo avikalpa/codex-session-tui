@@ -1017,7 +1017,7 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
                 width: inner_w,
                 height: 1,
             },
-            Style::default().add_modifier(Modifier::REVERSED),
+            Style::default().add_modifier(Modifier::DIM | Modifier::REVERSED),
         );
     }
 }
