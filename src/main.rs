@@ -159,6 +159,14 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
                 }
                 app.focus = Focus::Preview;
                 let row = app.preview_scroll + mouse_row_to_index(mouse.row, app.panes.preview);
+                if let Some((_, turn_idx)) = app
+                    .preview_header_rows
+                    .iter()
+                    .filter(|(header_row, _)| *header_row <= row)
+                    .max_by_key(|(header_row, _)| *header_row)
+                {
+                    app.preview_focus_turn = Some(*turn_idx);
+                }
                 app.toggle_fold_by_row(row);
             } else if point_in_rect(mouse.column, mouse.row, app.panes.status) {
                 app.search_focused = false;
@@ -383,7 +391,7 @@ fn mouse_row_to_index(y: u16, pane: ratatui::layout::Rect) -> usize {
 fn copy_to_clipboard_osc52(text: &str) -> Result<()> {
     let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
     let mut out = io::stdout();
-    write!(out, "\x1b]52;c;{b64}\x07").context("failed OSC52 write")?;
+    write!(out, "\x1b]52;c;{b64}\x1b\\").context("failed OSC52 write")?;
     out.flush().context("failed stdout flush")?;
     Ok(())
 }
@@ -415,10 +423,44 @@ fn handle_normal_mode(code: KeyCode, app: &mut App) -> Result<bool> {
         KeyCode::Char('/') => {
             app.search_focused = true;
         }
-        KeyCode::Tab => app.next_focus(),
-        KeyCode::BackTab => app.prev_focus(),
-        KeyCode::Up | KeyCode::Char('k') => app.move_up(),
-        KeyCode::Down | KeyCode::Char('j') => app.move_down(),
+        KeyCode::Tab => {
+            if app.focus == Focus::Preview {
+                app.toggle_fold_focused_preview_turn();
+            } else {
+                app.next_focus();
+            }
+        }
+        KeyCode::BackTab => {
+            if app.focus == Focus::Preview {
+                app.toggle_fold_all_preview_turns();
+            } else {
+                app.prev_focus();
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.focus == Focus::Preview {
+                app.focus_prev_preview_turn();
+            } else {
+                app.move_up();
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.focus == Focus::Preview {
+                app.focus_next_preview_turn();
+            } else {
+                app.move_down();
+            }
+        }
+        KeyCode::Left => {
+            if app.focus == Focus::Preview {
+                app.fold_focused_preview_turn();
+            }
+        }
+        KeyCode::Right => {
+            if app.focus == Focus::Preview {
+                app.unfold_focused_preview_turn();
+            }
+        }
         KeyCode::Char('g') => app.reload()?,
         KeyCode::Char('m') => app.start_action(Action::Move),
         KeyCode::Char('c') => app.start_action(Action::Copy),
@@ -614,6 +656,7 @@ struct App {
     preview_content_len: usize,
     preview_selection: Option<(usize, usize)>,
     preview_rendered_lines: Vec<String>,
+    preview_focus_turn: Option<usize>,
     preview_cache: HashMap<PathBuf, CachedPreviewSource>,
     preview_folded: HashMap<PathBuf, HashSet<usize>>,
     preview_header_rows: Vec<(usize, usize)>,
@@ -660,6 +703,7 @@ impl App {
             preview_content_len: 0,
             preview_selection: None,
             preview_rendered_lines: Vec::new(),
+            preview_focus_turn: None,
             preview_cache: HashMap::new(),
             preview_folded: HashMap::new(),
             preview_header_rows: Vec::new(),
@@ -1042,6 +1086,7 @@ impl App {
         } else {
             entry.insert(turn_idx);
         }
+        self.preview_focus_turn = Some(turn_idx);
     }
 
     fn toggle_fold_at_scroll(&mut self) {
@@ -1061,6 +1106,152 @@ impl App {
             });
         if let Some(r) = target_row {
             self.toggle_fold_by_row(r);
+        }
+    }
+
+    fn ensure_preview_focus_valid(&mut self) {
+        if self.preview_header_rows.is_empty() {
+            self.preview_focus_turn = None;
+            return;
+        }
+        let turn_ids = self
+            .preview_header_rows
+            .iter()
+            .map(|(_, t)| *t)
+            .collect::<Vec<_>>();
+        if let Some(focused) = self.preview_focus_turn
+            && turn_ids.contains(&focused)
+        {
+            return;
+        }
+        self.preview_focus_turn = turn_ids.first().copied();
+    }
+
+    fn focus_next_preview_turn(&mut self) {
+        self.ensure_preview_focus_valid();
+        let Some(current) = self.preview_focus_turn else {
+            return;
+        };
+        let turns = self
+            .preview_header_rows
+            .iter()
+            .map(|(_, t)| *t)
+            .collect::<Vec<_>>();
+        let Some(pos) = turns.iter().position(|t| *t == current) else {
+            return;
+        };
+        let next = (pos + 1).min(turns.len().saturating_sub(1));
+        self.preview_focus_turn = Some(turns[next]);
+        self.scroll_preview_focus_into_view();
+    }
+
+    fn focus_prev_preview_turn(&mut self) {
+        self.ensure_preview_focus_valid();
+        let Some(current) = self.preview_focus_turn else {
+            return;
+        };
+        let turns = self
+            .preview_header_rows
+            .iter()
+            .map(|(_, t)| *t)
+            .collect::<Vec<_>>();
+        let Some(pos) = turns.iter().position(|t| *t == current) else {
+            return;
+        };
+        let prev = pos.saturating_sub(1);
+        self.preview_focus_turn = Some(turns[prev]);
+        self.scroll_preview_focus_into_view();
+    }
+
+    fn scroll_preview_focus_into_view(&mut self) {
+        let Some(focused) = self.preview_focus_turn else {
+            return;
+        };
+        let Some((row, _)) = self
+            .preview_header_rows
+            .iter()
+            .find(|(_, t)| *t == focused)
+            .copied()
+        else {
+            return;
+        };
+        let visible = self.panes.preview.height.saturating_sub(2) as usize;
+        if visible == 0 {
+            return;
+        }
+        if row < self.preview_scroll {
+            self.preview_scroll = row;
+        } else if row >= self.preview_scroll + visible {
+            self.preview_scroll = row + 1 - visible;
+        }
+    }
+
+    fn toggle_fold_focused_preview_turn(&mut self) {
+        self.ensure_preview_focus_valid();
+        let Some(focused) = self.preview_focus_turn else {
+            return;
+        };
+        let Some((row, _)) = self
+            .preview_header_rows
+            .iter()
+            .find(|(_, t)| *t == focused)
+            .copied()
+        else {
+            return;
+        };
+        self.toggle_fold_by_row(row);
+        self.scroll_preview_focus_into_view();
+    }
+
+    fn fold_focused_preview_turn(&mut self) {
+        self.ensure_preview_focus_valid();
+        let (Some(path), Some(focused)) =
+            (self.preview_session_path.clone(), self.preview_focus_turn)
+        else {
+            return;
+        };
+        self.preview_folded.entry(path).or_default().insert(focused);
+        self.scroll_preview_focus_into_view();
+    }
+
+    fn unfold_focused_preview_turn(&mut self) {
+        self.ensure_preview_focus_valid();
+        let (Some(path), Some(focused)) =
+            (self.preview_session_path.clone(), self.preview_focus_turn)
+        else {
+            return;
+        };
+        self.preview_folded
+            .entry(path)
+            .or_default()
+            .remove(&focused);
+        self.scroll_preview_focus_into_view();
+    }
+
+    fn toggle_fold_all_preview_turns(&mut self) {
+        let Some(path) = self.preview_session_path.clone() else {
+            return;
+        };
+        let turns = self
+            .preview_header_rows
+            .iter()
+            .map(|(_, t)| *t)
+            .collect::<Vec<_>>();
+        if turns.is_empty() {
+            return;
+        }
+        let entry = self.preview_folded.entry(path).or_default();
+        let all_folded = turns.iter().all(|t| entry.contains(t));
+        if all_folded {
+            for turn in turns {
+                entry.remove(&turn);
+            }
+            self.status = String::from("Expanded all preview blocks");
+        } else {
+            for turn in turns {
+                entry.insert(turn);
+            }
+            self.status = String::from("Collapsed all preview blocks");
         }
     }
 
@@ -1310,6 +1501,7 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
     app.preview_scroll = app.preview_scroll.min(max_scroll);
     app.preview_header_rows = preview.header_rows.clone();
     app.preview_session_path = app.current_session().map(|s| s.path.clone());
+    app.ensure_preview_focus_valid();
 
     let focus_style = if app.focus == Focus::Preview && app.mode == Mode::Normal {
         Style::default().fg(Color::Yellow)
@@ -1347,6 +1539,27 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
                 height: 1,
             },
             block_tone_style(tone),
+        );
+    }
+    if app.focus == Focus::Preview
+        && let Some(focused_turn) = app.preview_focus_turn
+        && let Some((row, _)) = app
+            .preview_header_rows
+            .iter()
+            .find(|(_, t)| *t == focused_turn)
+            .copied()
+        && row >= scroll
+        && row < scroll + inner_h
+    {
+        let screen_y = inner_y + (row - scroll) as u16;
+        frame.buffer_mut().set_style(
+            ratatui::layout::Rect {
+                x: inner_x,
+                y: screen_y,
+                width: inner_w,
+                height: 1,
+            },
+            Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         );
     }
     if let Some((a, b)) = app.preview_selection {
@@ -1402,11 +1615,12 @@ fn block_tone_style(tone: BlockTone) -> Style {
     if tone == BlockTone::Assistant {
         return Style::default();
     }
+    // Similar to edit's approach: blend a cool accent into terminal background.
+    // This avoids warm/darker shifts while still creating a distinct user block.
     let (bg, _) = terminal_bg_rgb().unwrap_or(((0, 0, 0), true));
-    // Always brighten for USER blocks and reduce saturation to avoid warm casts.
-    let lifted = transform_bg(bg, 0.30);
-    let neutral = desaturate_towards_gray(lifted, 0.35);
-    let softened = blend_rgb(bg, neutral, 0.45);
+    let accent = ansi_index_to_rgb(12); // BrightBlue from ANSI palette.
+    let accented = blend_rgb(bg, accent, 0.20);
+    let softened = blend_rgb(bg, accented, 0.55);
     Style::default().bg(Color::Rgb(softened.0, softened.1, softened.2))
 }
 
@@ -1430,19 +1644,6 @@ fn terminal_bg_rgb() -> Option<((u8, u8, u8), bool)> {
     Some((rgb, dark))
 }
 
-fn transform_bg(bg: (u8, u8, u8), delta: f32) -> (u8, u8, u8) {
-    let tweak = |c: u8| -> u8 {
-        let v = c as f32;
-        let out = if delta >= 0.0 {
-            v + (255.0 - v) * delta
-        } else {
-            v * (1.0 + delta)
-        };
-        out.clamp(0.0, 255.0) as u8
-    };
-    (tweak(bg.0), tweak(bg.1), tweak(bg.2))
-}
-
 fn blend_rgb(base: (u8, u8, u8), overlay: (u8, u8, u8), alpha: f32) -> (u8, u8, u8) {
     let a = alpha.clamp(0.0, 1.0);
     let mix = |b: u8, o: u8| -> u8 {
@@ -1455,14 +1656,6 @@ fn blend_rgb(base: (u8, u8, u8), overlay: (u8, u8, u8), alpha: f32) -> (u8, u8, 
         mix(base.1, overlay.1),
         mix(base.2, overlay.2),
     )
-}
-
-fn desaturate_towards_gray(rgb: (u8, u8, u8), amount: f32) -> (u8, u8, u8) {
-    let a = amount.clamp(0.0, 1.0);
-    let gray = ((rgb.0 as f32 * 0.2126) + (rgb.1 as f32 * 0.7152) + (rgb.2 as f32 * 0.0722))
-        .round()
-        .clamp(0.0, 255.0) as u8;
-    blend_rgb(rgb, (gray, gray, gray), a)
 }
 
 fn ansi_index_to_rgb(idx: u8) -> (u8, u8, u8) {
@@ -1500,30 +1693,47 @@ fn ansi_index_to_rgb(idx: u8) -> (u8, u8, u8) {
 }
 
 fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
-    let key_line = Line::from(vec![
-        Span::styled("tab", Style::default().fg(Color::Cyan)),
-        Span::raw(" focus  "),
-        Span::styled("j/k", Style::default().fg(Color::Cyan)),
-        Span::raw(" nav  "),
-        Span::styled("/", Style::default().fg(Color::Cyan)),
-        Span::raw(" search  "),
-        Span::styled("v", Style::default().fg(Color::Cyan)),
-        Span::raw(" preview-mode  "),
-        Span::styled("z", Style::default().fg(Color::Cyan)),
-        Span::raw(" fold  "),
-        Span::styled("h/l", Style::default().fg(Color::Cyan)),
-        Span::raw(" resize-pane  "),
-        Span::styled("drag", Style::default().fg(Color::Cyan)),
-        Span::raw(" splitter  "),
-        Span::styled("S", Style::default().fg(Color::Cyan)),
-        Span::raw(" select-copy  "),
-        Span::styled("m/c/f", Style::default().fg(Color::Green)),
-        Span::raw(" move/copy/fork  "),
-        Span::styled("g", Style::default().fg(Color::Yellow)),
-        Span::raw(" refresh  "),
-        Span::styled("q", Style::default().fg(Color::Red)),
-        Span::raw(" quit"),
-    ]);
+    let key_line = if app.focus == Focus::Preview && app.mode == Mode::Normal {
+        Line::from(vec![
+            Span::styled("↑/↓", Style::default().fg(Color::Cyan)),
+            Span::raw(" block prev/next  "),
+            Span::styled("←/→", Style::default().fg(Color::Cyan)),
+            Span::raw(" fold/unfold block  "),
+            Span::styled("tab", Style::default().fg(Color::Cyan)),
+            Span::raw(" toggle block  "),
+            Span::styled("shift+tab", Style::default().fg(Color::Cyan)),
+            Span::raw(" toggle all blocks  "),
+            Span::styled("S", Style::default().fg(Color::Cyan)),
+            Span::raw(" select-copy  "),
+            Span::styled("drag", Style::default().fg(Color::Cyan)),
+            Span::raw(" pane/scrollbar"),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("tab", Style::default().fg(Color::Cyan)),
+            Span::raw(" focus  "),
+            Span::styled("j/k", Style::default().fg(Color::Cyan)),
+            Span::raw(" nav  "),
+            Span::styled("/", Style::default().fg(Color::Cyan)),
+            Span::raw(" search  "),
+            Span::styled("v", Style::default().fg(Color::Cyan)),
+            Span::raw(" preview-mode  "),
+            Span::styled("z", Style::default().fg(Color::Cyan)),
+            Span::raw(" fold  "),
+            Span::styled("h/l", Style::default().fg(Color::Cyan)),
+            Span::raw(" resize-pane  "),
+            Span::styled("drag", Style::default().fg(Color::Cyan)),
+            Span::raw(" splitter  "),
+            Span::styled("S", Style::default().fg(Color::Cyan)),
+            Span::raw(" select-copy  "),
+            Span::styled("m/c/f", Style::default().fg(Color::Green)),
+            Span::raw(" move/copy/fork  "),
+            Span::styled("g", Style::default().fg(Color::Yellow)),
+            Span::raw(" refresh  "),
+            Span::styled("q", Style::default().fg(Color::Red)),
+            Span::raw(" quit"),
+        ])
+    };
     let search_meta = if app.search_query.trim().is_empty() {
         String::from("search: <none>")
     } else {
@@ -2829,6 +3039,7 @@ mod tests {
             preview_content_len: 0,
             preview_selection: None,
             preview_rendered_lines: Vec::new(),
+            preview_focus_turn: None,
             preview_cache: HashMap::new(),
             preview_folded: HashMap::new(),
             preview_header_rows: Vec::new(),
@@ -2838,5 +3049,57 @@ mod tests {
         app.apply_search_filter();
         assert_eq!(app.projects.len(), 1);
         assert_eq!(app.projects[0].cwd, "/repo/a");
+    }
+
+    #[test]
+    fn preview_toggle_all_folds_collapses_and_expands() {
+        let mut app = App {
+            sessions_root: PathBuf::from("/tmp"),
+            all_projects: Vec::new(),
+            projects: Vec::new(),
+            project_idx: 0,
+            session_idx: 0,
+            focus: Focus::Preview,
+            mode: Mode::Normal,
+            pending_action: None,
+            input: String::new(),
+            input_focused: false,
+            search_query: String::new(),
+            search_focused: false,
+            search_dirty: false,
+            preview_mode: PreviewMode::Chat,
+            selection_mode: false,
+            drag_target: None,
+            scroll_drag: None,
+            status: String::new(),
+            panes: PaneLayout::default(),
+            project_width_pct: 28,
+            session_width_pct: 38,
+            project_scroll: 0,
+            session_scroll: 0,
+            preview_scroll: 0,
+            preview_content_len: 0,
+            preview_selection: None,
+            preview_rendered_lines: Vec::new(),
+            preview_focus_turn: None,
+            preview_cache: HashMap::new(),
+            preview_folded: HashMap::new(),
+            preview_header_rows: vec![(10, 0), (20, 1), (30, 2)],
+            preview_session_path: Some(PathBuf::from("/tmp/x.jsonl")),
+        };
+
+        app.toggle_fold_all_preview_turns();
+        let folded = app
+            .preview_folded
+            .get(&PathBuf::from("/tmp/x.jsonl"))
+            .expect("folded set");
+        assert!(folded.contains(&0) && folded.contains(&1) && folded.contains(&2));
+
+        app.toggle_fold_all_preview_turns();
+        let folded2 = app
+            .preview_folded
+            .get(&PathBuf::from("/tmp/x.jsonl"))
+            .expect("folded set");
+        assert!(folded2.is_empty());
     }
 }
