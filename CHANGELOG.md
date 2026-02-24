@@ -2,6 +2,11 @@
 
 All notable changes to `codex-session-explorer` are documented in this file.
 
+## [0.2.8] - 2026-02-24
+
+### Fixed
+- npm package README (`npm/README.md`) updated to `codex-session-tui` naming and commands.
+
 ## [0.2.7] - 2026-02-24
 
 ### Changed
