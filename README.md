@@ -8,12 +8,13 @@
 
 ## Features
 
+- **Fast search/filter (`/`)** across session metadata/content
 - Parse/session-index JSONL files from `${CODEX_HOME:-~/.codex}/sessions`
 - Group sessions by project `cwd`
 - 3-pane TUI: Projects, Sessions, Preview
 - Operations: move, copy, fork, delete, project-folder rename/copy
 - Multi-select sessions and bulk operations
-- Search/filter, foldable preview blocks, mouse selection/copy, draggable splitters/scrollbars
+- Foldable preview blocks, mouse selection/copy, draggable splitters/scrollbars
 
 ## Motivation
 
@@ -31,18 +32,21 @@ Install globally:
 ```bash
 npm i -g codex-session-tui
 codex-session-tui
+# press "/" to open search quickly
 ```
 
 Use a different Codex home:
 
 ```bash
 CODEX_HOME=/path/to/.codex codex-session-tui
+# press "/" to open search quickly
 ```
 
 or with `npx`:
 
 ```bash
 CODEX_HOME=/path/to/.codex npx -y codex-session-tui
+# press "/" to open search quickly
 ```
 
 ## Dev Run
