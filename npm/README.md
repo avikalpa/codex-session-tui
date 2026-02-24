@@ -14,8 +14,10 @@ npm i -g codex-session-tui
 codex-session-tui
 ```
 
-The launcher automatically selects the binary for:
+## Platforms
 
-- Linux: `x64`, `arm64`, `arm` (armv7)
-- macOS: `x64`, `arm64`
-- Windows: `x64`, `arm64`
+Prebuilt binaries are published for:
+
+- Linux: `x86_64`, `aarch64`, `armv7`
+- macOS: `x86_64`, `aarch64`
+- Windows (MSVC): `x86_64`, `aarch64`

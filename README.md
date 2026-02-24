@@ -49,6 +49,14 @@ CODEX_HOME=/path/to/.codex npx -y codex-session-tui
 # press "/" to open search quickly
 ```
 
+## Platforms
+
+Prebuilt binaries are published for:
+
+- Linux: `x86_64`, `aarch64`, `armv7`
+- macOS: `x86_64`, `aarch64`
+- Windows (MSVC): `x86_64`, `aarch64`
+
 ## Dev Run
 
 ```bash
