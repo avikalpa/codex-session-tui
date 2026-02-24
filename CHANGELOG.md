@@ -2,6 +2,12 @@
 
 All notable changes to `codex-session-explorer` are documented in this file.
 
+## [0.2.2] - 2026-02-23
+
+### Fixed
+- GitHub Actions workflow now has explicit `contents: write` permission so release binaries can be attached to GitHub Releases.
+- npm publish remains CI-only (release-triggered workflow path).
+
 ## [0.2.1] - 2026-02-23
 
 ### Fixed
