@@ -2,6 +2,11 @@
 
 All notable changes to `codex-session-explorer` are documented in this file.
 
+## [0.2.3] - 2026-02-24
+
+### Changed
+- Refresh release to pick up updated CI `NPM_TOKEN` for npm publish from GitHub Actions.
+
 ## [0.2.2] - 2026-02-23
 
 ### Fixed
