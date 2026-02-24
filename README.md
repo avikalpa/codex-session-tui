@@ -4,6 +4,22 @@
 
 ![codex-session-tui screenshot](assets/readme-screenshot.png)
 
+## Demo
+
+[![asciinema demo](https://asciinema.org/a/Du2tYavIkMCoXLvI.svg)](https://asciinema.org/a/Du2tYavIkMCoXLvI)
+
+Upload your own cast to asciinema:
+
+```bash
+asciinema upload demo.cast
+```
+
+Optionally render a local SVG from a cast:
+
+```bash
+./scripts/render-demo-svg.sh demo.cast assets/demo.svg
+```
+
 ## Quickstart
 
 Run once (no install):
