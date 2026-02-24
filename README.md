@@ -85,7 +85,7 @@ Workflow file:
 
 It also assembles an npm package layout for publishing under:
 
-- `@avikalpa/codex-session-explorer`
+- `codex-session-tui`
 
 ## Safety
 

@@ -162,5 +162,7 @@ jobs:
           fi
           npm publish --access public || {
             echo "npm publish failed. Checking if version already exists..."
-            npm view @avikalpa/codex-session-explorer@$(node -p "require('./package.json').version") version
+            PKG_NAME="$(node -p "require('./package.json').name")"
+            PKG_VER="$(node -p "require('./package.json').version")"
+            npm view "${PKG_NAME}@${PKG_VER}" version
           }

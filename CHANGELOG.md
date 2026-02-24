@@ -2,6 +2,13 @@
 
 All notable changes to `codex-session-explorer` are documented in this file.
 
+## [0.2.5] - 2026-02-24
+
+### Changed
+- npm package renamed to unscoped `codex-session-tui`.
+- Added npm bin alias so `npx -y codex-session-tui` runs directly.
+- npm publish fallback check in CI now uses package name from `npm/package.json`.
+
 ## [0.2.4] - 2026-02-24
 
 ### Fixed
