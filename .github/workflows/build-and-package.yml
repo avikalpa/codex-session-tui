@@ -25,6 +25,9 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             bin: codex-session-explorer
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-gnueabihf
+            bin: codex-session-explorer
           - os: macos-15-intel
             target: x86_64-apple-darwin
             bin: codex-session-explorer
@@ -52,9 +55,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
+      - name: Install Linux ARMv7 Linker
+        if: matrix.target == 'armv7-unknown-linux-gnueabihf'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf
+
       - name: Build
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
           CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER: link.exe
         run: cargo build --release --target ${{ matrix.target }}
 
@@ -123,7 +133,7 @@ jobs:
           for d in npm/dist/*; do
             name="$(basename "$d")"
             mkdir -p "npm/dist_flat/$name"
-            cp -v "$d"/*/* "npm/dist_flat/$name/" || true
+            find "$d" -maxdepth 2 -type f -exec cp -v {} "npm/dist_flat/$name/" \;
           done
           rm -rf npm/dist
           mv npm/dist_flat npm/dist

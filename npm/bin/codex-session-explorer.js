@@ -10,6 +10,7 @@ const arch = process.arch;
 const targetMap = {
   "linux:x64": "x86_64-unknown-linux-gnu",
   "linux:arm64": "aarch64-unknown-linux-gnu",
+  "linux:arm": "armv7-unknown-linux-gnueabihf",
   "darwin:x64": "x86_64-apple-darwin",
   "darwin:arm64": "aarch64-apple-darwin",
   "win32:x64": "x86_64-pc-windows-msvc",

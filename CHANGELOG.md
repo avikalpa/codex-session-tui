@@ -2,6 +2,13 @@
 
 All notable changes to `codex-session-explorer` are documented in this file.
 
+## [0.2.4] - 2026-02-24
+
+### Fixed
+- npm publish workflow now correctly includes `dist/*` binaries in the package tarball.
+- Added Linux `armv7` binary build/distribution path for 32-bit Raspberry Pi environments.
+- npm launcher now maps `linux/arm` to `armv7-unknown-linux-gnueabihf`.
+
 ## [0.2.3] - 2026-02-24
 
 ### Changed

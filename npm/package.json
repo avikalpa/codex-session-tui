@@ -1,6 +1,6 @@
 {
   "name": "@avikalpa/codex-session-explorer",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Prebuilt codex-session-explorer TUI binaries for macOS, Linux, and Windows.",
   "license": "MIT",
   "bin": {
