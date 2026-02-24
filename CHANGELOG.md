@@ -2,6 +2,12 @@
 
 All notable changes to `codex-session-explorer` are documented in this file.
 
+## [0.2.7] - 2026-02-24
+
+### Changed
+- README updated to emphasize fast `/` search at top of features.
+- Quickstart examples now mention invoking search with `/`.
+
 ## [0.2.6] - 2026-02-24
 
 ### Changed
