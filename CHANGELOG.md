@@ -2,6 +2,11 @@
 
 All notable changes to `codex-session-explorer` are documented in this file.
 
+## [0.2.9] - 2026-02-24
+
+### Changed
+- Added explicit platform support section to both root README and npm README.
+
 ## [0.2.8] - 2026-02-24
 
 ### Fixed
