@@ -1,30 +1,30 @@
 # codex-session-tui
 
-`codex-session-tui` is a Rust TUI to inspect and remap Codex sessions under `~/.codex/sessions`.
+`npx -y codex-session-tui`
 
 ## Demo
 
 [![asciinema demo](https://asciinema.org/a/Du2tYavIkMCoXLvI.svg)](https://asciinema.org/a/Du2tYavIkMCoXLvI)
 
-Upload your own cast to asciinema:
+## Features
 
-```bash
-asciinema upload demo.cast
-```
+- Parse/session-index JSONL files from `${CODEX_HOME:-~/.codex}/sessions`
+- Group sessions by project `cwd`
+- 3-pane TUI: Projects, Sessions, Preview
+- Operations: move, copy, fork, delete, project-folder rename/copy
+- Multi-select sessions and bulk operations
+- Search/filter, foldable preview blocks, mouse selection/copy, draggable splitters/scrollbars
 
-Optionally render a local SVG from a cast:
+## Motivation
 
-```bash
-./scripts/render-demo-svg.sh demo.cast assets/demo.svg
-```
+`codex resume` groups sessions by stored `cwd`.  
+After a repo/folder move, old sessions can become hard to discover.
+
+## Why
+
+`codex-session-tui` is a Rust TUI to inspect and remap Codex sessions safely.
 
 ## Quickstart
-
-Run once (no install):
-
-```bash
-npx -y codex-session-tui
-```
 
 Install globally:
 
@@ -44,21 +44,6 @@ or with `npx`:
 ```bash
 CODEX_HOME=/path/to/.codex npx -y codex-session-tui
 ```
-
-## Why
-
-`codex resume` groups sessions by stored `cwd`.  
-After a repo/folder move, old sessions can become hard to discover.  
-This tool helps recover them by browsing and rewriting session `cwd` safely.
-
-## Features
-
-- Parse/session-index JSONL files from `${CODEX_HOME:-~/.codex}/sessions`
-- Group sessions by project `cwd`
-- 3-pane TUI: Projects, Sessions, Preview
-- Operations: move, copy, fork, delete, project-folder rename/copy
-- Multi-select sessions and bulk operations
-- Search/filter, foldable preview blocks, mouse selection/copy, draggable splitters/scrollbars
 
 ## Dev Run
 
