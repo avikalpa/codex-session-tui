@@ -2,8 +2,6 @@
 
 `codex-session-tui` is a Rust TUI to inspect and remap Codex sessions under `~/.codex/sessions`.
 
-![codex-session-tui screenshot](assets/readme-screenshot.png)
-
 ## Demo
 
 [![asciinema demo](https://asciinema.org/a/Du2tYavIkMCoXLvI.svg)](https://asciinema.org/a/Du2tYavIkMCoXLvI)
