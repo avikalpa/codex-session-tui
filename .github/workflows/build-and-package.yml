@@ -21,25 +21,25 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            bin: codex-session-explorer
+            bin: codex-session-tui
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            bin: codex-session-explorer
+            bin: codex-session-tui
           - os: ubuntu-latest
             target: armv7-unknown-linux-gnueabihf
-            bin: codex-session-explorer
+            bin: codex-session-tui
           - os: macos-15-intel
             target: x86_64-apple-darwin
-            bin: codex-session-explorer
+            bin: codex-session-tui
           - os: macos-14
             target: aarch64-apple-darwin
-            bin: codex-session-explorer
+            bin: codex-session-tui
           - os: windows-2022
             target: x86_64-pc-windows-msvc
-            bin: codex-session-explorer.exe
+            bin: codex-session-tui.exe
           - os: windows-2022
             target: aarch64-pc-windows-msvc
-            bin: codex-session-explorer.exe
+            bin: codex-session-tui.exe
 
     steps:
       - uses: actions/checkout@v4
@@ -100,9 +100,9 @@ jobs:
             [ -d "$target_dir" ] || continue
             target="$(basename "$target_dir")"
             if [[ "$target" == *windows* ]]; then
-              (cd "$target_dir" && zip -9 -r "../../release-assets/codex-session-explorer-${target}.zip" .)
+              (cd "$target_dir" && zip -9 -r "../../release-assets/codex-session-tui-${target}.zip" .)
             else
-              tar -C "$target_dir" -czf "release-assets/codex-session-explorer-${target}.tar.gz" .
+              tar -C "$target_dir" -czf "release-assets/codex-session-tui-${target}.tar.gz" .
             fi
           done
           ls -lah release-assets

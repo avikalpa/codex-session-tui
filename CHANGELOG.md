@@ -2,6 +2,15 @@
 
 All notable changes to `codex-session-explorer` are documented in this file.
 
+## [0.2.6] - 2026-02-24
+
+### Changed
+- Rust release binary renamed from `codex-session-explorer` to `codex-session-tui` across CI artifacts and release assets.
+
+### Fixed
+- npm launcher now ensures executable permissions (`chmod +x`) before spawn on Unix-like systems to avoid `EACCES` in `npx` cache.
+- npm launcher keeps a legacy fallback to old binary name for compatibility.
+
 ## [0.2.5] - 2026-02-24
 
 ### Changed
