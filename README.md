@@ -60,3 +60,20 @@ CODEX_HOME=/path/to/.codex cargo run
 - Backups are created before mutating/deleting session files
 - Writes use atomic temp-file + rename
 - Unknown JSON fields are preserved
+
+Backup location and restore:
+
+- Backups are created next to the original session file under `${CODEX_HOME:-~/.codex}/sessions`
+- Backup filename format: `<original>.jsonl.bak.YYYYMMDDHHMMSS`
+
+Find backups:
+
+```bash
+find "${CODEX_HOME:-$HOME/.codex}/sessions" -type f -name "*.jsonl.bak.*"
+```
+
+Restore a backup:
+
+```bash
+cp "/path/to/rollout-....jsonl.bak.20260224101530" "/path/to/rollout-....jsonl"
+```
