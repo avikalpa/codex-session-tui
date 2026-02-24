@@ -145,6 +145,9 @@ jobs:
           node-version: 20
           registry-url: https://registry.npmjs.org
 
+      - name: Sync npm README from repo README
+        run: cp README.md npm/README.md
+
       - name: Pack npm Artifact
         run: |
           cd npm

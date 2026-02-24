@@ -6,6 +6,7 @@ All notable changes to `codex-session-explorer` are documented in this file.
 
 ### Fixed
 - npm package README (`npm/README.md`) updated to `codex-session-tui` naming and commands.
+- npm publish workflow now copies root `README.md` into `npm/README.md` before packing, so npm page always matches GitHub README.
 
 ## [0.2.7] - 2026-02-24
 
