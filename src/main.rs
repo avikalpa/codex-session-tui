@@ -2576,6 +2576,10 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
         Line::from(vec![
             Span::styled("j/k", Style::default().fg(Color::Cyan)),
             Span::raw(" nav  "),
+            Span::styled("←", Style::default().fg(Color::Cyan)),
+            Span::raw(" folder row  "),
+            Span::styled("→", Style::default().fg(Color::Cyan)),
+            Span::raw(" open preview  "),
             Span::styled("space", Style::default().fg(Color::Yellow)),
             Span::raw(" toggle-select  "),
             Span::styled("checkbox click", Style::default().fg(Color::Yellow)),
@@ -4418,6 +4422,66 @@ mod tests {
     }
 
     #[test]
+    fn right_on_project_row_enters_first_session_when_expanded() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/repo"),
+            sessions: vec![
+                sample_session("/tmp/a.jsonl", "/repo", "a"),
+                sample_session("/tmp/b.jsonl", "/repo", "b"),
+            ],
+        }];
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Project;
+
+        let quit = handle_normal_mode(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &mut app)
+            .expect("handle");
+        assert!(!quit);
+        assert_eq!(app.browser_cursor, BrowserCursor::Session);
+        assert_eq!(app.session_idx, 0);
+    }
+
+    #[test]
+    fn left_on_session_row_returns_to_project_row() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/repo"),
+            sessions: vec![
+                sample_session("/tmp/a.jsonl", "/repo", "a"),
+                sample_session("/tmp/b.jsonl", "/repo", "b"),
+            ],
+        }];
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Session;
+        app.session_idx = 1;
+
+        let quit = handle_normal_mode(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &mut app)
+            .expect("handle");
+        assert!(!quit);
+        assert_eq!(app.browser_cursor, BrowserCursor::Project);
+        assert_eq!(app.project_idx, 0);
+    }
+
+    #[test]
+    fn left_and_right_toggle_project_collapse_state() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/repo"),
+            sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
+        }];
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Project;
+
+        handle_normal_mode(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &mut app)
+            .expect("left");
+        assert!(app.collapsed_projects.contains("/repo"));
+
+        handle_normal_mode(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &mut app)
+            .expect("right");
+        assert!(!app.collapsed_projects.contains("/repo"));
+    }
+
+    #[test]
     fn moving_up_to_project_row_auto_expands_it() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
@@ -5061,6 +5125,37 @@ mod tests {
         assert!(!quit);
         assert!(!app.search_focused);
         assert_eq!(app.focus, Focus::Preview);
+    }
+
+    #[test]
+    fn render_status_shows_search_onboarding_keys() {
+        let mut app = empty_test_app();
+        app.search_focused = true;
+        app.search_query = String::from("johyperr");
+
+        let backend = TestBackend::new(100, 4);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_status(
+                    frame,
+                    ratatui::layout::Rect {
+                        x: 0,
+                        y: 0,
+                        width: 100,
+                        height: 4,
+                    },
+                    &app,
+                );
+            })
+            .expect("draw");
+
+        let backend = terminal.backend();
+        assert!(buffer_contains(backend, "enter"));
+        assert!(buffer_contains(backend, "esc"));
+        assert!(buffer_contains(backend, "tab"));
+        assert!(buffer_contains(backend, "shift+tab"));
+        assert!(buffer_contains(backend, "close search"));
     }
 
     #[test]
