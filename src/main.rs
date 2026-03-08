@@ -569,6 +569,7 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
             }
         }
         KeyCode::Char('g') => app.reload()?,
+        KeyCode::Char('t') => app.toggle_project_view_mode(),
         KeyCode::Char('m') => {
             if app.focus == Focus::Projects {
                 app.start_action(Action::ProjectRename);
@@ -783,6 +784,12 @@ struct ProjectBucket {
     sessions: Vec<SessionSummary>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProjectViewMode {
+    Absolute,
+    Tree,
+}
+
 #[derive(Clone, Copy, Default)]
 struct PaneLayout {
     search: ratatui::layout::Rect,
@@ -810,6 +817,7 @@ struct App {
     search_query: String,
     search_focused: bool,
     search_dirty: bool,
+    project_view_mode: ProjectViewMode,
     preview_mode: PreviewMode,
     preview_selecting: bool,
     preview_mouse_down_pos: Option<(usize, usize)>,
@@ -862,6 +870,7 @@ impl App {
             search_query: String::new(),
             search_focused: false,
             search_dirty: false,
+            project_view_mode: ProjectViewMode::Absolute,
             preview_mode: PreviewMode::Chat,
             preview_selecting: false,
             preview_mouse_down_pos: None,
@@ -1047,16 +1056,14 @@ impl App {
         for project in &self.all_projects {
             let mut scored: Vec<(i64, SessionSummary)> = Vec::new();
             for session in &project.sessions {
-                let session_text = format!(
-                    "{}\n{}\n{}\n{}",
-                    session.search_blob, session.file_name, session.id, project.cwd
-                );
-                let mut best = fuzzy_score(&query, &session_text).unwrap_or(i64::MIN);
-                if let Some(path_score) = fuzzy_score(&query, &project.cwd.to_lowercase()) {
-                    best = best.max(path_score / 2);
-                }
-                if best > i64::MIN {
-                    scored.push((best, session.clone()));
+                if let Some(score) = search_score(
+                    &query,
+                    &session.search_blob,
+                    &project.cwd,
+                    &session.file_name,
+                    &session.id,
+                ) {
+                    scored.push((score, session.clone()));
                 }
             }
 
@@ -1106,6 +1113,17 @@ impl App {
 
     fn search_visible(&self) -> bool {
         self.search_focused || !self.search_query.trim().is_empty()
+    }
+
+    fn toggle_project_view_mode(&mut self) {
+        self.project_view_mode = match self.project_view_mode {
+            ProjectViewMode::Absolute => ProjectViewMode::Tree,
+            ProjectViewMode::Tree => ProjectViewMode::Absolute,
+        };
+        self.status = match self.project_view_mode {
+            ProjectViewMode::Absolute => String::from("Projects view: absolute cwd"),
+            ProjectViewMode::Tree => String::from("Projects view: tree"),
+        };
     }
 
     fn resize_focused_pane(&mut self, delta: i16) {
@@ -1829,9 +1847,14 @@ fn render_projects(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app:
     let items: Vec<ListItem> = app
         .projects
         .iter()
-        .map(|project| {
-            let label = format!("{} ({})", project.cwd, project.sessions.len());
-            ListItem::new(label)
+        .enumerate()
+        .map(|(idx, project)| {
+            let label = format!(
+                "{} ({})",
+                project_label(&app.projects, idx, app.project_view_mode),
+                project.sessions.len()
+            );
+            ListItem::new(Line::from(highlight_spans(&label, &app.search_query)))
         })
         .collect();
 
@@ -1850,7 +1873,10 @@ fn render_projects(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app:
     let list = List::new(items)
         .block(
             Block::default()
-                .title("Projects (cwd) [m/r rename] [c/y copy]")
+                .title(match app.project_view_mode {
+                    ProjectViewMode::Absolute => "Projects (cwd) [t tree] [m/r rename] [c/y copy]",
+                    ProjectViewMode::Tree => "Projects (tree) [t absolute] [m/r rename] [c/y copy]",
+                })
                 .borders(Borders::ALL)
                 .border_style(focus_style)
                 .style(Style::default().add_modifier(Modifier::DIM)),
@@ -1921,8 +1947,14 @@ fn render_sessions(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app:
                 Style::default().fg(Color::DarkGray)
             };
             ListItem::new(vec![
-                Line::from(Span::styled(format!("{mark} {line1}"), line1_style)),
-                Line::from(Span::styled(format!("    {line2}"), line2_style)),
+                Line::from(prepend_style(
+                    highlight_spans(&format!("{mark} {line1}"), &app.search_query),
+                    line1_style,
+                )),
+                Line::from(prepend_style(
+                    highlight_spans(&format!("    {line2}"), &app.search_query),
+                    line2_style,
+                )),
             ])
         })
         .collect();
@@ -2299,6 +2331,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
         Line::from(vec![
             Span::styled("j/k", Style::default().fg(Color::Cyan)),
             Span::raw(" project nav  "),
+            Span::styled("t", Style::default().fg(Color::Yellow)),
+            Span::raw(" toggle tree  "),
             Span::styled("m or r", Style::default().fg(Color::Green)),
             Span::raw(" rename folder sessions  "),
             Span::styled("c or y", Style::default().fg(Color::Green)),
@@ -2331,6 +2365,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" focus  "),
             Span::styled("j/k", Style::default().fg(Color::Cyan)),
             Span::raw(" nav  "),
+            Span::styled("t", Style::default().fg(Color::Yellow)),
+            Span::raw(" tree  "),
             Span::styled("/", Style::default().fg(Color::Cyan)),
             Span::raw(" search  "),
             Span::styled("v", Style::default().fg(Color::Cyan)),
@@ -2844,6 +2880,129 @@ fn render_markdown_lines(text: &str, width: usize) -> Vec<String> {
     }
 }
 
+fn search_tokens(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn search_score(
+    query: &str,
+    search_blob: &str,
+    cwd: &str,
+    file_name: &str,
+    session_id: &str,
+) -> Option<i64> {
+    let tokens = search_tokens(query);
+    if tokens.is_empty() {
+        return Some(0);
+    }
+
+    let haystacks = [
+        search_blob.to_lowercase(),
+        cwd.to_lowercase(),
+        file_name.to_lowercase(),
+        session_id.to_lowercase(),
+    ];
+
+    let mut total = 0i64;
+    for token in &tokens {
+        let mut best = i64::MIN;
+        for hay in &haystacks {
+            if let Some(score) = fuzzy_score(token, hay) {
+                let mut adjusted = score;
+                if hay.contains(token) {
+                    adjusted += 24;
+                }
+                if hay.starts_with(token) {
+                    adjusted += 10;
+                }
+                best = best.max(adjusted);
+            }
+        }
+        if best == i64::MIN {
+            return None;
+        }
+        total += best;
+    }
+
+    if tokens.len() > 1 && search_blob.to_lowercase().contains(&query.to_lowercase()) {
+        total += 20;
+    }
+    Some(total)
+}
+
+fn highlight_spans(text: &str, query: &str) -> Vec<Span<'static>> {
+    let tokens = search_tokens(query);
+    if tokens.is_empty() {
+        return vec![Span::raw(text.to_string())];
+    }
+
+    let lower = text.to_lowercase();
+    let mut ranges = Vec::<(usize, usize)>::new();
+    for token in tokens {
+        let mut start_at = 0usize;
+        while let Some(rel) = lower[start_at..].find(&token) {
+            let start = start_at + rel;
+            let end = start + token.len();
+            ranges.push((start, end));
+            start_at = end;
+            if start_at >= lower.len() {
+                break;
+            }
+        }
+    }
+    if ranges.is_empty() {
+        return vec![Span::raw(text.to_string())];
+    }
+    ranges.sort_unstable();
+    let mut merged = Vec::<(usize, usize)>::new();
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut()
+            && start <= last.1
+        {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut spans = Vec::new();
+    let mut cursor = 0usize;
+    for (start_b, end_b) in merged {
+        let start = text[..start_b].chars().count();
+        let end = text[..end_b].chars().count();
+        if cursor < start {
+            spans.push(Span::raw(chars[cursor..start].iter().collect::<String>()));
+        }
+        spans.push(Span::styled(
+            chars[start..end].iter().collect::<String>(),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        cursor = end;
+    }
+    if cursor < chars.len() {
+        spans.push(Span::raw(chars[cursor..].iter().collect::<String>()));
+    }
+    spans
+}
+
+fn prepend_style(spans: Vec<Span<'static>>, base: Style) -> Vec<Span<'static>> {
+    spans
+        .into_iter()
+        .map(|span| {
+            let style = base.patch(span.style);
+            Span::styled(span.content.into_owned(), style)
+        })
+        .collect()
+}
+
 fn split_markdown_prefix(raw: &str) -> (String, &str) {
     let trimmed = raw.trim_start();
     let indent_len = raw.len().saturating_sub(trimmed.len());
@@ -2871,6 +3030,58 @@ fn split_markdown_prefix(raw: &str) -> (String, &str) {
         return (format!("{indent}{marker} "), rest);
     }
     (indent, trimmed)
+}
+
+fn project_label(projects: &[ProjectBucket], idx: usize, mode: ProjectViewMode) -> String {
+    let cwd = projects
+        .get(idx)
+        .map(|p| p.cwd.as_str())
+        .unwrap_or("<unknown>");
+    if mode == ProjectViewMode::Absolute {
+        return cwd.to_string();
+    }
+
+    let common = shared_path_prefix(projects);
+    let parts = path_components(cwd);
+    let common_len = common.len().min(parts.len());
+    let rel = &parts[common_len..];
+    if rel.is_empty() {
+        return cwd.to_string();
+    }
+
+    let indent = "  ".repeat(rel.len().saturating_sub(1).min(6));
+    format!("{indent}{}", rel.last().unwrap_or(&String::from(cwd)))
+}
+
+fn shared_path_prefix(projects: &[ProjectBucket]) -> Vec<String> {
+    let mut iter = projects.iter();
+    let Some(first) = iter.next() else {
+        return Vec::new();
+    };
+    let mut prefix = path_components(&first.cwd);
+    for project in iter {
+        let parts = path_components(&project.cwd);
+        let keep = prefix
+            .iter()
+            .zip(parts.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        prefix.truncate(keep);
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    prefix
+}
+
+fn path_components(path: &str) -> Vec<String> {
+    Path::new(path)
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(v) => Some(v.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn split_ordered_list(s: &str) -> Option<(&str, &str)> {
@@ -3506,6 +3717,7 @@ mod tests {
             search_query: String::new(),
             search_focused: false,
             search_dirty: false,
+            project_view_mode: ProjectViewMode::Absolute,
             preview_mode: PreviewMode::Chat,
             preview_selecting: false,
             preview_mouse_down_pos: None,
@@ -3555,6 +3767,47 @@ mod tests {
         let a = fuzzy_score("abc", "a_b_c").unwrap_or(i64::MIN);
         let b = fuzzy_score("abc", "alphabet-bucket-code").unwrap_or(i64::MIN);
         assert!(a > b);
+    }
+
+    #[test]
+    fn search_tokens_match_across_multiple_words() {
+        let score = search_score(
+            "deploy alpha",
+            "fix deploy pipeline for alpha release",
+            "/repo/alpha",
+            "deploy-alpha.jsonl",
+            "sess-1",
+        );
+        assert!(score.is_some());
+    }
+
+    #[test]
+    fn search_tokens_require_all_terms() {
+        let score = search_score(
+            "deploy alpha",
+            "deploy pipeline only",
+            "/repo/beta",
+            "deploy.jsonl",
+            "sess-1",
+        );
+        assert!(score.is_none());
+    }
+
+    #[test]
+    fn project_tree_label_uses_shared_prefix() {
+        let projects = vec![
+            ProjectBucket {
+                cwd: String::from("/work/src/api"),
+                sessions: Vec::new(),
+            },
+            ProjectBucket {
+                cwd: String::from("/work/src/web"),
+                sessions: Vec::new(),
+            },
+        ];
+        let label = project_label(&projects, 0, ProjectViewMode::Tree);
+        assert!(label.contains("api"));
+        assert!(!label.contains("/work/src/api"));
     }
 
     #[test]
@@ -3753,6 +4006,7 @@ mod tests {
             search_query: String::new(),
             search_focused: false,
             search_dirty: false,
+            project_view_mode: ProjectViewMode::Absolute,
             preview_mode: PreviewMode::Chat,
             preview_selecting: false,
             preview_mouse_down_pos: None,
@@ -4074,6 +4328,7 @@ mod tests {
             search_query: String::from("alpha"),
             search_focused: true,
             search_dirty: true,
+            project_view_mode: ProjectViewMode::Absolute,
             preview_mode: PreviewMode::Chat,
             preview_selecting: false,
             preview_mouse_down_pos: None,
@@ -4121,6 +4376,7 @@ mod tests {
             search_query: String::new(),
             search_focused: false,
             search_dirty: false,
+            project_view_mode: ProjectViewMode::Absolute,
             preview_mode: PreviewMode::Chat,
             preview_selecting: false,
             preview_mouse_down_pos: None,
