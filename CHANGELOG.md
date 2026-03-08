@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.2 - 2026-03-08
+
+Release pipeline follow-up.
+
+### Changed
+- Switched npm publishing in GitHub Actions to npm trusted publishing via GitHub OIDC.
+- Updated the release workflow to use a modern Node/npm runtime compatible with trusted publishing.
+
 ## 1.0.1 - 2026-03-08
 
 Packaging follow-up release.
