@@ -2035,11 +2035,7 @@ fn render_browser(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
                 .border_style(focus_style)
                 .style(Style::default().add_modifier(Modifier::DIM)),
         )
-        .highlight_style(
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-        )
+        .highlight_style(browser_highlight_style())
         .highlight_symbol(" > ");
 
     frame.render_stateful_widget(list, area, &mut state);
@@ -2050,6 +2046,13 @@ fn render_browser(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
         rows.len(),
         App::visible_rows(area.height, 1),
     );
+}
+
+fn browser_highlight_style() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn format_session_browser_line(session: &SessionSummary) -> String {
@@ -4312,6 +4315,15 @@ mod tests {
         };
         let line = format_session_browser_line(&s);
         assert_eq!(line, "1234567");
+    }
+
+    #[test]
+    fn browser_highlight_style_is_explicit_high_contrast() {
+        let style = browser_highlight_style();
+        assert_eq!(style.fg, Some(Color::Black));
+        assert_eq!(style.bg, Some(Color::Cyan));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+        assert!(!style.add_modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
