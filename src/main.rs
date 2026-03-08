@@ -482,6 +482,20 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
         return Ok(false);
     }
 
+    if key.modifiers.contains(KeyModifiers::CONTROL) && app.focus == Focus::Projects {
+        match key.code {
+            KeyCode::Left => {
+                app.collapse_all_projects_except_current();
+                return Ok(false);
+            }
+            KeyCode::Right => {
+                app.expand_all_projects();
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
+
     if key.modifiers.intersects(disallowed_mods) {
         return Ok(false);
     }
@@ -1121,6 +1135,25 @@ impl App {
             return;
         }
         self.toggle_current_project_collapsed();
+    }
+
+    fn collapse_all_projects_except_current(&mut self) {
+        let current_cwd = self.current_project().map(|project| project.cwd.clone());
+        self.collapsed_projects.clear();
+        for project in &self.projects {
+            if Some(project.cwd.as_str()) != current_cwd.as_deref() {
+                self.collapsed_projects.insert(project.cwd.clone());
+            }
+        }
+        self.browser_cursor = BrowserCursor::Project;
+        self.ensure_selection_visible();
+        self.status = String::from("Collapsed all folders except current");
+    }
+
+    fn expand_all_projects(&mut self) {
+        self.collapsed_projects.clear();
+        self.ensure_selection_visible();
+        self.status = String::from("Expanded all folders");
     }
 
     fn browser_enter(&mut self) {
@@ -2560,6 +2593,10 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" folder nav  "),
             Span::styled("←/→", Style::default().fg(Color::Cyan)),
             Span::raw(" collapse/expand  "),
+            Span::styled("ctrl+←", Style::default().fg(Color::Cyan)),
+            Span::raw(" collapse others  "),
+            Span::styled("ctrl+→", Style::default().fg(Color::Cyan)),
+            Span::raw(" expand all  "),
             Span::styled("m or r", Style::default().fg(Color::Green)),
             Span::raw(" rename folder sessions  "),
             Span::styled("c or y", Style::default().fg(Color::Green)),
@@ -4562,6 +4599,63 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_left_collapses_all_except_current_project() {
+        let mut app = empty_test_app();
+        app.projects = vec![
+            ProjectBucket {
+                cwd: String::from("/repo-a"),
+                sessions: vec![sample_session("/tmp/a.jsonl", "/repo-a", "a")],
+            },
+            ProjectBucket {
+                cwd: String::from("/repo-b"),
+                sessions: vec![sample_session("/tmp/b.jsonl", "/repo-b", "b")],
+            },
+            ProjectBucket {
+                cwd: String::from("/repo-c"),
+                sessions: vec![sample_session("/tmp/c.jsonl", "/repo-c", "c")],
+            },
+        ];
+        app.project_idx = 1;
+        app.browser_cursor = BrowserCursor::Session;
+
+        let quit = handle_normal_mode(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .expect("handle");
+        assert!(!quit);
+        assert_eq!(app.browser_cursor, BrowserCursor::Project);
+        assert!(!app.collapsed_projects.contains("/repo-b"));
+        assert!(app.collapsed_projects.contains("/repo-a"));
+        assert!(app.collapsed_projects.contains("/repo-c"));
+    }
+
+    #[test]
+    fn ctrl_right_expands_all_projects() {
+        let mut app = empty_test_app();
+        app.projects = vec![
+            ProjectBucket {
+                cwd: String::from("/repo-a"),
+                sessions: vec![sample_session("/tmp/a.jsonl", "/repo-a", "a")],
+            },
+            ProjectBucket {
+                cwd: String::from("/repo-b"),
+                sessions: vec![sample_session("/tmp/b.jsonl", "/repo-b", "b")],
+            },
+        ];
+        app.collapsed_projects.insert(String::from("/repo-a"));
+        app.collapsed_projects.insert(String::from("/repo-b"));
+
+        let quit = handle_normal_mode(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .expect("handle");
+        assert!(!quit);
+        assert!(app.collapsed_projects.is_empty());
+    }
+
+    #[test]
     fn moving_up_to_project_row_auto_expands_it() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
@@ -5236,6 +5330,36 @@ mod tests {
         assert!(buffer_contains(backend, "tab"));
         assert!(buffer_contains(backend, "shift+tab"));
         assert!(buffer_contains(backend, "close search"));
+    }
+
+    #[test]
+    fn render_status_shows_bulk_folder_shortcuts() {
+        let mut app = empty_test_app();
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Project;
+
+        let backend = TestBackend::new(120, 4);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_status(
+                    frame,
+                    ratatui::layout::Rect {
+                        x: 0,
+                        y: 0,
+                        width: 120,
+                        height: 4,
+                    },
+                    &app,
+                );
+            })
+            .expect("draw");
+
+        let backend = terminal.backend();
+        assert!(buffer_contains(backend, "ctrl+←"));
+        assert!(buffer_contains(backend, "collapse others"));
+        assert!(buffer_contains(backend, "ctrl+→"));
+        assert!(buffer_contains(backend, "expand all"));
     }
 
     #[test]
