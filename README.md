@@ -1,6 +1,6 @@
 # codex-session-tui
 
-`npx -y @avikalpa/codex-session-tui`
+`npx -y codex-session-tui`
 
 ## Demo
 
@@ -33,7 +33,7 @@ After a repo/folder move, old sessions can become hard to discover.
 Install globally:
 
 ```bash
-npm i -g @avikalpa/codex-session-tui
+npm i -g codex-session-tui
 codex-session-tui
 # press "/" to open search quickly
 ```
@@ -48,7 +48,7 @@ CODEX_HOME=/path/to/.codex codex-session-tui
 or with `npx`:
 
 ```bash
-CODEX_HOME=/path/to/.codex npx -y @avikalpa/codex-session-tui
+CODEX_HOME=/path/to/.codex npx -y codex-session-tui
 # press "/" to open search quickly
 ```
 
