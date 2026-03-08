@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.4 - 2026-03-08
+
+Packaging follow-up.
+
+### Changed
+- Switched the npm package name back from `@avikalpa/codex-session-tui` to unscoped `codex-session-tui`.
+- Updated install and `npx` usage examples back to the unscoped package name.
+
 ## 1.0.3 - 2026-03-08
 
 Release pipeline follow-up.
