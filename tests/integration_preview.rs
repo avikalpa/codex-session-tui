@@ -21,6 +21,8 @@ fn integration_preview_chat_mode_contains_turn_labels() {
         id: "x".to_string(),
         cwd: "/tmp/int".to_string(),
         started_at: "2026-01-01T00:00:00Z".to_string(),
+        modified_at: "2026-01-02 03:04".to_string(),
+        modified_epoch: 123,
         event_count: 3,
         search_blob: "one two".to_string(),
     };

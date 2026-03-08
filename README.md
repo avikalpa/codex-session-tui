@@ -10,10 +10,11 @@
 
 - **Fast search/filter (`/`)** with tokenized matching and result highlighting
 - Parse/session-index JSONL files from `${CODEX_HOME:-~/.codex}/sessions`
-- Group sessions by project `cwd`, with toggleable absolute/tree project views
-- 3-pane TUI: Projects, Sessions, Preview
+- Group sessions by project `cwd` in a tree-style browser pane
+- 2-pane TUI: Browser, Preview
 - Operations: move, copy, fork, delete, project-folder rename/copy
 - Multi-select sessions and bulk operations
+- Sessions sorted by last modified, with short hash-style ids and human-readable labels
 - Foldable preview blocks, mouse selection/copy, draggable splitters/scrollbars
 
 ## Motivation
@@ -33,7 +34,6 @@ Install globally:
 npm i -g codex-session-tui
 codex-session-tui
 # press "/" to open search quickly
-# press "t" to toggle projects between absolute and tree view
 ```
 
 Use a different Codex home:
@@ -41,7 +41,6 @@ Use a different Codex home:
 ```bash
 CODEX_HOME=/path/to/.codex codex-session-tui
 # press "/" to open search quickly
-# press "t" to toggle projects between absolute and tree view
 ```
 
 or with `npx`:
@@ -49,7 +48,6 @@ or with `npx`:
 ```bash
 CODEX_HOME=/path/to/.codex npx -y codex-session-tui
 # press "/" to open search quickly
-# press "t" to toggle projects between absolute and tree view
 ```
 
 ## Platforms

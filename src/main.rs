@@ -87,60 +87,44 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
             if is_on_splitter(
                 mouse.column,
                 mouse.row,
-                app.panes.projects,
-                app.panes.sessions,
-            ) {
-                app.drag_target = Some(DragTarget::LeftSplitter);
-                return;
-            }
-            if is_on_splitter(
-                mouse.column,
-                mouse.row,
-                app.panes.sessions,
+                app.panes.browser,
                 app.panes.preview,
             ) {
-                app.drag_target = Some(DragTarget::RightSplitter);
+                app.drag_target = Some(DragTarget::LeftSplitter);
                 return;
             }
 
             if point_in_rect(mouse.column, mouse.row, app.panes.search) {
                 app.search_focused = true;
                 app.input_focused = false;
-            } else if point_in_rect(mouse.column, mouse.row, app.panes.projects) {
+            } else if point_in_rect(mouse.column, mouse.row, app.panes.browser) {
                 app.search_focused = false;
                 if app.mode == Mode::Input {
                     app.input_focused = false;
                 }
                 app.focus = Focus::Projects;
-                let idx = app.project_scroll + mouse_row_to_index(mouse.row, app.panes.projects);
-                if idx < app.projects.len() {
-                    app.project_idx = idx;
-                    app.clamp_session_idx();
-                    app.session_select_anchor = None;
-                    app.preview_scroll = 0;
-                    app.ensure_selection_visible();
-                }
-            } else if point_in_rect(mouse.column, mouse.row, app.panes.sessions) {
-                app.search_focused = false;
-                if app.mode == Mode::Input {
-                    app.input_focused = false;
-                }
-                app.focus = Focus::Sessions;
-                let len = app.current_project().map(|p| p.sessions.len()).unwrap_or(0);
-                let idx =
-                    app.session_scroll + (mouse_row_to_index(mouse.row, app.panes.sessions) / 2);
-                if idx < len {
-                    let checkbox_hit =
-                        is_sessions_checkbox_hit(mouse.column, mouse.row, app.panes.sessions);
-                    if checkbox_hit {
-                        app.session_idx = idx;
-                        app.toggle_current_session_selection();
+                let rows = app.browser_rows();
+                let idx = app.project_scroll + mouse_row_to_index(mouse.row, app.panes.browser);
+                if let Some(row) = rows.get(idx).copied() {
+                    app.project_idx = row.project_idx;
+                    app.browser_cursor = if let Some(session_idx) = row.session_idx {
+                        app.session_idx = session_idx;
+                        let checkbox_hit =
+                            is_sessions_checkbox_hit(mouse.column, mouse.row, app.panes.browser);
+                        if checkbox_hit {
+                            app.toggle_current_session_selection();
+                        } else {
+                            app.session_select_anchor = Some(session_idx);
+                        }
+                        BrowserCursor::Session
                     } else {
-                        app.session_idx = idx;
-                        app.session_select_anchor = Some(idx);
-                    }
-                    app.preview_scroll = 0;
+                        BrowserCursor::Project
+                    };
+                    app.clamp_session_idx();
                     app.ensure_selection_visible();
+                    if row.session_idx.is_some() {
+                        app.preview_scroll = 0;
+                    }
                 }
             } else if point_in_rect(mouse.column, mouse.row, app.panes.preview) {
                 app.search_focused = false;
@@ -227,11 +211,8 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
             app.drag_target = None;
         }
         MouseEventKind::ScrollUp => {
-            if point_in_rect(mouse.column, mouse.row, app.panes.projects) {
+            if point_in_rect(mouse.column, mouse.row, app.panes.browser) {
                 app.focus = Focus::Projects;
-                app.move_up();
-            } else if point_in_rect(mouse.column, mouse.row, app.panes.sessions) {
-                app.focus = Focus::Sessions;
                 app.move_up();
             } else if point_in_rect(mouse.column, mouse.row, app.panes.preview) {
                 app.focus = Focus::Preview;
@@ -239,11 +220,8 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
             }
         }
         MouseEventKind::ScrollDown => {
-            if point_in_rect(mouse.column, mouse.row, app.panes.projects) {
+            if point_in_rect(mouse.column, mouse.row, app.panes.browser) {
                 app.focus = Focus::Projects;
-                app.move_down();
-            } else if point_in_rect(mouse.column, mouse.row, app.panes.sessions) {
-                app.focus = Focus::Sessions;
                 app.move_down();
             } else if point_in_rect(mouse.column, mouse.row, app.panes.preview) {
                 app.focus = Focus::Preview;
@@ -286,7 +264,7 @@ fn status_buttons(app: &App) -> Vec<StatusButton> {
     if app.mode == Mode::Input {
         return vec![StatusButton::Apply, StatusButton::Cancel];
     }
-    if app.focus == Focus::Projects {
+    if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Project {
         return vec![
             StatusButton::ProjectRename,
             StatusButton::ProjectCopy,
@@ -294,7 +272,7 @@ fn status_buttons(app: &App) -> Vec<StatusButton> {
             StatusButton::Quit,
         ];
     }
-    if app.focus == Focus::Sessions {
+    if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Session {
         return vec![
             StatusButton::SelectAll,
             StatusButton::Invert,
@@ -384,11 +362,8 @@ fn point_in_rect(x: u16, y: u16, rect: ratatui::layout::Rect) -> bool {
 }
 
 fn scrollbar_target_at(x: u16, y: u16, app: &App) -> Option<ScrollTarget> {
-    if is_on_scrollbar(x, y, app.panes.projects) {
+    if is_on_scrollbar(x, y, app.panes.browser) {
         return Some(ScrollTarget::Projects);
-    }
-    if is_on_scrollbar(x, y, app.panes.sessions) {
-        return Some(ScrollTarget::Sessions);
     }
     if is_on_scrollbar(x, y, app.panes.preview) {
         return Some(ScrollTarget::Preview);
@@ -428,18 +403,11 @@ fn scroll_offset_from_mouse_row(
 fn jump_to_scroll_from_mouse(target: ScrollTarget, y: u16, app: &mut App) {
     match target {
         ScrollTarget::Projects => {
-            let viewport = App::visible_rows(app.panes.projects.height, 1);
-            let off =
-                scroll_offset_from_mouse_row(y, app.panes.projects, app.projects.len(), viewport);
+            let rows = app.browser_rows();
+            let viewport = App::visible_rows(app.panes.browser.height, 1);
+            let off = scroll_offset_from_mouse_row(y, app.panes.browser, rows.len(), viewport);
             app.project_scroll = off;
             app.focus = Focus::Projects;
-        }
-        ScrollTarget::Sessions => {
-            let len = app.current_project().map(|p| p.sessions.len()).unwrap_or(0);
-            let viewport = App::visible_rows(app.panes.sessions.height, 2);
-            let off = scroll_offset_from_mouse_row(y, app.panes.sessions, len, viewport);
-            app.session_scroll = off;
-            app.focus = Focus::Sessions;
         }
         ScrollTarget::Preview => {
             let viewport = app.panes.preview.height.saturating_sub(2) as usize;
@@ -465,12 +433,10 @@ fn mouse_col_to_index(x: u16, pane: ratatui::layout::Rect) -> usize {
     x.saturating_sub(pane.x.saturating_add(1)) as usize
 }
 
-fn is_sessions_checkbox_hit(x: u16, y: u16, pane: ratatui::layout::Rect) -> bool {
-    let row = mouse_row_to_index(y, pane);
+fn is_sessions_checkbox_hit(x: u16, _y: u16, pane: ratatui::layout::Rect) -> bool {
     let col = mouse_col_to_index(x, pane);
-    // Session items are 2 rows high. Checkbox is rendered on the first row and
-    // appears after list's highlight gutter, so allow a small left-column band.
-    row.is_multiple_of(2) && col <= 7
+    // Browser rows are single-line; session checkbox sits near the left gutter.
+    col <= 7
 }
 
 fn copy_to_clipboard_osc52(text: &str) -> Result<()> {
@@ -516,17 +482,17 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
             app.search_focused = true;
         }
         KeyCode::Char(' ') => {
-            if app.focus == Focus::Sessions {
+            if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Session {
                 app.toggle_current_session_selection();
             }
         }
         KeyCode::Char('a') => {
-            if app.focus == Focus::Sessions {
+            if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Session {
                 app.select_all_sessions_current_project();
             }
         }
         KeyCode::Char('i') => {
-            if app.focus == Focus::Sessions {
+            if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Session {
                 app.invert_sessions_selection_current_project();
             }
         }
@@ -569,23 +535,22 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
             }
         }
         KeyCode::Char('g') => app.reload()?,
-        KeyCode::Char('t') => app.toggle_project_view_mode(),
         KeyCode::Char('m') => {
-            if app.focus == Focus::Projects {
+            if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Project {
                 app.start_action(Action::ProjectRename);
             } else {
                 app.start_action(Action::Move);
             }
         }
         KeyCode::Char('c') => {
-            if app.focus == Focus::Projects {
+            if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Project {
                 app.start_action(Action::ProjectCopy);
             } else {
                 app.start_action(Action::Copy);
             }
         }
         KeyCode::Char('f') => {
-            if app.focus == Focus::Projects {
+            if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Project {
                 app.status = String::from("Project scope supports rename/copy");
             } else {
                 app.start_action(Action::Fork);
@@ -597,12 +562,12 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
             }
         }
         KeyCode::Char('r') => {
-            if app.focus == Focus::Projects {
+            if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Project {
                 app.start_action(Action::ProjectRename);
             }
         }
         KeyCode::Char('y') => {
-            if app.focus == Focus::Projects {
+            if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Project {
                 app.start_action(Action::ProjectCopy);
             }
         }
@@ -685,25 +650,22 @@ impl Tui {
             let panes = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
-                    Constraint::Percentage(app.project_width_pct),
-                    Constraint::Percentage(app.session_width_pct),
+                    Constraint::Percentage(app.project_width_pct + app.session_width_pct),
                     Constraint::Percentage(app.preview_width_pct()),
                 ])
                 .split(root[1]);
 
             app.panes = PaneLayout {
                 search: root[0],
-                projects: panes[0],
-                sessions: panes[1],
-                preview: panes[2],
+                browser: panes[0],
+                preview: panes[1],
                 status: root[2],
             };
             app.ensure_selection_visible();
             if app.search_visible() {
                 render_search(frame, root[0], app);
             }
-            render_projects(frame, app.panes.projects, app);
-            render_sessions(frame, app.panes.sessions, app);
+            render_browser(frame, app.panes.browser, app);
             render_preview(frame, app.panes.preview, app);
             render_status(frame, root[2], app);
         })?;
@@ -728,8 +690,13 @@ impl Tui {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Projects,
-    Sessions,
     Preview,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BrowserCursor {
+    Project,
+    Session,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -757,13 +724,11 @@ enum PreviewMode {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DragTarget {
     LeftSplitter,
-    RightSplitter,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ScrollTarget {
     Projects,
-    Sessions,
     Preview,
 }
 
@@ -774,6 +739,9 @@ struct SessionSummary {
     id: String,
     cwd: String,
     started_at: String,
+    modified_at: String,
+    modified_epoch: i64,
+    #[allow(dead_code)]
     event_count: usize,
     search_blob: String,
 }
@@ -784,17 +752,10 @@ struct ProjectBucket {
     sessions: Vec<SessionSummary>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ProjectViewMode {
-    Absolute,
-    Tree,
-}
-
 #[derive(Clone, Copy, Default)]
 struct PaneLayout {
     search: ratatui::layout::Rect,
-    projects: ratatui::layout::Rect,
-    sessions: ratatui::layout::Rect,
+    browser: ratatui::layout::Rect,
     preview: ratatui::layout::Rect,
     status: ratatui::layout::Rect,
 }
@@ -805,6 +766,7 @@ struct App {
     projects: Vec<ProjectBucket>,
     project_idx: usize,
     session_idx: usize,
+    browser_cursor: BrowserCursor,
     selected_sessions: HashSet<PathBuf>,
     session_select_anchor: Option<usize>,
     focus: Focus,
@@ -817,7 +779,6 @@ struct App {
     search_query: String,
     search_focused: bool,
     search_dirty: bool,
-    project_view_mode: ProjectViewMode,
     preview_mode: PreviewMode,
     preview_selecting: bool,
     preview_mouse_down_pos: Option<(usize, usize)>,
@@ -847,6 +808,12 @@ struct CachedPreviewSource {
     events: Vec<String>,
 }
 
+#[derive(Clone, Copy)]
+struct BrowserRow {
+    project_idx: usize,
+    session_idx: Option<usize>,
+}
+
 impl App {
     fn load() -> Result<Self> {
         let codex_home = resolve_codex_home()?;
@@ -858,6 +825,7 @@ impl App {
             projects: Vec::new(),
             project_idx: 0,
             session_idx: 0,
+            browser_cursor: BrowserCursor::Project,
             selected_sessions: HashSet::new(),
             session_select_anchor: None,
             focus: Focus::Projects,
@@ -870,7 +838,6 @@ impl App {
             search_query: String::new(),
             search_focused: false,
             search_dirty: false,
-            project_view_mode: ProjectViewMode::Absolute,
             preview_mode: PreviewMode::Chat,
             preview_selecting: false,
             preview_mouse_down_pos: None,
@@ -918,6 +885,7 @@ impl App {
             self.session_idx = self.session_idx.min(sessions_len.saturating_sub(1));
         } else {
             self.session_idx = 0;
+            self.browser_cursor = BrowserCursor::Project;
         }
 
         self.status = format!("Loaded {} projects", self.projects.len());
@@ -936,8 +904,7 @@ impl App {
 
     fn next_focus(&mut self) {
         self.focus = match self.focus {
-            Focus::Projects => Focus::Sessions,
-            Focus::Sessions => Focus::Preview,
+            Focus::Projects => Focus::Preview,
             Focus::Preview => Focus::Projects,
         };
     }
@@ -953,19 +920,22 @@ impl App {
 
         match self.focus {
             Focus::Projects => {
-                if self.project_idx > 0 {
-                    self.project_idx -= 1;
+                match self.browser_cursor {
+                    BrowserCursor::Project => {
+                        if self.project_idx > 0 {
+                            self.project_idx -= 1;
+                        }
+                    }
+                    BrowserCursor::Session => {
+                        if self.session_idx > 0 {
+                            self.session_idx -= 1;
+                        } else {
+                            self.browser_cursor = BrowserCursor::Project;
+                        }
+                    }
                 }
                 self.clamp_session_idx();
                 self.session_select_anchor = None;
-                self.preview_scroll = 0;
-                self.ensure_selection_visible();
-            }
-            Focus::Sessions => {
-                if self.session_idx > 0 {
-                    self.session_idx -= 1;
-                }
-                self.preview_scroll = 0;
                 self.ensure_selection_visible();
             }
             Focus::Preview => {
@@ -981,21 +951,32 @@ impl App {
 
         match self.focus {
             Focus::Projects => {
-                if self.project_idx + 1 < self.projects.len() {
-                    self.project_idx += 1;
+                match self.browser_cursor {
+                    BrowserCursor::Project => {
+                        let session_len = self
+                            .current_project()
+                            .map(|project| project.sessions.len())
+                            .unwrap_or(0);
+                        if session_len > 0 {
+                            self.browser_cursor = BrowserCursor::Session;
+                            self.session_idx = self.session_idx.min(session_len - 1);
+                        } else if self.project_idx + 1 < self.projects.len() {
+                            self.project_idx += 1;
+                        }
+                    }
+                    BrowserCursor::Session => {
+                        if let Some(project) = self.current_project() {
+                            if self.session_idx + 1 < project.sessions.len() {
+                                self.session_idx += 1;
+                            } else if self.project_idx + 1 < self.projects.len() {
+                                self.project_idx += 1;
+                                self.browser_cursor = BrowserCursor::Project;
+                            }
+                        }
+                    }
                 }
                 self.clamp_session_idx();
                 self.session_select_anchor = None;
-                self.preview_scroll = 0;
-                self.ensure_selection_visible();
-            }
-            Focus::Sessions => {
-                if let Some(project) = self.current_project() {
-                    if self.session_idx + 1 < project.sessions.len() {
-                        self.session_idx += 1;
-                    }
-                }
-                self.preview_scroll = 0;
                 self.ensure_selection_visible();
             }
             Focus::Preview => {
@@ -1022,19 +1003,54 @@ impl App {
         (rows / item_height.max(1)).max(1)
     }
 
-    fn ensure_selection_visible(&mut self) {
-        let project_visible = Self::visible_rows(self.panes.projects.height, 1);
-        if self.project_idx < self.project_scroll {
-            self.project_scroll = self.project_idx;
-        } else if self.project_idx >= self.project_scroll + project_visible {
-            self.project_scroll = self.project_idx + 1 - project_visible;
+    fn browser_rows(&self) -> Vec<BrowserRow> {
+        let mut rows = Vec::new();
+        for (project_idx, project) in self.projects.iter().enumerate() {
+            rows.push(BrowserRow {
+                project_idx,
+                session_idx: None,
+            });
+            if project_idx == self.project_idx {
+                for session_idx in 0..project.sessions.len() {
+                    rows.push(BrowserRow {
+                        project_idx,
+                        session_idx: Some(session_idx),
+                    });
+                }
+            }
         }
+        rows
+    }
 
-        let session_visible = Self::visible_rows(self.panes.sessions.height, 2);
-        if self.session_idx < self.session_scroll {
-            self.session_scroll = self.session_idx;
-        } else if self.session_idx >= self.session_scroll + session_visible {
-            self.session_scroll = self.session_idx + 1 - session_visible;
+    fn current_browser_row_index(&self) -> usize {
+        let mut row = 0usize;
+        for (project_idx, project) in self.projects.iter().enumerate() {
+            if project_idx == self.project_idx {
+                return row
+                    + match self.browser_cursor {
+                        BrowserCursor::Project => 0,
+                        BrowserCursor::Session => {
+                            1 + self
+                                .session_idx
+                                .min(project.sessions.len().saturating_sub(1))
+                        }
+                    };
+            }
+            row += 1;
+            if project_idx == self.project_idx {
+                row += project.sessions.len();
+            }
+        }
+        0
+    }
+
+    fn ensure_selection_visible(&mut self) {
+        let visible = Self::visible_rows(self.panes.browser.height, 1);
+        let current = self.current_browser_row_index();
+        if current < self.project_scroll {
+            self.project_scroll = current;
+        } else if current >= self.project_scroll + visible {
+            self.project_scroll = current + 1 - visible;
         }
     }
 
@@ -1043,6 +1059,7 @@ impl App {
             self.projects = self.all_projects.clone();
             self.project_idx = self.project_idx.min(self.projects.len().saturating_sub(1));
             self.clamp_session_idx();
+            self.browser_cursor = BrowserCursor::Project;
             self.project_scroll = 0;
             self.session_scroll = 0;
             self.preview_scroll = 0;
@@ -1088,6 +1105,7 @@ impl App {
         self.projects = filtered;
         self.project_idx = 0;
         self.session_idx = 0;
+        self.browser_cursor = BrowserCursor::Project;
         self.project_scroll = 0;
         self.session_scroll = 0;
         self.preview_scroll = 0;
@@ -1115,17 +1133,6 @@ impl App {
         self.search_focused || !self.search_query.trim().is_empty()
     }
 
-    fn toggle_project_view_mode(&mut self) {
-        self.project_view_mode = match self.project_view_mode {
-            ProjectViewMode::Absolute => ProjectViewMode::Tree,
-            ProjectViewMode::Tree => ProjectViewMode::Absolute,
-        };
-        self.status = match self.project_view_mode {
-            ProjectViewMode::Absolute => String::from("Projects view: absolute cwd"),
-            ProjectViewMode::Tree => String::from("Projects view: tree"),
-        };
-    }
-
     fn resize_focused_pane(&mut self, delta: i16) {
         let min = 15i16;
         let mut p = self.project_width_pct as i16;
@@ -1135,10 +1142,6 @@ impl App {
         match self.focus {
             Focus::Projects => {
                 p += delta;
-                r -= delta;
-            }
-            Focus::Sessions => {
-                s += delta;
                 r -= delta;
             }
             Focus::Preview => {
@@ -1158,60 +1161,35 @@ impl App {
     fn resize_from_mouse(&mut self, target: DragTarget, mouse_x: u16) {
         let total_width = self
             .panes
-            .projects
+            .browser
             .width
-            .saturating_add(self.panes.sessions.width)
             .saturating_add(self.panes.preview.width);
         if total_width == 0 {
             return;
         }
 
-        let x0 = self.panes.projects.x;
-        let x1 = self.panes.sessions.x;
-        let x2 = self.panes.preview.x;
+        let x0 = self.panes.browser.x;
         let right = x0.saturating_add(total_width);
 
-        let mut split1 = x1;
-        let mut split2 = x2;
+        let split = match target {
+            DragTarget::LeftSplitter => mouse_x.clamp(x0.saturating_add(12), right.saturating_sub(12)),
+        };
 
-        match target {
-            DragTarget::LeftSplitter => {
-                split1 = mouse_x.clamp(x0.saturating_add(8), split2.saturating_sub(8));
-            }
-            DragTarget::RightSplitter => {
-                split2 = mouse_x.clamp(split1.saturating_add(8), right.saturating_sub(8));
-            }
-        }
-
-        let p = split1.saturating_sub(x0) as f32 / total_width as f32 * 100.0;
-        let s = split2.saturating_sub(split1) as f32 / total_width as f32 * 100.0;
+        let p = split.saturating_sub(x0) as f32 / total_width as f32 * 100.0;
         let mut p_pct = p.round() as i16;
-        let mut s_pct = s.round() as i16;
+        let mut s_pct = 100 - p_pct;
         let min = 15i16;
-        let mut r_pct = 100 - p_pct - s_pct;
-
         if p_pct < min {
-            let d = min - p_pct;
-            p_pct += d;
-            r_pct -= d;
+            p_pct = min;
+            s_pct = 100 - p_pct;
         }
         if s_pct < min {
-            let d = min - s_pct;
-            s_pct += d;
-            r_pct -= d;
+            s_pct = min;
+            p_pct = 100 - s_pct;
         }
-        if r_pct < min {
-            let d = min - r_pct;
-            if target == DragTarget::LeftSplitter {
-                p_pct -= d;
-            } else {
-                s_pct -= d;
-            }
-        }
-
-        if p_pct >= min && s_pct >= min && (100 - p_pct - s_pct) >= min {
+        if p_pct >= min && s_pct >= min {
             self.project_width_pct = p_pct as u16;
-            self.session_width_pct = s_pct as u16;
+            self.session_width_pct = 0;
         }
     }
 
@@ -1504,6 +1482,9 @@ impl App {
     }
 
     fn current_session(&self) -> Option<&SessionSummary> {
+        if self.browser_cursor != BrowserCursor::Session {
+            return None;
+        }
         self.current_project()
             .and_then(|project| project.sessions.get(self.session_idx))
     }
@@ -1843,61 +1824,6 @@ impl App {
     }
 }
 
-fn render_projects(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
-    let items: Vec<ListItem> = app
-        .projects
-        .iter()
-        .enumerate()
-        .map(|(idx, project)| {
-            let label = format!(
-                "{} ({})",
-                project_label(&app.projects, idx, app.project_view_mode),
-                project.sessions.len()
-            );
-            ListItem::new(Line::from(highlight_spans(&label, &app.search_query)))
-        })
-        .collect();
-
-    let mut state = ListState::default();
-    if !app.projects.is_empty() {
-        state.select(Some(app.project_idx));
-        state = state.with_offset(app.project_scroll);
-    }
-
-    let focus_style = if app.focus == Focus::Projects && app.mode == Mode::Normal {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default()
-    };
-
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .title(match app.project_view_mode {
-                    ProjectViewMode::Absolute => "Projects (cwd) [t tree] [m/r rename] [c/y copy]",
-                    ProjectViewMode::Tree => "Projects (tree) [t absolute] [m/r rename] [c/y copy]",
-                })
-                .borders(Borders::ALL)
-                .border_style(focus_style)
-                .style(Style::default().add_modifier(Modifier::DIM)),
-        )
-        .highlight_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-        )
-        .highlight_symbol(" > ");
-
-    frame.render_stateful_widget(list, area, &mut state);
-    render_thin_scrollbar(
-        frame,
-        area,
-        app.project_scroll,
-        app.projects.len(),
-        App::visible_rows(area.height, 1),
-    );
-}
-
 fn render_search(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
     let focus_style = if app.search_focused {
         Style::default().fg(Color::Yellow)
@@ -1922,50 +1848,51 @@ fn render_search(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
     frame.render_widget(para, area);
 }
 
-fn render_sessions(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
-    let sessions = app
-        .current_project()
-        .map(|project| project.sessions.clone())
-        .unwrap_or_default();
-
-    let items: Vec<ListItem> = sessions
+fn render_browser(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
+    let rows = app.browser_rows();
+    let items: Vec<ListItem> = rows
         .iter()
-        .map(|session| {
-            let selected = app.selected_sessions.contains(&session.path);
-            let (line1, line2) = format_session_item_lines(session);
-            let mark = if selected { "[x]" } else { "[ ]" };
-            let line1_style = if selected {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
+        .map(|row| {
+            if let Some(session_idx) = row.session_idx {
+                let session = &app.projects[row.project_idx].sessions[session_idx];
+                let selected = app.selected_sessions.contains(&session.path);
+                let mark = if selected { "[x]" } else { "[ ]" };
+                let line = format!("{mark} {}", format_session_browser_line(session));
+                let base = if selected {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Line::from(prepend_style(
+                    highlight_spans(&line, &app.search_query),
+                    base,
+                )))
             } else {
-                Style::default()
-            };
-            let line2_style = if selected {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            ListItem::new(vec![
-                Line::from(prepend_style(
-                    highlight_spans(&format!("{mark} {line1}"), &app.search_query),
-                    line1_style,
-                )),
-                Line::from(prepend_style(
-                    highlight_spans(&format!("    {line2}"), &app.search_query),
-                    line2_style,
-                )),
-            ])
+                let project = &app.projects[row.project_idx];
+                let label = format!(
+                    "📁 {} ({})",
+                    project_label(&app.projects, row.project_idx),
+                    project.sessions.len()
+                );
+                ListItem::new(Line::from(prepend_style(
+                    highlight_spans(&label, &app.search_query),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )))
+            }
         })
         .collect();
 
     let mut state = ListState::default();
-    if !sessions.is_empty() {
-        state.select(Some(app.session_idx));
-        state = state.with_offset(app.session_scroll);
+    if !rows.is_empty() {
+        state.select(Some(app.current_browser_row_index()));
+        state = state.with_offset(app.project_scroll);
     }
 
-    let focus_style = if app.focus == Focus::Sessions && app.mode == Mode::Normal {
+    let focus_style = if app.focus == Focus::Projects && app.mode == Mode::Normal {
         Style::default().fg(Color::Yellow)
     } else {
         Style::default()
@@ -1975,12 +1902,12 @@ fn render_sessions(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app:
         .block(
             Block::default()
                 .title(format!(
-                    "Sessions [{} selected] (Space/checkbox toggle, a all, i invert)",
+                    "Browser [{} selected] (folder+sessions)",
                     app.selected_count_current_project()
                 ))
                 .borders(Borders::ALL)
                 .border_style(focus_style)
-                .style(Style::default()),
+                .style(Style::default().add_modifier(Modifier::DIM)),
         )
         .highlight_style(
             Style::default()
@@ -1993,17 +1920,30 @@ fn render_sessions(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app:
     render_thin_scrollbar(
         frame,
         area,
-        app.session_scroll,
-        sessions.len(),
-        App::visible_rows(area.height, 2),
+        app.project_scroll,
+        rows.len(),
+        App::visible_rows(area.height, 1),
     );
 }
 
-fn format_session_item_lines(session: &SessionSummary) -> (String, String) {
-    let line1 = format!("{} | {} events", session.started_at, session.event_count);
-    let short_id: String = session.id.chars().take(8).collect();
-    let line2 = format!("{} | {}", short_id, session.file_name);
-    (line1, line2)
+fn format_session_browser_line(session: &SessionSummary) -> String {
+    let short_id: String = session.id.chars().take(7).collect();
+    let label = session_human_label(session);
+    format!("{short_id}  {}  {label}", session.modified_at)
+}
+
+fn session_human_label(session: &SessionSummary) -> String {
+    let raw = session
+        .search_blob
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(&session.file_name);
+    let trimmed = raw.trim();
+    if trimmed.chars().count() <= 48 {
+        trimmed.to_string()
+    } else {
+        format!("{}...", trimmed.chars().take(45).collect::<String>())
+    }
 }
 
 fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut App) {
@@ -2030,7 +1970,13 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
     app.preview_rendered_lines = preview.lines.iter().map(|l| l.to_string()).collect();
     let viewport_len = area.height.saturating_sub(2) as usize;
     let max_scroll = app.preview_content_len.saturating_sub(viewport_len);
-    app.preview_scroll = app.preview_scroll.min(max_scroll);
+    let session_changed =
+        app.preview_session_path.as_ref() != app.current_session().map(|s| &s.path);
+    if session_changed {
+        app.preview_scroll = default_preview_scroll(app.preview_content_len, viewport_len);
+    } else {
+        app.preview_scroll = app.preview_scroll.min(max_scroll);
+    }
     app.preview_header_rows = preview.header_rows.clone();
     app.preview_session_path = app.current_session().map(|s| s.path.clone());
     app.ensure_preview_focus_valid();
@@ -2167,6 +2113,10 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
         app.preview_content_len,
         viewport_len,
     );
+}
+
+fn default_preview_scroll(content_len: usize, viewport_len: usize) -> usize {
+    content_len.saturating_sub(viewport_len)
 }
 
 fn render_thin_scrollbar(
@@ -2327,12 +2277,13 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::styled("drag", Style::default().fg(Color::Cyan)),
             Span::raw(" splitter/scrollbar"),
         ])
-    } else if app.focus == Focus::Projects && app.mode == Mode::Normal {
+    } else if app.focus == Focus::Projects
+        && app.mode == Mode::Normal
+        && app.browser_cursor == BrowserCursor::Project
+    {
         Line::from(vec![
             Span::styled("j/k", Style::default().fg(Color::Cyan)),
-            Span::raw(" project nav  "),
-            Span::styled("t", Style::default().fg(Color::Yellow)),
-            Span::raw(" toggle tree  "),
+            Span::raw(" folder nav  "),
             Span::styled("m or r", Style::default().fg(Color::Green)),
             Span::raw(" rename folder sessions  "),
             Span::styled("c or y", Style::default().fg(Color::Green)),
@@ -2342,7 +2293,10 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::styled("q", Style::default().fg(Color::Red)),
             Span::raw(" quit"),
         ])
-    } else if app.focus == Focus::Sessions && app.mode == Mode::Normal {
+    } else if app.focus == Focus::Projects
+        && app.mode == Mode::Normal
+        && app.browser_cursor == BrowserCursor::Session
+    {
         Line::from(vec![
             Span::styled("j/k", Style::default().fg(Color::Cyan)),
             Span::raw(" nav  "),
@@ -2365,8 +2319,6 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" focus  "),
             Span::styled("j/k", Style::default().fg(Color::Cyan)),
             Span::raw(" nav  "),
-            Span::styled("t", Style::default().fg(Color::Yellow)),
-            Span::raw(" tree  "),
             Span::styled("/", Style::default().fg(Color::Cyan)),
             Span::raw(" search  "),
             Span::styled("v", Style::default().fg(Color::Cyan)),
@@ -3032,15 +2984,11 @@ fn split_markdown_prefix(raw: &str) -> (String, &str) {
     (indent, trimmed)
 }
 
-fn project_label(projects: &[ProjectBucket], idx: usize, mode: ProjectViewMode) -> String {
+fn project_label(projects: &[ProjectBucket], idx: usize) -> String {
     let cwd = projects
         .get(idx)
         .map(|p| p.cwd.as_str())
         .unwrap_or("<unknown>");
-    if mode == ProjectViewMode::Absolute {
-        return cwd.to_string();
-    }
-
     let common = shared_path_prefix(projects);
     let parts = path_components(cwd);
     let common_len = common.len().min(parts.len());
@@ -3327,7 +3275,11 @@ fn scan_sessions(root: &Path) -> Result<Vec<ProjectBucket>> {
 
     let mut sorted_projects = BTreeMap::new();
     for (cwd, mut sessions) in projects {
-        sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        sessions.sort_by(|a, b| {
+            b.modified_epoch
+                .cmp(&a.modified_epoch)
+                .then_with(|| b.started_at.cmp(&a.started_at))
+        });
         sorted_projects.insert(cwd, sessions);
     }
 
@@ -3364,6 +3316,10 @@ fn collect_jsonl_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
 fn parse_session_summary(path: &Path) -> Result<SessionSummary> {
     let content =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed metadata {}", path.display()))?;
+    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let modified_dt: DateTime<Utc> = modified.into();
 
     let mut session_id = String::from("unknown");
     let mut cwd = String::from("<unknown>");
@@ -3439,6 +3395,8 @@ fn parse_session_summary(path: &Path) -> Result<SessionSummary> {
         id: session_id,
         cwd,
         started_at,
+        modified_at: modified_dt.format("%Y-%m-%d %H:%M").to_string(),
+        modified_epoch: modified_dt.timestamp(),
         event_count,
         search_blob: search_parts.join("\n"),
     })
@@ -3705,6 +3663,7 @@ mod tests {
             projects: Vec::new(),
             project_idx: 0,
             session_idx: 0,
+            browser_cursor: BrowserCursor::Project,
             selected_sessions: HashSet::new(),
             session_select_anchor: None,
             focus: Focus::Projects,
@@ -3717,7 +3676,6 @@ mod tests {
             search_query: String::new(),
             search_focused: false,
             search_dirty: false,
-            project_view_mode: ProjectViewMode::Absolute,
             preview_mode: PreviewMode::Chat,
             preview_selecting: false,
             preview_mouse_down_pos: None,
@@ -3726,7 +3684,7 @@ mod tests {
             status: String::new(),
             panes: PaneLayout::default(),
             project_width_pct: 20,
-            session_width_pct: 36,
+            session_width_pct: 0,
             project_scroll: 0,
             session_scroll: 0,
             preview_scroll: 0,
@@ -3748,6 +3706,8 @@ mod tests {
             id: String::from(id),
             cwd: String::from(cwd),
             started_at: String::from("2026-01-01T00:00:00Z"),
+            modified_at: String::from("2026-01-02 03:04"),
+            modified_epoch: 123,
             event_count: 1,
             search_blob: String::new(),
         }
@@ -3805,7 +3765,7 @@ mod tests {
                 sessions: Vec::new(),
             },
         ];
-        let label = project_label(&projects, 0, ProjectViewMode::Tree);
+        let label = project_label(&projects, 0);
         assert!(label.contains("api"));
         assert!(!label.contains("/work/src/api"));
     }
@@ -3891,7 +3851,8 @@ mod tests {
                 sample_session("/tmp/b.jsonl", "/repo", "b"),
             ],
         }];
-        app.focus = Focus::Sessions;
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Session;
         app.session_idx = 1;
 
         app.toggle_current_session_selection();
@@ -3916,7 +3877,8 @@ mod tests {
                 sample_session("/tmp/c.jsonl", "/repo", "c"),
             ],
         }];
-        app.focus = Focus::Sessions;
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Session;
         app.session_idx = 1;
 
         app.select_all_sessions_current_project();
@@ -3929,7 +3891,8 @@ mod tests {
     #[test]
     fn action_targets_prefers_selected_sessions() {
         let mut app = empty_test_app();
-        app.focus = Focus::Sessions;
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Session;
         app.projects = vec![ProjectBucket {
             cwd: String::from("/repo"),
             sessions: vec![
@@ -3948,7 +3911,8 @@ mod tests {
     #[test]
     fn delete_targets_prefers_selected_sessions() {
         let mut app = empty_test_app();
-        app.focus = Focus::Sessions;
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Session;
         app.projects = vec![ProjectBucket {
             cwd: String::from("/repo"),
             sessions: vec![
@@ -3994,6 +3958,7 @@ mod tests {
             projects: Vec::new(),
             project_idx: 0,
             session_idx: 0,
+            browser_cursor: BrowserCursor::Project,
             selected_sessions: HashSet::new(),
             session_select_anchor: None,
             focus: Focus::Preview,
@@ -4006,7 +3971,6 @@ mod tests {
             search_query: String::new(),
             search_focused: false,
             search_dirty: false,
-            project_view_mode: ProjectViewMode::Absolute,
             preview_mode: PreviewMode::Chat,
             preview_selecting: false,
             preview_mouse_down_pos: None,
@@ -4015,7 +3979,7 @@ mod tests {
             status: String::new(),
             panes: PaneLayout::default(),
             project_width_pct: 20,
-            session_width_pct: 36,
+            session_width_pct: 0,
             project_scroll: 0,
             session_scroll: 0,
             preview_scroll: 0,
@@ -4049,19 +4013,28 @@ mod tests {
     }
 
     #[test]
-    fn session_item_lines_are_two_line_pretty_format() {
+    fn session_browser_line_uses_short_hash_and_modified_time() {
         let s = SessionSummary {
             path: PathBuf::from("/tmp/a.jsonl"),
             file_name: String::from("rollout-a.jsonl"),
             id: String::from("123456789abcdef"),
             cwd: String::from("/tmp"),
             started_at: String::from("2026-01-01T00:00:00Z"),
+            modified_at: String::from("2026-01-02 03:04"),
+            modified_epoch: 123,
             event_count: 42,
-            search_blob: String::new(),
+            search_blob: String::from("first user prompt"),
         };
-        let (a, b) = format_session_item_lines(&s);
-        assert!(a.contains("| 42 events"));
-        assert!(b.starts_with("12345678 | "));
+        let line = format_session_browser_line(&s);
+        assert!(line.starts_with("1234567"));
+        assert!(line.contains("2026-01-02 03:04"));
+        assert!(line.contains("first user prompt"));
+    }
+
+    #[test]
+    fn default_preview_scroll_opens_at_end() {
+        assert_eq!(default_preview_scroll(120, 20), 100);
+        assert_eq!(default_preview_scroll(10, 20), 0);
     }
 
     #[test]
@@ -4077,6 +4050,8 @@ mod tests {
             id: String::from("abc"),
             cwd: String::from("/tmp/x"),
             started_at: String::from("2026-01-01T00:00:00Z"),
+            modified_at: String::from("2026-01-02 03:04"),
+            modified_epoch: 123,
             event_count: 4,
             search_blob: String::from("hello world normalized user"),
         };
@@ -4115,6 +4090,8 @@ mod tests {
             id: String::from("x"),
             cwd: String::from("/tmp"),
             started_at: String::from("2026-01-01T00:00:00Z"),
+            modified_at: String::from("2026-01-02 03:04"),
+            modified_epoch: 123,
             event_count: 2,
             search_blob: String::new(),
         };
@@ -4150,6 +4127,8 @@ mod tests {
             id: String::from("x"),
             cwd: String::from("/tmp"),
             started_at: String::from("2026-01-01T00:00:00Z"),
+            modified_at: String::from("2026-01-02 03:04"),
+            modified_epoch: 123,
             event_count: 141,
             search_blob: String::new(),
         };
@@ -4174,6 +4153,8 @@ mod tests {
             id: String::from("x"),
             cwd: String::from("/tmp"),
             started_at: String::from("2026-01-01T00:00:00Z"),
+            modified_at: String::from("2026-01-02 03:04"),
+            modified_epoch: 123,
             event_count: 2,
             search_blob: String::new(),
         };
@@ -4214,6 +4195,8 @@ mod tests {
             id: String::from("x"),
             cwd: String::from("/tmp"),
             started_at: String::from("t0"),
+            modified_at: String::from("2026-01-02 03:04"),
+            modified_epoch: 123,
             event_count: 2,
             search_blob: String::new(),
         };
@@ -4263,6 +4246,8 @@ mod tests {
             id: String::from("x"),
             cwd: String::from("/tmp"),
             started_at: String::from("t0"),
+            modified_at: String::from("2026-01-02 03:04"),
+            modified_epoch: 123,
             event_count: 2,
             search_blob: String::new(),
         };
@@ -4288,6 +4273,8 @@ mod tests {
             id: String::from("a"),
             cwd: String::from("/repo/a"),
             started_at: String::from("2026-01-01T00:00:00Z"),
+            modified_at: String::from("2026-01-02 03:04"),
+            modified_epoch: 123,
             event_count: 1,
             search_blob: String::from("deploy fix alpha"),
         };
@@ -4297,6 +4284,8 @@ mod tests {
             id: String::from("b"),
             cwd: String::from("/repo/b"),
             started_at: String::from("2026-01-01T00:00:00Z"),
+            modified_at: String::from("2026-01-02 03:03"),
+            modified_epoch: 122,
             event_count: 1,
             search_blob: String::from("unrelated text"),
         };
@@ -4316,6 +4305,7 @@ mod tests {
             projects: Vec::new(),
             project_idx: 0,
             session_idx: 0,
+            browser_cursor: BrowserCursor::Project,
             selected_sessions: HashSet::new(),
             session_select_anchor: None,
             focus: Focus::Projects,
@@ -4328,7 +4318,6 @@ mod tests {
             search_query: String::from("alpha"),
             search_focused: true,
             search_dirty: true,
-            project_view_mode: ProjectViewMode::Absolute,
             preview_mode: PreviewMode::Chat,
             preview_selecting: false,
             preview_mouse_down_pos: None,
@@ -4364,6 +4353,7 @@ mod tests {
             projects: Vec::new(),
             project_idx: 0,
             session_idx: 0,
+            browser_cursor: BrowserCursor::Project,
             selected_sessions: HashSet::new(),
             session_select_anchor: None,
             focus: Focus::Preview,
@@ -4376,7 +4366,6 @@ mod tests {
             search_query: String::new(),
             search_focused: false,
             search_dirty: false,
-            project_view_mode: ProjectViewMode::Absolute,
             preview_mode: PreviewMode::Chat,
             preview_selecting: false,
             preview_mouse_down_pos: None,
