@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.3 - 2026-03-08
+
+Release pipeline follow-up.
+
+### Changed
+- Kept npm trusted publishing support in the workflow.
+- Restored `NPM_TOKEN` fallback for release publishing so package publication works immediately while npm trusted-publisher scope access is finalized.
+
 ## 1.0.2 - 2026-03-08
 
 Release pipeline follow-up.
