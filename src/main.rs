@@ -510,6 +510,11 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
                 app.prev_focus();
             }
         }
+        KeyCode::Esc => {
+            if app.focus == Focus::Preview {
+                app.focus = Focus::Projects;
+            }
+        }
         KeyCode::Up | KeyCode::Char('k') => {
             if app.focus == Focus::Preview {
                 app.focus_prev_preview_turn();
@@ -795,6 +800,7 @@ struct App {
     preview_rendered_lines: Vec<String>,
     preview_focus_turn: Option<usize>,
     preview_cache: HashMap<PathBuf, CachedPreviewSource>,
+    rendered_preview_cache: HashMap<PathBuf, RenderedPreviewCache>,
     preview_folded: HashMap<PathBuf, HashSet<usize>>,
     preview_header_rows: Vec<(usize, usize)>,
     preview_session_path: Option<PathBuf>,
@@ -805,6 +811,14 @@ struct CachedPreviewSource {
     mtime: SystemTime,
     turns: Vec<ChatTurn>,
     events: Vec<String>,
+}
+
+#[derive(Clone)]
+struct RenderedPreviewCache {
+    mode: PreviewMode,
+    width: usize,
+    folded: HashSet<usize>,
+    data: PreviewData,
 }
 
 #[derive(Clone, Copy)]
@@ -844,7 +858,7 @@ impl App {
             scroll_drag: None,
             status: String::from("Press q to quit, g to refresh"),
             panes: PaneLayout::default(),
-            project_width_pct: 24,
+            project_width_pct: 20,
             session_width_pct: 0,
             project_scroll: 0,
             session_scroll: 0,
@@ -854,6 +868,7 @@ impl App {
             preview_rendered_lines: Vec::new(),
             preview_focus_turn: None,
             preview_cache: HashMap::new(),
+            rendered_preview_cache: HashMap::new(),
             preview_folded: HashMap::new(),
             preview_header_rows: Vec::new(),
             preview_session_path: None,
@@ -1239,14 +1254,27 @@ impl App {
             .preview_folded
             .get(&session.path)
             .cloned()
-            .unwrap_or_default();
-        Ok(build_preview_from_cached(
-            session,
-            mode,
-            inner_width,
-            cached,
-            &folded,
-        ))
+            .unwrap_or_else(|| default_folded_turns(&coalesce_chat_turns(&cached.turns)));
+
+        if let Some(rendered) = self.rendered_preview_cache.get(&session.path)
+            && rendered.mode == mode
+            && rendered.width == inner_width
+            && rendered.folded == folded
+        {
+            return Ok(rendered.data.clone());
+        }
+
+        let data = build_preview_from_cached(session, mode, inner_width, cached, &folded);
+        self.rendered_preview_cache.insert(
+            session.path.clone(),
+            RenderedPreviewCache {
+                mode,
+                width: inner_width,
+                folded,
+                data: data.clone(),
+            },
+        );
+        Ok(data)
     }
 
     fn toggle_fold_by_row(&mut self, row: usize) {
@@ -1931,6 +1959,13 @@ fn format_session_browser_line(session: &SessionSummary) -> String {
     session.id.chars().take(7).collect()
 }
 
+fn browser_display_path(path: &str) -> String {
+    path.strip_prefix("/root/")
+        .map(|rest| format!("/{rest}"))
+        .or_else(|| path.strip_prefix("/root").map(|rest| rest.to_string()))
+        .unwrap_or_else(|| path.to_string())
+}
+
 fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut App) {
     let session_title = app
         .current_session()
@@ -2259,6 +2294,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
         ])
     } else if app.focus == Focus::Preview && app.mode == Mode::Normal {
         Line::from(vec![
+            Span::styled("esc", Style::default().fg(Color::Red)),
+            Span::raw(" browser  "),
             Span::styled("↑/↓", Style::default().fg(Color::Cyan)),
             Span::raw(" block prev/next  "),
             Span::styled("←/→", Style::default().fg(Color::Cyan)),
@@ -2988,6 +3025,8 @@ fn project_label(projects: &[ProjectBucket], idx: usize) -> String {
         .get(idx)
         .map(|p| p.cwd.as_str())
         .unwrap_or("<unknown>");
+    let display = browser_display_path(cwd);
+    let cwd = display.as_str();
     let common = shared_path_prefix(projects);
     let parts = path_components(cwd);
     let common_len = common.len().min(parts.len());
@@ -3003,6 +3042,8 @@ fn project_indent(projects: &[ProjectBucket], idx: usize) -> String {
         .get(idx)
         .map(|p| p.cwd.as_str())
         .unwrap_or("<unknown>");
+    let display = browser_display_path(cwd);
+    let cwd = display.as_str();
     let common = shared_path_prefix(projects);
     let parts = path_components(cwd);
     let common_len = common.len().min(parts.len());
@@ -3015,9 +3056,9 @@ fn shared_path_prefix(projects: &[ProjectBucket]) -> Vec<String> {
     let Some(first) = iter.next() else {
         return Vec::new();
     };
-    let mut prefix = path_components(&first.cwd);
+    let mut prefix = path_components(&browser_display_path(&first.cwd));
     for project in iter {
-        let parts = path_components(&project.cwd);
+        let parts = path_components(&browser_display_path(&project.cwd));
         let keep = prefix
             .iter()
             .zip(parts.iter())
@@ -3136,6 +3177,17 @@ fn coalesce_chat_turns(turns: &[ChatTurn]) -> Vec<ChatTurn> {
         out.push(turn.clone());
     }
     out
+}
+
+fn default_folded_turns(turns: &[ChatTurn]) -> HashSet<usize> {
+    let mut folded = HashSet::new();
+    for (idx, turn) in turns.iter().enumerate() {
+        let should_fold = turn.role == "assistant" || (turn.role == "user" && idx == 0);
+        if should_fold {
+            folded.insert(idx);
+        }
+    }
+    folded
 }
 
 fn format_human_timestamp(raw: &str) -> String {
@@ -3729,6 +3781,7 @@ mod tests {
             preview_rendered_lines: Vec::new(),
             preview_focus_turn: None,
             preview_cache: HashMap::new(),
+            rendered_preview_cache: HashMap::new(),
             preview_folded: HashMap::new(),
             preview_header_rows: Vec::new(),
             preview_session_path: None,
@@ -4023,6 +4076,7 @@ mod tests {
             preview_rendered_lines: vec![String::from("abcde"), String::from("vwxyz")],
             preview_focus_turn: None,
             preview_cache: HashMap::new(),
+            rendered_preview_cache: HashMap::new(),
             preview_folded: HashMap::new(),
             preview_header_rows: Vec::new(),
             preview_session_path: None,
@@ -4072,6 +4126,15 @@ mod tests {
     }
 
     #[test]
+    fn browser_display_path_shortens_root_prefix() {
+        assert_eq!(
+            browser_display_path("/root/gh/codex-session-tui"),
+            "/gh/codex-session-tui"
+        );
+        assert_eq!(browser_display_path("/tmp/x"), "/tmp/x");
+    }
+
+    #[test]
     fn coalesce_adjacent_turns_merges_same_role() {
         let turns = vec![
             ChatTurn {
@@ -4094,6 +4157,31 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].text, "one\n\ntwo");
         assert_eq!(merged[0].timestamp, "2026-01-01T00:01:00Z");
+    }
+
+    #[test]
+    fn default_folded_turns_collapses_assistant_and_first_user() {
+        let turns = vec![
+            ChatTurn {
+                role: String::from("user"),
+                timestamp: String::from("2026-01-01T00:00:00Z"),
+                text: String::from("system-ish"),
+            },
+            ChatTurn {
+                role: String::from("assistant"),
+                timestamp: String::from("2026-01-01T00:01:00Z"),
+                text: String::from("reply"),
+            },
+            ChatTurn {
+                role: String::from("user"),
+                timestamp: String::from("2026-01-01T00:02:00Z"),
+                text: String::from("real user"),
+            },
+        ];
+        let folded = default_folded_turns(&turns);
+        assert!(folded.contains(&0));
+        assert!(folded.contains(&1));
+        assert!(!folded.contains(&2));
     }
 
     #[test]
@@ -4383,6 +4471,7 @@ mod tests {
             preview_rendered_lines: Vec::new(),
             preview_focus_turn: None,
             preview_cache: HashMap::new(),
+            rendered_preview_cache: HashMap::new(),
             preview_folded: HashMap::new(),
             preview_header_rows: Vec::new(),
             preview_session_path: None,
@@ -4431,6 +4520,7 @@ mod tests {
             preview_rendered_lines: Vec::new(),
             preview_focus_turn: None,
             preview_cache: HashMap::new(),
+            rendered_preview_cache: HashMap::new(),
             preview_folded: HashMap::new(),
             preview_header_rows: vec![(10, 0), (20, 1), (30, 2)],
             preview_session_path: Some(PathBuf::from("/tmp/x.jsonl")),
