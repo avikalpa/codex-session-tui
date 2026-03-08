@@ -2163,13 +2163,20 @@ fn browser_highlight_style() -> Style {
 }
 
 fn format_session_browser_line(session: &SessionSummary) -> String {
-    session.id.chars().take(7).collect()
+    let chars = session.id.chars().collect::<Vec<_>>();
+    let start = chars.len().saturating_sub(7);
+    chars[start..].iter().collect()
 }
 
 fn browser_display_path(path: &str) -> String {
+    if path == "/" {
+        return String::from("/");
+    }
+    if path == "/root" {
+        return String::from("/root");
+    }
     path.strip_prefix("/root/")
         .map(|rest| format!("/{rest}"))
-        .or_else(|| path.strip_prefix("/root").map(|rest| rest.to_string()))
         .unwrap_or_else(|| path.to_string())
 }
 
@@ -3350,6 +3357,9 @@ fn project_label(projects: &[ProjectBucket], idx: usize) -> String {
         .map(|p| p.cwd.as_str())
         .unwrap_or("<unknown>");
     let display = browser_display_path(cwd);
+    if display == "/" || display == "/root" {
+        return display;
+    }
     let cwd = display.as_str();
     let common = shared_path_prefix(projects);
     let parts = path_components(cwd);
@@ -4890,7 +4900,7 @@ mod tests {
             search_blob: String::from("first user prompt"),
         };
         let line = format_session_browser_line(&s);
-        assert_eq!(line, "1234567");
+        assert_eq!(line, "9abcdef");
     }
 
     #[test]
@@ -4999,7 +5009,25 @@ mod tests {
             browser_display_path("/root/gh/codex-session-tui"),
             "/gh/codex-session-tui"
         );
+        assert_eq!(browser_display_path("/root"), "/root");
+        assert_eq!(browser_display_path("/"), "/");
         assert_eq!(browser_display_path("/tmp/x"), "/tmp/x");
+    }
+
+    #[test]
+    fn project_label_preserves_root_names() {
+        let projects = vec![
+            ProjectBucket {
+                cwd: String::from("/root"),
+                sessions: Vec::new(),
+            },
+            ProjectBucket {
+                cwd: String::from("/"),
+                sessions: Vec::new(),
+            },
+        ];
+        assert_eq!(project_label(&projects, 0), "/root");
+        assert_eq!(project_label(&projects, 1), "/");
     }
 
     #[test]
