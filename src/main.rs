@@ -107,25 +107,32 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
                 let rows = app.browser_rows();
                 let idx = app.project_scroll + mouse_row_to_index(mouse.row, app.panes.browser);
                 if let Some(row) = rows.get(idx).copied() {
-                    app.project_idx = row.project_idx;
-                    app.browser_cursor = if let Some(session_idx) = row.session_idx {
-                        app.session_idx = session_idx;
-                        let checkbox_hit =
-                            is_sessions_checkbox_hit(mouse.column, mouse.row, app.panes.browser);
-                        if checkbox_hit {
-                            app.toggle_current_session_selection();
-                        } else {
-                            app.session_select_anchor = Some(session_idx);
-                        }
-                        BrowserCursor::Session
+                    if row.session_idx.is_none()
+                        && is_project_toggle_hit(
+                            mouse.column,
+                            app.panes.browser,
+                            row.project_idx,
+                            app,
+                        )
+                    {
+                        app.project_idx = row.project_idx;
+                        app.browser_cursor = BrowserCursor::Project;
+                        app.toggle_current_project_collapsed_manual();
                     } else {
-                        BrowserCursor::Project
-                    };
-                    app.clamp_session_idx();
-                    app.note_browser_navigation();
-                    app.ensure_selection_visible();
-                    if row.session_idx.is_some() {
-                        app.preview_scroll = 0;
+                        app.set_browser_row(row);
+                        if let Some(session_idx) = row.session_idx {
+                            let checkbox_hit = is_sessions_checkbox_hit(
+                                mouse.column,
+                                mouse.row,
+                                app.panes.browser,
+                            );
+                            if checkbox_hit {
+                                app.toggle_current_session_selection();
+                            } else {
+                                app.session_select_anchor = Some(session_idx);
+                            }
+                            app.preview_scroll = 0;
+                        }
                     }
                 }
             } else if point_in_rect(mouse.column, mouse.row, app.panes.preview) {
@@ -439,6 +446,17 @@ fn is_sessions_checkbox_hit(x: u16, _y: u16, pane: ratatui::layout::Rect) -> boo
     let col = mouse_col_to_index(x, pane);
     // Browser rows are single-line; session checkbox sits near the left gutter.
     col <= 7
+}
+
+fn is_project_toggle_hit(
+    x: u16,
+    pane: ratatui::layout::Rect,
+    project_idx: usize,
+    app: &App,
+) -> bool {
+    let col = mouse_col_to_index(x, pane);
+    let indent = project_indent(&app.projects, project_idx).chars().count();
+    col >= indent && col <= indent + 3
 }
 
 fn copy_to_clipboard_osc52(text: &str) -> Result<()> {
@@ -860,6 +878,7 @@ struct App {
     rendered_preview_cache: HashMap<PathBuf, RenderedPreviewCache>,
     preview_folded: HashMap<PathBuf, HashSet<usize>>,
     collapsed_projects: HashSet<String>,
+    pinned_open_projects: HashSet<String>,
     preview_header_rows: Vec<(usize, usize)>,
     preview_session_path: Option<PathBuf>,
     last_browser_nav_at: Option<Instant>,
@@ -931,6 +950,7 @@ impl App {
             rendered_preview_cache: HashMap::new(),
             preview_folded: HashMap::new(),
             collapsed_projects: HashSet::new(),
+            pinned_open_projects: HashSet::new(),
             preview_header_rows: Vec::new(),
             preview_session_path: None,
             last_browser_nav_at: None,
@@ -1029,8 +1049,6 @@ impl App {
         let next = (current + delta).clamp(0, rows.len().saturating_sub(1) as isize) as usize;
         self.set_browser_row(rows[next]);
         self.session_select_anchor = None;
-        self.note_browser_navigation();
-        self.ensure_selection_visible();
     }
 
     fn set_browser_row(&mut self, row: BrowserRow) {
@@ -1039,13 +1057,16 @@ impl App {
             Some(session_idx) => {
                 self.browser_cursor = BrowserCursor::Session;
                 self.session_idx = session_idx;
+                self.auto_manage_project_expansion();
             }
             None => {
                 self.browser_cursor = BrowserCursor::Project;
-                self.expand_current_project();
+                self.auto_manage_project_expansion();
             }
         }
         self.clamp_session_idx();
+        self.note_browser_navigation();
+        self.ensure_selection_visible();
     }
 
     fn current_project_collapsed(&self) -> bool {
@@ -1114,43 +1135,59 @@ impl App {
         0
     }
 
-    fn toggle_current_project_collapsed(&mut self) {
-        let Some((cwd, display_path)) = self
-            .current_project()
-            .map(|project| (project.cwd.clone(), browser_display_path(&project.cwd)))
-        else {
+    fn toggle_current_project_collapsed_manual(&mut self) {
+        let Some(cwd) = self.current_project().map(|project| project.cwd.clone()) else {
             return;
         };
         if self.collapsed_projects.contains(&cwd) {
             self.collapsed_projects.remove(&cwd);
-            self.status = format!("Expanded {display_path}");
+            self.pinned_open_projects.insert(cwd.clone());
+            self.status = format!("Expanded {}", browser_display_path(&cwd));
         } else {
-            self.collapsed_projects.insert(cwd);
+            self.collapsed_projects.insert(cwd.clone());
+            self.pinned_open_projects.remove(&cwd);
             self.browser_cursor = BrowserCursor::Project;
-            self.status = format!("Collapsed {display_path}");
+            self.status = format!("Collapsed {}", browser_display_path(&cwd));
         }
+        self.note_browser_navigation();
+        self.ensure_selection_visible();
     }
 
     fn collapse_current_project(&mut self) {
         if self.projects.is_empty() || self.current_project_collapsed() {
             return;
         }
-        self.toggle_current_project_collapsed();
+        self.toggle_current_project_collapsed_manual();
     }
 
     fn expand_current_project(&mut self) {
         if self.projects.is_empty() || !self.current_project_collapsed() {
             return;
         }
-        self.toggle_current_project_collapsed();
+        self.toggle_current_project_collapsed_manual();
+    }
+
+    fn auto_manage_project_expansion(&mut self) {
+        let Some(current_cwd) = self.current_project().map(|project| project.cwd.clone()) else {
+            return;
+        };
+        for project in &self.projects {
+            if project.cwd != current_cwd && !self.pinned_open_projects.contains(&project.cwd) {
+                self.collapsed_projects.insert(project.cwd.clone());
+            }
+        }
+        self.collapsed_projects.remove(&current_cwd);
     }
 
     fn collapse_all_projects_except_current(&mut self) {
         let current_cwd = self.current_project().map(|project| project.cwd.clone());
         self.collapsed_projects.clear();
+        self.pinned_open_projects.clear();
         for project in &self.projects {
             if Some(project.cwd.as_str()) != current_cwd.as_deref() {
                 self.collapsed_projects.insert(project.cwd.clone());
+            } else {
+                self.pinned_open_projects.insert(project.cwd.clone());
             }
         }
         self.browser_cursor = BrowserCursor::Project;
@@ -1160,6 +1197,11 @@ impl App {
 
     fn expand_all_projects(&mut self) {
         self.collapsed_projects.clear();
+        self.pinned_open_projects = self
+            .projects
+            .iter()
+            .map(|project| project.cwd.clone())
+            .collect();
         self.ensure_selection_visible();
         self.status = String::from("Expanded all folders");
     }
@@ -1172,7 +1214,7 @@ impl App {
         let next = (current + delta).clamp(0, self.projects.len().saturating_sub(1) as isize);
         self.project_idx = next as usize;
         self.browser_cursor = BrowserCursor::Project;
-        self.expand_current_project();
+        self.auto_manage_project_expansion();
         self.session_select_anchor = None;
         self.note_browser_navigation();
         self.ensure_selection_visible();
@@ -1186,7 +1228,7 @@ impl App {
 
         match self.browser_cursor {
             BrowserCursor::Project => {
-                self.toggle_current_project_collapsed();
+                self.toggle_current_project_collapsed_manual();
             }
             BrowserCursor::Session => {
                 self.focus = Focus::Preview;
@@ -4145,6 +4187,7 @@ mod tests {
             rendered_preview_cache: HashMap::new(),
             preview_folded: HashMap::new(),
             collapsed_projects: HashSet::new(),
+            pinned_open_projects: HashSet::new(),
             preview_header_rows: Vec::new(),
             preview_session_path: None,
             last_browser_nav_at: None,
@@ -4459,7 +4502,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_row_navigation_is_linear_and_stable() {
+    fn browser_row_navigation_auto_collapses_unpinned_projects() {
         let mut app = empty_test_app();
         app.projects = vec![
             ProjectBucket {
@@ -4488,11 +4531,12 @@ mod tests {
         app.move_down();
         assert_eq!(app.browser_cursor, BrowserCursor::Project);
         assert_eq!(app.project_idx, 1);
+        assert!(app.collapsed_projects.contains("/repo-a"));
 
         app.move_up();
-        assert_eq!(app.browser_cursor, BrowserCursor::Session);
+        assert_eq!(app.browser_cursor, BrowserCursor::Project);
         assert_eq!(app.project_idx, 0);
-        assert_eq!(app.session_idx, 1);
+        assert!(!app.collapsed_projects.contains("/repo-a"));
     }
 
     #[test]
@@ -4780,6 +4824,69 @@ mod tests {
     }
 
     #[test]
+    fn pinned_project_stays_open_when_navigating_to_next_project() {
+        let mut app = empty_test_app();
+        app.projects = vec![
+            ProjectBucket {
+                cwd: String::from("/repo-a"),
+                sessions: vec![sample_session("/tmp/a.jsonl", "/repo-a", "a")],
+            },
+            ProjectBucket {
+                cwd: String::from("/repo-b"),
+                sessions: vec![sample_session("/tmp/b.jsonl", "/repo-b", "b")],
+            },
+        ];
+        app.pinned_open_projects.insert(String::from("/repo-a"));
+        app.browser_cursor = BrowserCursor::Session;
+        app.session_idx = 0;
+
+        app.move_down();
+
+        assert_eq!(app.project_idx, 1);
+        assert_eq!(app.browser_cursor, BrowserCursor::Project);
+        assert!(!app.collapsed_projects.contains("/repo-a"));
+    }
+
+    #[test]
+    fn mouse_project_toggle_pins_folder_open_and_closed() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/repo"),
+            sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
+        }];
+        app.panes.browser = ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 8,
+        };
+
+        handle_mouse_event(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut app,
+        );
+        assert!(app.collapsed_projects.contains("/repo"));
+        assert!(!app.pinned_open_projects.contains("/repo"));
+
+        handle_mouse_event(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut app,
+        );
+        assert!(!app.collapsed_projects.contains("/repo"));
+        assert!(app.pinned_open_projects.contains("/repo"));
+    }
+
+    #[test]
     fn delete_targets_prefers_selected_sessions() {
         let mut app = empty_test_app();
         app.focus = Focus::Projects;
@@ -4862,6 +4969,7 @@ mod tests {
             rendered_preview_cache: HashMap::new(),
             preview_folded: HashMap::new(),
             collapsed_projects: HashSet::new(),
+            pinned_open_projects: HashSet::new(),
             preview_header_rows: Vec::new(),
             preview_session_path: None,
             last_browser_nav_at: None,
@@ -5370,6 +5478,7 @@ mod tests {
             rendered_preview_cache: HashMap::new(),
             preview_folded: HashMap::new(),
             collapsed_projects: HashSet::new(),
+            pinned_open_projects: HashSet::new(),
             preview_header_rows: Vec::new(),
             preview_session_path: None,
             last_browser_nav_at: None,
@@ -5680,6 +5789,7 @@ mod tests {
             rendered_preview_cache: HashMap::new(),
             preview_folded: HashMap::new(),
             collapsed_projects: HashSet::new(),
+            pinned_open_projects: HashSet::new(),
             preview_header_rows: vec![(10, 0), (20, 1), (30, 2)],
             preview_session_path: Some(PathBuf::from("/tmp/x.jsonl")),
             last_browser_nav_at: None,
