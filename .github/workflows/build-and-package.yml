@@ -149,6 +149,14 @@ jobs:
       - name: Sync npm README from repo README
         run: cp README.md npm/README.md
 
+      - name: Verify npm package identity
+        run: |
+          PKG_NAME="$(node -p "require('./npm/package.json').name")"
+          if [ "$PKG_NAME" != "codex-session-tui" ]; then
+            echo "Unexpected npm package name: $PKG_NAME"
+            exit 1
+          fi
+
       - name: Pack npm Artifact
         run: |
           cd npm
