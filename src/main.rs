@@ -4,6 +4,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
@@ -855,7 +856,7 @@ struct RenderedPreviewCache {
     mode: PreviewMode,
     width: usize,
     folded: HashSet<usize>,
-    data: PreviewData,
+    data: Arc<PreviewData>,
 }
 
 #[derive(Clone, Copy)]
@@ -974,29 +975,7 @@ impl App {
 
         match self.focus {
             Focus::Projects => {
-                match self.browser_cursor {
-                    BrowserCursor::Project => {
-                        if self.project_idx > 0 {
-                            self.project_idx -= 1;
-                            self.expand_current_project();
-                        }
-                    }
-                    BrowserCursor::Session => {
-                        if self.session_idx > 0 {
-                            self.session_idx -= 1;
-                            if self.session_idx == 0 {
-                                self.expand_current_project();
-                            }
-                        } else {
-                            self.browser_cursor = BrowserCursor::Project;
-                            self.expand_current_project();
-                        }
-                    }
-                }
-                self.clamp_session_idx();
-                self.session_select_anchor = None;
-                self.note_browser_navigation();
-                self.ensure_selection_visible();
+                self.move_browser_row(-1);
             }
             Focus::Preview => {
                 self.preview_scroll = self.preview_scroll.saturating_sub(1);
@@ -1011,44 +990,40 @@ impl App {
 
         match self.focus {
             Focus::Projects => {
-                match self.browser_cursor {
-                    BrowserCursor::Project => {
-                        let session_len = self
-                            .current_project()
-                            .map(|project| project.sessions.len())
-                            .unwrap_or(0);
-                        let expanded = self
-                            .current_project()
-                            .is_some_and(|project| !self.collapsed_projects.contains(&project.cwd));
-                        if session_len > 0 && expanded {
-                            self.browser_cursor = BrowserCursor::Session;
-                            self.session_idx = self.session_idx.min(session_len - 1);
-                        } else if self.project_idx + 1 < self.projects.len() {
-                            self.project_idx += 1;
-                            self.expand_current_project();
-                        }
-                    }
-                    BrowserCursor::Session => {
-                        if let Some(project) = self.current_project() {
-                            if self.session_idx + 1 < project.sessions.len() {
-                                self.session_idx += 1;
-                            } else if self.project_idx + 1 < self.projects.len() {
-                                self.project_idx += 1;
-                                self.browser_cursor = BrowserCursor::Project;
-                                self.expand_current_project();
-                            }
-                        }
-                    }
-                }
-                self.clamp_session_idx();
-                self.session_select_anchor = None;
-                self.note_browser_navigation();
-                self.ensure_selection_visible();
+                self.move_browser_row(1);
             }
             Focus::Preview => {
                 self.preview_scroll = self.preview_scroll.saturating_add(1);
             }
         }
+    }
+
+    fn move_browser_row(&mut self, delta: isize) {
+        let rows = self.browser_rows();
+        if rows.is_empty() {
+            return;
+        }
+        let current = self.current_browser_row_index() as isize;
+        let next = (current + delta).clamp(0, rows.len().saturating_sub(1) as isize) as usize;
+        self.set_browser_row(rows[next]);
+        self.session_select_anchor = None;
+        self.note_browser_navigation();
+        self.ensure_selection_visible();
+    }
+
+    fn set_browser_row(&mut self, row: BrowserRow) {
+        self.project_idx = row.project_idx;
+        match row.session_idx {
+            Some(session_idx) => {
+                self.browser_cursor = BrowserCursor::Session;
+                self.session_idx = session_idx;
+            }
+            None => {
+                self.browser_cursor = BrowserCursor::Project;
+                self.expand_current_project();
+            }
+        }
+        self.clamp_session_idx();
     }
 
     fn current_project_collapsed(&self) -> bool {
@@ -1081,7 +1056,7 @@ impl App {
                 project_idx,
                 session_idx: None,
             });
-            if project_idx == self.project_idx && !self.collapsed_projects.contains(&project.cwd) {
+            if !self.collapsed_projects.contains(&project.cwd) {
                 for session_idx in 0..project.sessions.len() {
                     rows.push(BrowserRow {
                         project_idx,
@@ -1380,7 +1355,7 @@ impl App {
         session: &SessionSummary,
         mode: PreviewMode,
         inner_width: usize,
-    ) -> Result<PreviewData> {
+    ) -> Result<Arc<PreviewData>> {
         let meta = fs::metadata(&session.path)
             .with_context(|| format!("failed metadata {}", session.path.display()))?;
         let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
@@ -1428,17 +1403,23 @@ impl App {
             && rendered.width == inner_width
             && rendered.folded == folded
         {
-            return Ok(rendered.data.clone());
+            return Ok(Arc::clone(&rendered.data));
         }
 
-        let data = build_preview_from_cached(session, mode, inner_width, cached, &folded);
+        let data = Arc::new(build_preview_from_cached(
+            session,
+            mode,
+            inner_width,
+            cached,
+            &folded,
+        ));
         self.rendered_preview_cache.insert(
             session.path.clone(),
             RenderedPreviewCache {
                 mode,
                 width: inner_width,
                 folded,
-                data: data.clone(),
+                data: Arc::clone(&data),
             },
         );
         Ok(data)
@@ -2027,7 +2008,8 @@ fn render_search(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
     };
 
     let query_prefix = if app.search_focused { ">" } else { " " };
-    let content = format!("{query_prefix} {}", app.search_query);
+    let cursor = if app.search_focused { "█" } else { " " };
+    let content = format!("{query_prefix} {}{cursor}", app.search_query);
 
     let para = Paragraph::new(Line::from(vec![
         Span::styled("Search ", Style::default().fg(Color::Cyan)),
@@ -2151,20 +2133,20 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
         let inner_width = area.width.saturating_sub(2) as usize;
         match app.preview_for_session(&session, app.preview_mode, inner_width) {
             Ok(preview) => preview,
-            Err(err) => PreviewData {
+            Err(err) => Arc::new(PreviewData {
                 lines: vec![Line::from(format!("Preview error: {err:#}"))],
                 tone_rows: Vec::new(),
                 header_rows: Vec::new(),
                 block_ranges: Vec::new(),
-            },
+            }),
         }
     } else {
-        PreviewData {
+        Arc::new(PreviewData {
             lines: vec![Line::from("No session selected")],
             tone_rows: Vec::new(),
             header_rows: Vec::new(),
             block_ranges: Vec::new(),
-        }
+        })
     };
     app.preview_content_len = preview.lines.len();
     let viewport_len = area.height.saturating_sub(2) as usize;
@@ -2222,7 +2204,7 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
     let inner_w = area.width.saturating_sub(2);
     let inner_h = area.height.saturating_sub(2) as usize;
     let scroll = app.preview_scroll;
-    for (row, tone) in preview.tone_rows {
+    for &(row, tone) in &preview.tone_rows {
         if row < scroll || row >= scroll + inner_h {
             continue;
         }
@@ -4007,6 +3989,8 @@ fn expand_tilde(input: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn sample_chat_jsonl() -> String {
         [
@@ -4016,6 +4000,31 @@ mod tests {
             r#"{"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"normalized user"}]}}"#,
         ]
         .join("\n")
+    }
+
+    fn buffer_lines(backend: &TestBackend) -> Vec<String> {
+        let area = backend.buffer().area;
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| backend.buffer()[(x, y)].symbol().to_string())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect()
+    }
+
+    fn buffer_contains(backend: &TestBackend, needle: &str) -> bool {
+        buffer_lines(backend)
+            .iter()
+            .any(|line| line.contains(needle))
+    }
+
+    fn write_test_session(path: &Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("mkdir");
+        }
+        fs::write(path, body).expect("write session");
     }
 
     fn empty_test_app() -> App {
@@ -4369,6 +4378,43 @@ mod tests {
 
         app.browser_enter();
         assert_eq!(app.focus, Focus::Preview);
+    }
+
+    #[test]
+    fn browser_row_navigation_is_linear_and_stable() {
+        let mut app = empty_test_app();
+        app.projects = vec![
+            ProjectBucket {
+                cwd: String::from("/repo-a"),
+                sessions: vec![
+                    sample_session("/tmp/a1.jsonl", "/repo-a", "a1"),
+                    sample_session("/tmp/a2.jsonl", "/repo-a", "a2"),
+                ],
+            },
+            ProjectBucket {
+                cwd: String::from("/repo-b"),
+                sessions: vec![sample_session("/tmp/b1.jsonl", "/repo-b", "b1")],
+            },
+        ];
+
+        app.move_down();
+        assert_eq!(app.browser_cursor, BrowserCursor::Session);
+        assert_eq!(app.project_idx, 0);
+        assert_eq!(app.session_idx, 0);
+
+        app.move_down();
+        assert_eq!(app.browser_cursor, BrowserCursor::Session);
+        assert_eq!(app.project_idx, 0);
+        assert_eq!(app.session_idx, 1);
+
+        app.move_down();
+        assert_eq!(app.browser_cursor, BrowserCursor::Project);
+        assert_eq!(app.project_idx, 1);
+
+        app.move_up();
+        assert_eq!(app.browser_cursor, BrowserCursor::Session);
+        assert_eq!(app.project_idx, 0);
+        assert_eq!(app.session_idx, 1);
     }
 
     #[test]
@@ -5018,6 +5064,33 @@ mod tests {
     }
 
     #[test]
+    fn render_search_shows_cursor_when_focused() {
+        let mut app = empty_test_app();
+        app.search_focused = true;
+        app.search_query = String::from("johyperr");
+
+        let backend = TestBackend::new(40, 3);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_search(
+                    frame,
+                    ratatui::layout::Rect {
+                        x: 0,
+                        y: 0,
+                        width: 40,
+                        height: 3,
+                    },
+                    &app,
+                );
+            })
+            .expect("draw");
+
+        assert!(buffer_contains(terminal.backend(), "johyperr"));
+        assert!(buffer_contains(terminal.backend(), "█"));
+    }
+
+    #[test]
     fn preview_match_row_finds_first_matching_line() {
         let preview = PreviewData {
             lines: vec![
@@ -5035,6 +5108,84 @@ mod tests {
             preview_turn_at_or_before_row(&preview.header_rows, 1),
             Some(0)
         );
+    }
+
+    #[test]
+    fn render_preview_applies_search_highlight_overlay() {
+        let dir = std::env::temp_dir().join(format!("cse-preview-highlight-{}", Uuid::new_v4()));
+        let path = dir.join("sample.jsonl");
+        let body = [
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"abc","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/x"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello johyperr world"}]}}"#,
+        ]
+        .join("\n");
+        write_test_session(&path, &body);
+
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/tmp/x"),
+            sessions: vec![SessionSummary {
+                path: path.clone(),
+                file_name: String::from("sample.jsonl"),
+                id: String::from("abcdef1"),
+                cwd: String::from("/tmp/x"),
+                started_at: String::from("2026-01-01T00:00:00Z"),
+                modified_epoch: 1,
+                event_count: 2,
+                search_blob: String::from("hello johyperr world"),
+            }],
+        }];
+        app.browser_cursor = BrowserCursor::Session;
+        app.search_query = String::from("johyperr");
+        app.preview_folded.insert(path.clone(), HashSet::new());
+        app.panes.preview = ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 12,
+        };
+
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_preview(
+                    frame,
+                    ratatui::layout::Rect {
+                        x: 0,
+                        y: 0,
+                        width: 60,
+                        height: 12,
+                    },
+                    &mut app,
+                );
+            })
+            .expect("draw");
+
+        let backend = terminal.backend();
+        assert!(buffer_contains(backend, "johyperr"));
+        let area = backend.buffer().area;
+        let mut highlighted = false;
+        for y in 0..area.height {
+            let line = (0..area.width)
+                .map(|x| backend.buffer()[(x, y)].symbol().to_string())
+                .collect::<Vec<_>>()
+                .join("");
+            if let Some(start) = line.find("johyperr") {
+                let mut any_underlined = false;
+                for x in start as u16..(start + "johyperr".len()) as u16 {
+                    let cell = &backend.buffer()[(x, y)];
+                    if cell.modifier.contains(Modifier::UNDERLINED) {
+                        any_underlined = true;
+                    }
+                }
+                highlighted = any_underlined;
+                if highlighted {
+                    break;
+                }
+            }
+        }
+        assert!(highlighted);
     }
 
     #[test]
