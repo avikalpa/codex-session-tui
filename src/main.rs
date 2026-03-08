@@ -484,6 +484,14 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && app.focus == Focus::Projects {
         match key.code {
+            KeyCode::Up => {
+                app.jump_project(-1);
+                return Ok(false);
+            }
+            KeyCode::Down => {
+                app.jump_project(1);
+                return Ok(false);
+            }
             KeyCode::Left => {
                 app.collapse_all_projects_except_current();
                 return Ok(false);
@@ -1154,6 +1162,21 @@ impl App {
         self.collapsed_projects.clear();
         self.ensure_selection_visible();
         self.status = String::from("Expanded all folders");
+    }
+
+    fn jump_project(&mut self, delta: isize) {
+        if self.projects.is_empty() {
+            return;
+        }
+        let current = self.project_idx as isize;
+        let next = (current + delta).clamp(0, self.projects.len().saturating_sub(1) as isize);
+        self.project_idx = next as usize;
+        self.browser_cursor = BrowserCursor::Project;
+        self.expand_current_project();
+        self.session_select_anchor = None;
+        self.note_browser_navigation();
+        self.ensure_selection_visible();
+        self.status = String::from("Jumped to project");
     }
 
     fn browser_enter(&mut self) {
@@ -2591,6 +2614,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
         Line::from(vec![
             Span::styled("j/k", Style::default().fg(Color::Cyan)),
             Span::raw(" folder nav  "),
+            Span::styled("ctrl+↑/↓", Style::default().fg(Color::Cyan)),
+            Span::raw(" project jump  "),
             Span::styled("←/→", Style::default().fg(Color::Cyan)),
             Span::raw(" collapse/expand  "),
             Span::styled("ctrl+←", Style::default().fg(Color::Cyan)),
@@ -2613,6 +2638,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
         Line::from(vec![
             Span::styled("j/k", Style::default().fg(Color::Cyan)),
             Span::raw(" nav  "),
+            Span::styled("ctrl+↑/↓", Style::default().fg(Color::Cyan)),
+            Span::raw(" project jump  "),
             Span::styled("←", Style::default().fg(Color::Cyan)),
             Span::raw(" folder row  "),
             Span::styled("→", Style::default().fg(Color::Cyan)),
@@ -4656,6 +4683,49 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_down_and_up_jump_between_projects_only() {
+        let mut app = empty_test_app();
+        app.projects = vec![
+            ProjectBucket {
+                cwd: String::from("/repo-a"),
+                sessions: vec![sample_session("/tmp/a.jsonl", "/repo-a", "a")],
+            },
+            ProjectBucket {
+                cwd: String::from("/repo-b"),
+                sessions: vec![sample_session("/tmp/b.jsonl", "/repo-b", "b")],
+            },
+            ProjectBucket {
+                cwd: String::from("/repo-c"),
+                sessions: vec![sample_session("/tmp/c.jsonl", "/repo-c", "c")],
+            },
+        ];
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Session;
+        app.session_idx = 0;
+
+        handle_normal_mode(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .expect("ctrl-down");
+        assert_eq!(app.project_idx, 1);
+        assert_eq!(app.browser_cursor, BrowserCursor::Project);
+
+        handle_normal_mode(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .expect("ctrl-down");
+        assert_eq!(app.project_idx, 2);
+        assert_eq!(app.browser_cursor, BrowserCursor::Project);
+
+        handle_normal_mode(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL), &mut app)
+            .expect("ctrl-up");
+        assert_eq!(app.project_idx, 1);
+        assert_eq!(app.browser_cursor, BrowserCursor::Project);
+    }
+
+    #[test]
     fn moving_up_to_project_row_auto_expands_it() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
@@ -5360,6 +5430,8 @@ mod tests {
         assert!(buffer_contains(backend, "collapse others"));
         assert!(buffer_contains(backend, "ctrl+→"));
         assert!(buffer_contains(backend, "expand all"));
+        assert!(buffer_contains(backend, "ctrl+↑/↓"));
+        assert!(buffer_contains(backend, "project jump"));
     }
 
     #[test]
