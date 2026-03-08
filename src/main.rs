@@ -510,6 +510,11 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
                 app.prev_focus();
             }
         }
+        KeyCode::Enter => {
+            if app.mode == Mode::Normal {
+                app.browser_enter();
+            }
+        }
         KeyCode::Esc => {
             if app.focus == Focus::Preview {
                 app.focus = Focus::Projects;
@@ -532,37 +537,57 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
         KeyCode::Left => {
             if app.focus == Focus::Preview {
                 app.fold_focused_preview_turn();
+            } else if app.focus == Focus::Projects {
+                match app.browser_cursor {
+                    BrowserCursor::Session => app.browser_cursor = BrowserCursor::Project,
+                    BrowserCursor::Project => app.collapse_current_project(),
+                }
             }
         }
         KeyCode::Right => {
             if app.focus == Focus::Preview {
                 app.unfold_focused_preview_turn();
+            } else if app.focus == Focus::Projects {
+                match app.browser_cursor {
+                    BrowserCursor::Project => {
+                        if app.current_project_collapsed() {
+                            app.expand_current_project();
+                        } else if app
+                            .current_project()
+                            .is_some_and(|project| !project.sessions.is_empty())
+                        {
+                            app.browser_cursor = BrowserCursor::Session;
+                            app.ensure_selection_visible();
+                        }
+                    }
+                    BrowserCursor::Session => {}
+                }
             }
         }
         KeyCode::Char('g') => app.reload()?,
         KeyCode::Char('m') => {
             if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Project {
                 app.start_action(Action::ProjectRename);
-            } else {
+            } else if app.current_session().is_some() {
                 app.start_action(Action::Move);
             }
         }
         KeyCode::Char('c') => {
             if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Project {
                 app.start_action(Action::ProjectCopy);
-            } else {
+            } else if app.current_session().is_some() {
                 app.start_action(Action::Copy);
             }
         }
         KeyCode::Char('f') => {
             if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Project {
                 app.status = String::from("Project scope supports rename/copy");
-            } else {
+            } else if app.current_session().is_some() {
                 app.start_action(Action::Fork);
             }
         }
         KeyCode::Char('d') | KeyCode::Delete => {
-            if app.focus != Focus::Projects {
+            if app.current_session().is_some() {
                 app.start_action(Action::Delete);
             }
         }
@@ -692,19 +717,19 @@ impl Tui {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Focus {
     Projects,
     Preview,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BrowserCursor {
     Project,
     Session,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Action {
     Move,
     Copy,
@@ -714,7 +739,7 @@ enum Action {
     ProjectCopy,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {
     Normal,
     Input,
@@ -802,6 +827,7 @@ struct App {
     preview_cache: HashMap<PathBuf, CachedPreviewSource>,
     rendered_preview_cache: HashMap<PathBuf, RenderedPreviewCache>,
     preview_folded: HashMap<PathBuf, HashSet<usize>>,
+    collapsed_projects: HashSet<String>,
     preview_header_rows: Vec<(usize, usize)>,
     preview_session_path: Option<PathBuf>,
 }
@@ -870,6 +896,7 @@ impl App {
             preview_cache: HashMap::new(),
             rendered_preview_cache: HashMap::new(),
             preview_folded: HashMap::new(),
+            collapsed_projects: HashSet::new(),
             preview_header_rows: Vec::new(),
             preview_session_path: None,
         };
@@ -971,7 +998,10 @@ impl App {
                             .current_project()
                             .map(|project| project.sessions.len())
                             .unwrap_or(0);
-                        if session_len > 0 {
+                        let expanded = self
+                            .current_project()
+                            .is_some_and(|project| !self.collapsed_projects.contains(&project.cwd));
+                        if session_len > 0 && expanded {
                             self.browser_cursor = BrowserCursor::Session;
                             self.session_idx = self.session_idx.min(session_len - 1);
                         } else if self.project_idx + 1 < self.projects.len() {
@@ -999,6 +1029,11 @@ impl App {
         }
     }
 
+    fn current_project_collapsed(&self) -> bool {
+        self.current_project()
+            .is_some_and(|project| self.collapsed_projects.contains(&project.cwd))
+    }
+
     fn clamp_session_idx(&mut self) {
         let len = self
             .current_project()
@@ -1024,7 +1059,7 @@ impl App {
                 project_idx,
                 session_idx: None,
             });
-            if project_idx == self.project_idx {
+            if project_idx == self.project_idx && !self.collapsed_projects.contains(&project.cwd) {
                 for session_idx in 0..project.sessions.len() {
                     rows.push(BrowserRow {
                         project_idx,
@@ -1040,22 +1075,82 @@ impl App {
         let mut row = 0usize;
         for (project_idx, project) in self.projects.iter().enumerate() {
             if project_idx == self.project_idx {
+                let expanded = !self.collapsed_projects.contains(&project.cwd);
                 return row
                     + match self.browser_cursor {
                         BrowserCursor::Project => 0,
-                        BrowserCursor::Session => {
+                        BrowserCursor::Session if expanded => {
                             1 + self
                                 .session_idx
                                 .min(project.sessions.len().saturating_sub(1))
                         }
+                        BrowserCursor::Session => 0,
                     };
             }
             row += 1;
-            if project_idx == self.project_idx {
+            if !self.collapsed_projects.contains(&project.cwd) {
                 row += project.sessions.len();
             }
         }
         0
+    }
+
+    fn toggle_current_project_collapsed(&mut self) {
+        let Some((cwd, display_path)) = self
+            .current_project()
+            .map(|project| (project.cwd.clone(), browser_display_path(&project.cwd)))
+        else {
+            return;
+        };
+        if self.collapsed_projects.contains(&cwd) {
+            self.collapsed_projects.remove(&cwd);
+            self.status = format!("Expanded {display_path}");
+        } else {
+            self.collapsed_projects.insert(cwd);
+            self.browser_cursor = BrowserCursor::Project;
+            self.status = format!("Collapsed {display_path}");
+        }
+    }
+
+    fn collapse_current_project(&mut self) {
+        if self.projects.is_empty() || self.current_project_collapsed() {
+            return;
+        }
+        self.toggle_current_project_collapsed();
+    }
+
+    fn expand_current_project(&mut self) {
+        if self.projects.is_empty() || !self.current_project_collapsed() {
+            return;
+        }
+        self.toggle_current_project_collapsed();
+    }
+
+    fn browser_enter(&mut self) {
+        if self.focus != Focus::Projects {
+            return;
+        }
+
+        match self.browser_cursor {
+            BrowserCursor::Project => {
+                let session_len = self
+                    .current_project()
+                    .map(|project| project.sessions.len())
+                    .unwrap_or(0);
+                if self.current_project_collapsed() {
+                    self.expand_current_project();
+                } else if session_len > 0 {
+                    self.browser_cursor = BrowserCursor::Session;
+                    self.session_idx = self.session_idx.min(session_len - 1);
+                    self.status = String::from("Selected first session");
+                }
+            }
+            BrowserCursor::Session => {
+                self.focus = Focus::Preview;
+            }
+        }
+
+        self.ensure_selection_visible();
     }
 
     fn ensure_selection_visible(&mut self) {
@@ -1899,9 +1994,11 @@ fn render_browser(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
                 )))
             } else {
                 let project = &app.projects[row.project_idx];
+                let collapsed = app.collapsed_projects.contains(&project.cwd);
                 let label = format!(
-                    "{}📁 {} ({})",
+                    "{}{} 📁 {} ({})",
                     project_indent(&app.projects, row.project_idx),
+                    if collapsed { "▶" } else { "▼" },
                     project_label(&app.projects, row.project_idx),
                     project.sessions.len()
                 );
@@ -2316,6 +2413,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
         Line::from(vec![
             Span::styled("j/k", Style::default().fg(Color::Cyan)),
             Span::raw(" folder nav  "),
+            Span::styled("←/→", Style::default().fg(Color::Cyan)),
+            Span::raw(" collapse/expand  "),
             Span::styled("m or r", Style::default().fg(Color::Green)),
             Span::raw(" rename folder sessions  "),
             Span::styled("c or y", Style::default().fg(Color::Green)),
@@ -3783,6 +3882,7 @@ mod tests {
             preview_cache: HashMap::new(),
             rendered_preview_cache: HashMap::new(),
             preview_folded: HashMap::new(),
+            collapsed_projects: HashSet::new(),
             preview_header_rows: Vec::new(),
             preview_session_path: None,
         }
@@ -3997,6 +4097,102 @@ mod tests {
     }
 
     #[test]
+    fn browser_rows_hide_sessions_when_project_collapsed() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/repo"),
+            sessions: vec![
+                sample_session("/tmp/a.jsonl", "/repo", "a"),
+                sample_session("/tmp/b.jsonl", "/repo", "b"),
+            ],
+        }];
+        assert_eq!(app.browser_rows().len(), 3);
+        app.collapsed_projects.insert(String::from("/repo"));
+        assert_eq!(app.browser_rows().len(), 1);
+    }
+
+    #[test]
+    fn browser_row_index_counts_expanded_projects_above_selection() {
+        let mut app = empty_test_app();
+        app.projects = vec![
+            ProjectBucket {
+                cwd: String::from("/repo-a"),
+                sessions: vec![sample_session("/tmp/a.jsonl", "/repo-a", "a")],
+            },
+            ProjectBucket {
+                cwd: String::from("/repo-b"),
+                sessions: vec![sample_session("/tmp/b.jsonl", "/repo-b", "b")],
+            },
+        ];
+        app.project_idx = 1;
+        app.browser_cursor = BrowserCursor::Project;
+
+        assert_eq!(app.current_browser_row_index(), 2);
+    }
+
+    #[test]
+    fn delete_key_starts_delete_action_for_session_row() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/repo"),
+            sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
+        }];
+        app.browser_cursor = BrowserCursor::Session;
+        app.focus = Focus::Projects;
+        let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE);
+        let quit = handle_normal_mode(key, &mut app).expect("handle");
+        assert!(!quit);
+        assert_eq!(app.mode, Mode::Input);
+        assert_eq!(app.pending_action, Some(Action::Delete));
+    }
+
+    #[test]
+    fn move_copy_and_fork_keys_start_actions_for_session_row() {
+        let actions = [
+            (KeyCode::Char('m'), Action::Move),
+            (KeyCode::Char('c'), Action::Copy),
+            (KeyCode::Char('f'), Action::Fork),
+        ];
+
+        for (code, expected) in actions {
+            let mut app = empty_test_app();
+            app.projects = vec![ProjectBucket {
+                cwd: String::from("/repo"),
+                sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
+            }];
+            app.browser_cursor = BrowserCursor::Session;
+            app.focus = Focus::Projects;
+
+            let quit = handle_normal_mode(KeyEvent::new(code, KeyModifiers::NONE), &mut app)
+                .expect("handle");
+            assert!(!quit);
+            assert_eq!(app.mode, Mode::Input);
+            assert_eq!(app.pending_action, Some(expected));
+        }
+    }
+
+    #[test]
+    fn browser_enter_expands_project_then_enters_session_then_focuses_preview() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/repo"),
+            sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
+        }];
+        app.collapsed_projects.insert(String::from("/repo"));
+
+        app.browser_enter();
+        assert_eq!(app.browser_cursor, BrowserCursor::Project);
+        assert!(!app.collapsed_projects.contains("/repo"));
+
+        app.browser_enter();
+        assert_eq!(app.browser_cursor, BrowserCursor::Session);
+        assert_eq!(app.focus, Focus::Projects);
+
+        app.browser_enter();
+        assert_eq!(app.focus, Focus::Preview);
+    }
+
+    #[test]
     fn delete_targets_prefers_selected_sessions() {
         let mut app = empty_test_app();
         app.focus = Focus::Projects;
@@ -4078,6 +4274,7 @@ mod tests {
             preview_cache: HashMap::new(),
             rendered_preview_cache: HashMap::new(),
             preview_folded: HashMap::new(),
+            collapsed_projects: HashSet::new(),
             preview_header_rows: Vec::new(),
             preview_session_path: None,
         };
@@ -4473,6 +4670,7 @@ mod tests {
             preview_cache: HashMap::new(),
             rendered_preview_cache: HashMap::new(),
             preview_folded: HashMap::new(),
+            collapsed_projects: HashSet::new(),
             preview_header_rows: Vec::new(),
             preview_session_path: None,
         };
@@ -4522,6 +4720,7 @@ mod tests {
             preview_cache: HashMap::new(),
             rendered_preview_cache: HashMap::new(),
             preview_folded: HashMap::new(),
+            collapsed_projects: HashSet::new(),
             preview_header_rows: vec![(10, 0), (20, 1), (30, 2)],
             preview_session_path: Some(PathBuf::from("/tmp/x.jsonl")),
         };
