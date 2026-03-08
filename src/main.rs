@@ -4422,6 +4422,86 @@ mod tests {
     }
 
     #[test]
+    fn browser_rows_preserve_order_with_mixed_collapsed_projects() {
+        let mut app = empty_test_app();
+        app.projects = vec![
+            ProjectBucket {
+                cwd: String::from("/repo-a"),
+                sessions: vec![
+                    sample_session("/tmp/a1.jsonl", "/repo-a", "a1"),
+                    sample_session("/tmp/a2.jsonl", "/repo-a", "a2"),
+                ],
+            },
+            ProjectBucket {
+                cwd: String::from("/repo-b"),
+                sessions: vec![sample_session("/tmp/b1.jsonl", "/repo-b", "b1")],
+            },
+            ProjectBucket {
+                cwd: String::from("/repo-c"),
+                sessions: vec![sample_session("/tmp/c1.jsonl", "/repo-c", "c1")],
+            },
+        ];
+        app.collapsed_projects.insert(String::from("/repo-b"));
+
+        let rows = app.browser_rows();
+        let shape = rows
+            .iter()
+            .map(|row| (row.project_idx, row.session_idx))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shape,
+            vec![
+                (0, None),
+                (0, Some(0)),
+                (0, Some(1)),
+                (1, None),
+                (2, None),
+                (2, Some(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn repeated_browser_navigation_clamps_at_visible_bounds() {
+        let mut app = empty_test_app();
+        app.projects = vec![
+            ProjectBucket {
+                cwd: String::from("/repo-a"),
+                sessions: vec![
+                    sample_session("/tmp/a1.jsonl", "/repo-a", "a1"),
+                    sample_session("/tmp/a2.jsonl", "/repo-a", "a2"),
+                ],
+            },
+            ProjectBucket {
+                cwd: String::from("/repo-b"),
+                sessions: vec![sample_session("/tmp/b1.jsonl", "/repo-b", "b1")],
+            },
+        ];
+
+        for _ in 0..12 {
+            app.move_down();
+        }
+        let rows = app.browser_rows();
+        let last = rows.last().copied().expect("last row");
+        assert_eq!(app.project_idx, last.project_idx);
+        assert_eq!(app.session_idx, last.session_idx.unwrap_or(0));
+        assert_eq!(
+            app.browser_cursor,
+            if last.session_idx.is_some() {
+                BrowserCursor::Session
+            } else {
+                BrowserCursor::Project
+            }
+        );
+
+        for _ in 0..12 {
+            app.move_up();
+        }
+        assert_eq!(app.project_idx, 0);
+        assert_eq!(app.browser_cursor, BrowserCursor::Project);
+    }
+
+    #[test]
     fn right_on_project_row_enters_first_session_when_expanded() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
@@ -5156,6 +5236,46 @@ mod tests {
         assert!(buffer_contains(backend, "tab"));
         assert!(buffer_contains(backend, "shift+tab"));
         assert!(buffer_contains(backend, "close search"));
+    }
+
+    #[test]
+    fn mouse_click_browser_row_matches_row_mapping() {
+        let mut app = empty_test_app();
+        app.projects = vec![
+            ProjectBucket {
+                cwd: String::from("/repo-a"),
+                sessions: vec![
+                    sample_session("/tmp/a1.jsonl", "/repo-a", "a1"),
+                    sample_session("/tmp/a2.jsonl", "/repo-a", "a2"),
+                ],
+            },
+            ProjectBucket {
+                cwd: String::from("/repo-b"),
+                sessions: vec![sample_session("/tmp/b1.jsonl", "/repo-b", "b1")],
+            },
+        ];
+        app.panes.browser = ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+
+        let rows = app.browser_rows();
+        let target = rows[2];
+        handle_mouse_event(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 3,
+                row: 3,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut app,
+        );
+
+        assert_eq!(app.project_idx, target.project_idx);
+        assert_eq!(app.session_idx, target.session_idx.unwrap_or(0));
+        assert_eq!(app.browser_cursor, BrowserCursor::Session);
     }
 
     #[test]
