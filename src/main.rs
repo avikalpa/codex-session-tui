@@ -121,6 +121,7 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
                         BrowserCursor::Project
                     };
                     app.clamp_session_idx();
+                    app.note_browser_navigation();
                     app.ensure_selection_visible();
                     if row.session_idx.is_some() {
                         app.preview_scroll = 0;
@@ -830,6 +831,7 @@ struct App {
     collapsed_projects: HashSet<String>,
     preview_header_rows: Vec<(usize, usize)>,
     preview_session_path: Option<PathBuf>,
+    last_browser_nav_at: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -899,6 +901,7 @@ impl App {
             collapsed_projects: HashSet::new(),
             preview_header_rows: Vec::new(),
             preview_session_path: None,
+            last_browser_nav_at: None,
         };
 
         app.reload()?;
@@ -977,6 +980,7 @@ impl App {
                 }
                 self.clamp_session_idx();
                 self.session_select_anchor = None;
+                self.note_browser_navigation();
                 self.ensure_selection_visible();
             }
             Focus::Preview => {
@@ -1021,6 +1025,7 @@ impl App {
                 }
                 self.clamp_session_idx();
                 self.session_select_anchor = None;
+                self.note_browser_navigation();
                 self.ensure_selection_visible();
             }
             Focus::Preview => {
@@ -1143,6 +1148,7 @@ impl App {
                     self.browser_cursor = BrowserCursor::Session;
                     self.session_idx = self.session_idx.min(session_len - 1);
                     self.status = String::from("Selected first session");
+                    self.note_browser_navigation();
                 }
             }
             BrowserCursor::Session => {
@@ -1151,6 +1157,48 @@ impl App {
         }
 
         self.ensure_selection_visible();
+    }
+
+    fn note_browser_navigation(&mut self) {
+        self.last_browser_nav_at = Some(Instant::now());
+    }
+
+    fn current_preview_session(&self) -> Option<SessionSummary> {
+        self.current_preview_session_at(Instant::now())
+    }
+
+    fn current_preview_session_at(&self, now: Instant) -> Option<SessionSummary> {
+        let current = self.current_session().cloned();
+        if self.focus == Focus::Preview {
+            return current;
+        }
+
+        let should_defer = self
+            .last_browser_nav_at
+            .is_some_and(|last| now.duration_since(last) < Duration::from_millis(80));
+        if !should_defer {
+            return current;
+        }
+
+        self.preview_session_path
+            .as_ref()
+            .and_then(|path| self.find_session_by_path(path))
+            .or(current)
+    }
+
+    fn find_session_by_path(&self, path: &Path) -> Option<SessionSummary> {
+        self.projects
+            .iter()
+            .flat_map(|project| project.sessions.iter())
+            .find(|session| session.path == path)
+            .cloned()
+            .or_else(|| {
+                self.all_projects
+                    .iter()
+                    .flat_map(|project| project.sessions.iter())
+                    .find(|session| session.path == path)
+                    .cloned()
+            })
     }
 
     fn ensure_selection_visible(&mut self) {
@@ -2049,10 +2097,7 @@ fn render_browser(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
 }
 
 fn browser_highlight_style() -> Style {
-    Style::default()
-        .fg(Color::Black)
-        .bg(Color::Cyan)
-        .add_modifier(Modifier::BOLD)
+    Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
 }
 
 fn format_session_browser_line(session: &SessionSummary) -> String {
@@ -2068,7 +2113,7 @@ fn browser_display_path(path: &str) -> String {
 
 fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut App) {
     let session_title = app
-        .current_session()
+        .current_preview_session()
         .map(|s| {
             format!(
                 "{}  {}",
@@ -2077,7 +2122,8 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
             )
         })
         .unwrap_or_else(|| String::from("No session selected"));
-    let preview = if let Some(session) = app.current_session().cloned() {
+    let preview_session = app.current_preview_session();
+    let preview = if let Some(session) = preview_session.clone() {
         let inner_width = area.width.saturating_sub(2) as usize;
         match app.preview_for_session(&session, app.preview_mode, inner_width) {
             Ok(preview) => preview,
@@ -2101,14 +2147,14 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
     let viewport_len = area.height.saturating_sub(2) as usize;
     let max_scroll = app.preview_content_len.saturating_sub(viewport_len);
     let session_changed =
-        app.preview_session_path.as_ref() != app.current_session().map(|s| &s.path);
+        app.preview_session_path.as_ref() != preview_session.as_ref().map(|s| &s.path);
     if session_changed {
         app.preview_scroll = default_preview_scroll(app.preview_content_len, viewport_len);
     } else {
         app.preview_scroll = app.preview_scroll.min(max_scroll);
     }
     app.preview_header_rows = preview.header_rows.clone();
-    app.preview_session_path = app.current_session().map(|s| s.path.clone());
+    app.preview_session_path = preview_session.map(|s| s.path);
     app.ensure_preview_focus_valid();
 
     let focus_style = if app.focus == Focus::Preview && app.mode == Mode::Normal {
@@ -3888,6 +3934,7 @@ mod tests {
             collapsed_projects: HashSet::new(),
             preview_header_rows: Vec::new(),
             preview_session_path: None,
+            last_browser_nav_at: None,
         }
     }
 
@@ -4280,6 +4327,7 @@ mod tests {
             collapsed_projects: HashSet::new(),
             preview_header_rows: Vec::new(),
             preview_session_path: None,
+            last_browser_nav_at: None,
         };
         let text = app
             .preview_selected_text((0, 1), (1, 2))
@@ -4318,12 +4366,58 @@ mod tests {
     }
 
     #[test]
-    fn browser_highlight_style_is_explicit_high_contrast() {
+    fn preview_session_defers_follow_during_rapid_browser_navigation() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/repo"),
+            sessions: vec![
+                sample_session("/tmp/a.jsonl", "/repo", "aaaaaaa"),
+                sample_session("/tmp/b.jsonl", "/repo", "bbbbbbb"),
+            ],
+        }];
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Session;
+        app.session_idx = 1;
+        app.preview_session_path = Some(PathBuf::from("/tmp/a.jsonl"));
+        let now = Instant::now();
+        app.last_browser_nav_at = Some(now);
+
+        let preview = app
+            .current_preview_session_at(now)
+            .expect("preview session");
+        assert_eq!(preview.id, "aaaaaaa");
+    }
+
+    #[test]
+    fn preview_session_follows_selection_after_browser_navigation_settles() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/repo"),
+            sessions: vec![
+                sample_session("/tmp/a.jsonl", "/repo", "aaaaaaa"),
+                sample_session("/tmp/b.jsonl", "/repo", "bbbbbbb"),
+            ],
+        }];
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Session;
+        app.session_idx = 1;
+        app.preview_session_path = Some(PathBuf::from("/tmp/a.jsonl"));
+        let now = Instant::now();
+        app.last_browser_nav_at = Some(now.checked_sub(Duration::from_millis(120)).unwrap_or(now));
+
+        let preview = app
+            .current_preview_session_at(now)
+            .expect("preview session");
+        assert_eq!(preview.id, "bbbbbbb");
+    }
+
+    #[test]
+    fn browser_highlight_style_is_terminal_adaptive() {
         let style = browser_highlight_style();
-        assert_eq!(style.fg, Some(Color::Black));
-        assert_eq!(style.bg, Some(Color::Cyan));
+        assert_eq!(style.fg, None);
+        assert_eq!(style.bg, None);
         assert!(style.add_modifier.contains(Modifier::BOLD));
-        assert!(!style.add_modifier.contains(Modifier::REVERSED));
+        assert!(style.add_modifier.contains(Modifier::UNDERLINED));
     }
 
     #[test]
@@ -4685,6 +4779,7 @@ mod tests {
             collapsed_projects: HashSet::new(),
             preview_header_rows: Vec::new(),
             preview_session_path: None,
+            last_browser_nav_at: None,
         };
 
         app.apply_search_filter();
@@ -4735,6 +4830,7 @@ mod tests {
             collapsed_projects: HashSet::new(),
             preview_header_rows: vec![(10, 0), (20, 1), (30, 2)],
             preview_session_path: Some(PathBuf::from("/tmp/x.jsonl")),
+            last_browser_nav_at: None,
         };
 
         app.toggle_fold_all_preview_turns();
