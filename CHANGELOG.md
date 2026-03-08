@@ -1,79 +1,35 @@
 # Changelog
 
-All notable changes to `codex-session-explorer` are documented in this file.
+## 1.0.0 - 2026-03-08
 
-## [0.2.9] - 2026-02-24
-
-### Changed
-- Added explicit platform support section to both root README and npm README.
-
-## [0.2.8] - 2026-02-24
-
-### Fixed
-- npm package README (`npm/README.md`) updated to `codex-session-tui` naming and commands.
-- npm publish workflow now copies root `README.md` into `npm/README.md` before packing, so npm page always matches GitHub README.
-
-## [0.2.7] - 2026-02-24
-
-### Changed
-- README updated to emphasize fast `/` search at top of features.
-- Quickstart examples now mention invoking search with `/`.
-
-## [0.2.6] - 2026-02-24
-
-### Changed
-- Rust release binary renamed from `codex-session-explorer` to `codex-session-tui` across CI artifacts and release assets.
-
-### Fixed
-- npm launcher now ensures executable permissions (`chmod +x`) before spawn on Unix-like systems to avoid `EACCES` in `npx` cache.
-- npm launcher keeps a legacy fallback to old binary name for compatibility.
-
-## [0.2.5] - 2026-02-24
-
-### Changed
-- npm package renamed to unscoped `codex-session-tui`.
-- Added npm bin alias so `npx -y codex-session-tui` runs directly.
-- npm publish fallback check in CI now uses package name from `npm/package.json`.
-
-## [0.2.4] - 2026-02-24
-
-### Fixed
-- npm publish workflow now correctly includes `dist/*` binaries in the package tarball.
-- Added Linux `armv7` binary build/distribution path for 32-bit Raspberry Pi environments.
-- npm launcher now maps `linux/arm` to `armv7-unknown-linux-gnueabihf`.
-
-## [0.2.3] - 2026-02-24
-
-### Changed
-- Refresh release to pick up updated CI `NPM_TOKEN` for npm publish from GitHub Actions.
-
-## [0.2.2] - 2026-02-23
-
-### Fixed
-- GitHub Actions workflow now has explicit `contents: write` permission so release binaries can be attached to GitHub Releases.
-- npm publish remains CI-only (release-triggered workflow path).
-
-## [0.2.1] - 2026-02-23
-
-### Fixed
-- CI release workflow now uses a supported macOS Intel runner label for `x86_64-apple-darwin` builds.
-
-## [0.2.0] - 2026-02-23
+Major release focused on turning the session explorer into a stable, workflow-grade TUI.
 
 ### Added
-- Multi-select sessions with keyboard and mouse checkbox toggles.
-- Bulk session operations over selected sessions.
-- Project-scope folder remap actions:
-  - Rename folder sessions (rewrite `cwd` for all sessions in a project).
-  - Copy folder sessions (duplicate all sessions to a new `cwd`).
-- Session delete action with strict confirmation (`DELETE`) and backup-before-delete.
-- Input path tab-completion with repeated-Tab directory listing.
-- Theme-aware highlighted status rendering for repeated-Tab match lists.
+- Unified browser tree with inline projects and sessions.
+- Session move, copy, fork, delete, project-folder rename, and project-folder copy actions.
+- Multi-select session operations.
+- Search-driven browser filtering with preview jump-to-match behavior.
+- Foldable preview blocks with block focus navigation.
+- Mouse selection, copying, draggable splitters, draggable scrollbars, and folder toggling.
+- Bulk browser controls:
+  - `Ctrl+Up` / `Ctrl+Down` project jump
+  - `Ctrl+Left` collapse all except current
+  - `Ctrl+Right` expand all
+- Automated TUI regression coverage for browser navigation, mouse mapping, search rendering, preview highlighting, and status-bar onboarding hints.
 
 ### Changed
-- Sessions pane default width increased for better readability.
-- Sessions pane status/footer controls now expose select-all (`a`) and invert (`i`).
+- Browser session labels now use the trailing short hash to reduce collisions.
+- Browser root labels now preserve `/` and `/root` correctly.
+- Browser navigation now follows a pinned-vs-auto expansion model:
+  - manually opened folders remain open
+  - navigation auto-expands the current project
+  - previously auto-opened projects collapse when moving away
+- Search box now shows a visible cursor and exposes keyboard onboarding in the status bar.
+- Preview opens on the latest conversation content by default and supports search highlight overlays.
 
 ### Fixed
-- Deterministic mouse checkbox toggle/unselect behavior in Sessions pane.
-- Improved status bar action discoverability for project and session workflows.
+- Preview now renders chat content instead of raw event summaries in normal chat mode.
+- Preview search highlights remain visible over two-tone message styling.
+- Browser `Left` / `Right` and mouse row mapping are consistent with rendered tree rows.
+- Rapid browser navigation no longer stalls as heavily due to deferred preview follow and reduced preview rendering work.
+- Folder toggling is available from both keyboard and mouse.
