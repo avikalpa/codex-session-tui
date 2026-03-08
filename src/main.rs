@@ -968,6 +968,7 @@ impl App {
                     BrowserCursor::Project => {
                         if self.project_idx > 0 {
                             self.project_idx -= 1;
+                            self.expand_current_project();
                         }
                     }
                     BrowserCursor::Session => {
@@ -1010,6 +1011,7 @@ impl App {
                             self.session_idx = self.session_idx.min(session_len - 1);
                         } else if self.project_idx + 1 < self.projects.len() {
                             self.project_idx += 1;
+                            self.expand_current_project();
                         }
                     }
                     BrowserCursor::Session => {
@@ -1019,6 +1021,7 @@ impl App {
                             } else if self.project_idx + 1 < self.projects.len() {
                                 self.project_idx += 1;
                                 self.browser_cursor = BrowserCursor::Project;
+                                self.expand_current_project();
                             }
                         }
                     }
@@ -1138,18 +1141,7 @@ impl App {
 
         match self.browser_cursor {
             BrowserCursor::Project => {
-                let session_len = self
-                    .current_project()
-                    .map(|project| project.sessions.len())
-                    .unwrap_or(0);
-                if self.current_project_collapsed() {
-                    self.expand_current_project();
-                } else if session_len > 0 {
-                    self.browser_cursor = BrowserCursor::Session;
-                    self.session_idx = self.session_idx.min(session_len - 1);
-                    self.status = String::from("Selected first session");
-                    self.note_browser_navigation();
-                }
+                self.toggle_current_project_collapsed();
             }
             BrowserCursor::Session => {
                 self.focus = Focus::Preview;
@@ -2143,15 +2135,22 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
         }
     };
     app.preview_content_len = preview.lines.len();
-    app.preview_rendered_lines = preview.lines.iter().map(|l| l.to_string()).collect();
     let viewport_len = area.height.saturating_sub(2) as usize;
     let max_scroll = app.preview_content_len.saturating_sub(viewport_len);
     let session_changed =
         app.preview_session_path.as_ref() != preview_session.as_ref().map(|s| &s.path);
+    let content_len_changed = app.preview_rendered_lines.len() != preview.lines.len();
     if session_changed {
         app.preview_scroll = default_preview_scroll(app.preview_content_len, viewport_len);
     } else {
         app.preview_scroll = app.preview_scroll.min(max_scroll);
+    }
+    if session_changed
+        || content_len_changed
+        || app.preview_selection.is_some()
+        || app.preview_mouse_down_pos.is_some()
+    {
+        app.preview_rendered_lines = preview.lines.iter().map(|l| l.to_string()).collect();
     }
     app.preview_header_rows = preview.header_rows.clone();
     app.preview_session_path = preview_session.map(|s| s.path);
@@ -2170,9 +2169,9 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
         .title(format!("Preview ({mode_name}) {session_title}"))
         .borders(Borders::ALL)
         .border_style(focus_style);
-    let para = Paragraph::new(preview.lines.clone())
-        .block(block)
-        .scroll((app.preview_scroll as u16, 0));
+    let (visible_start, visible_end) =
+        preview_window_bounds(app.preview_content_len, app.preview_scroll, viewport_len);
+    let para = Paragraph::new(preview.lines[visible_start..visible_end].to_vec()).block(block);
     frame.render_widget(para, area);
 
     let inner_x = area.x.saturating_add(1);
@@ -2293,6 +2292,15 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
 
 fn default_preview_scroll(content_len: usize, viewport_len: usize) -> usize {
     content_len.saturating_sub(viewport_len)
+}
+
+fn preview_window_bounds(content_len: usize, scroll: usize, viewport_len: usize) -> (usize, usize) {
+    if viewport_len == 0 || content_len == 0 {
+        return (0, 0);
+    }
+    let start = scroll.min(content_len);
+    let end = (start + viewport_len).min(content_len);
+    (start, end)
 }
 
 fn render_thin_scrollbar(
@@ -4222,7 +4230,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_enter_expands_project_then_enters_session_then_focuses_preview() {
+    fn browser_enter_toggles_project_and_session_enter_focuses_preview() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
             cwd: String::from("/repo"),
@@ -4235,11 +4243,37 @@ mod tests {
         assert!(!app.collapsed_projects.contains("/repo"));
 
         app.browser_enter();
-        assert_eq!(app.browser_cursor, BrowserCursor::Session);
-        assert_eq!(app.focus, Focus::Projects);
+        assert_eq!(app.browser_cursor, BrowserCursor::Project);
+        assert!(app.collapsed_projects.contains("/repo"));
+
+        app.browser_cursor = BrowserCursor::Session;
 
         app.browser_enter();
         assert_eq!(app.focus, Focus::Preview);
+    }
+
+    #[test]
+    fn moving_onto_project_row_auto_expands_it() {
+        let mut app = empty_test_app();
+        app.projects = vec![
+            ProjectBucket {
+                cwd: String::from("/repo-a"),
+                sessions: vec![sample_session("/tmp/a.jsonl", "/repo-a", "a")],
+            },
+            ProjectBucket {
+                cwd: String::from("/repo-b"),
+                sessions: vec![sample_session("/tmp/b.jsonl", "/repo-b", "b")],
+            },
+        ];
+        app.browser_cursor = BrowserCursor::Session;
+        app.session_idx = 0;
+        app.collapsed_projects.insert(String::from("/repo-b"));
+
+        app.move_down();
+
+        assert_eq!(app.project_idx, 1);
+        assert_eq!(app.browser_cursor, BrowserCursor::Project);
+        assert!(!app.collapsed_projects.contains("/repo-b"));
     }
 
     #[test]
@@ -4409,6 +4443,18 @@ mod tests {
             .current_preview_session_at(now)
             .expect("preview session");
         assert_eq!(preview.id, "bbbbbbb");
+    }
+
+    #[test]
+    fn preview_window_bounds_clamps_to_visible_slice() {
+        assert_eq!(preview_window_bounds(100, 10, 20), (10, 30));
+        assert_eq!(preview_window_bounds(100, 95, 20), (95, 100));
+    }
+
+    #[test]
+    fn preview_window_bounds_handles_empty_content() {
+        assert_eq!(preview_window_bounds(0, 0, 20), (0, 0));
+        assert_eq!(preview_window_bounds(10, 0, 0), (0, 0));
     }
 
     #[test]
