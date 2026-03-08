@@ -458,6 +458,14 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
             KeyCode::Enter => {
                 app.search_focused = false;
             }
+            KeyCode::Tab => {
+                app.search_focused = false;
+                app.next_focus();
+            }
+            KeyCode::BackTab => {
+                app.search_focused = false;
+                app.prev_focus();
+            }
             KeyCode::Backspace => {
                 app.search_query.pop();
                 app.search_dirty = true;
@@ -832,6 +840,7 @@ struct App {
     preview_header_rows: Vec<(usize, usize)>,
     preview_session_path: Option<PathBuf>,
     last_browser_nav_at: Option<Instant>,
+    pending_preview_search_jump: Option<(PathBuf, String)>,
 }
 
 #[derive(Clone)]
@@ -902,6 +911,7 @@ impl App {
             preview_header_rows: Vec::new(),
             preview_session_path: None,
             last_browser_nav_at: None,
+            pending_preview_search_jump: None,
         };
 
         app.reload()?;
@@ -1164,6 +1174,9 @@ impl App {
         if self.focus == Focus::Preview {
             return current;
         }
+        if let Some((path, _)) = &self.pending_preview_search_jump {
+            return self.find_session_by_path(path).or(current);
+        }
 
         let should_defer = self
             .last_browser_nav_at
@@ -1212,6 +1225,7 @@ impl App {
             self.project_scroll = 0;
             self.session_scroll = 0;
             self.preview_scroll = 0;
+            self.pending_preview_search_jump = None;
             self.search_dirty = false;
             return;
         }
@@ -1255,9 +1269,23 @@ impl App {
         self.project_idx = 0;
         self.session_idx = 0;
         self.browser_cursor = BrowserCursor::Project;
+        if let Some(first_project) = self.projects.first() {
+            if let Some(first_session) = first_project.sessions.first() {
+                self.browser_cursor = BrowserCursor::Session;
+                self.collapsed_projects.remove(&first_project.cwd);
+                self.pending_preview_search_jump =
+                    Some((first_session.path.clone(), self.search_query.clone()));
+            } else {
+                self.pending_preview_search_jump = None;
+            }
+        } else {
+            self.pending_preview_search_jump = None;
+        }
         self.project_scroll = 0;
         self.session_scroll = 0;
         self.preview_scroll = 0;
+        self.note_browser_navigation();
+        self.ensure_selection_visible();
         self.status = format!(
             "Search '{}' matched {} projects",
             self.search_query,
@@ -2145,6 +2173,17 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
     } else {
         app.preview_scroll = app.preview_scroll.min(max_scroll);
     }
+    if let Some((path, query)) = app.pending_preview_search_jump.clone()
+        && preview_session
+            .as_ref()
+            .is_some_and(|session| session.path == path)
+    {
+        if let Some(row) = preview_match_row(&preview, &query) {
+            app.preview_scroll = row.saturating_sub(viewport_len / 3);
+            app.preview_focus_turn = preview_turn_at_or_before_row(&preview.header_rows, row);
+        }
+        app.pending_preview_search_jump = None;
+    }
     if session_changed
         || content_len_changed
         || app.preview_selection.is_some()
@@ -2171,7 +2210,11 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
         .border_style(focus_style);
     let (visible_start, visible_end) =
         preview_window_bounds(app.preview_content_len, app.preview_scroll, viewport_len);
-    let para = Paragraph::new(preview.lines[visible_start..visible_end].to_vec()).block(block);
+    let visible_lines = preview.lines[visible_start..visible_end]
+        .iter()
+        .map(|line| highlight_preview_line(line, &app.search_query))
+        .collect::<Vec<_>>();
+    let para = Paragraph::new(visible_lines).block(block);
     frame.render_widget(para, area);
 
     let inner_x = area.x.saturating_add(1);
@@ -2301,6 +2344,38 @@ fn preview_window_bounds(content_len: usize, scroll: usize, viewport_len: usize)
     let start = scroll.min(content_len);
     let end = (start + viewport_len).min(content_len);
     (start, end)
+}
+
+fn preview_match_row(preview: &PreviewData, query: &str) -> Option<usize> {
+    let tokens = search_tokens(query);
+    if tokens.is_empty() {
+        return None;
+    }
+    preview.lines.iter().enumerate().find_map(|(idx, line)| {
+        let lower = line.to_string().to_lowercase();
+        if tokens.iter().all(|token| lower.contains(token))
+            || tokens.iter().any(|token| lower.contains(token))
+        {
+            Some(idx)
+        } else {
+            None
+        }
+    })
+}
+
+fn preview_turn_at_or_before_row(header_rows: &[(usize, usize)], row: usize) -> Option<usize> {
+    header_rows
+        .iter()
+        .filter(|(header_row, _)| *header_row <= row)
+        .max_by_key(|(header_row, _)| *header_row)
+        .map(|(_, turn_idx)| *turn_idx)
+}
+
+fn highlight_preview_line(line: &Line<'static>, query: &str) -> Line<'static> {
+    if query.trim().is_empty() {
+        return line.clone();
+    }
+    Line::from(highlight_spans(&line.to_string(), query))
 }
 
 fn render_thin_scrollbar(
@@ -3124,10 +3199,7 @@ fn highlight_spans(text: &str, query: &str) -> Vec<Span<'static>> {
         }
         spans.push(Span::styled(
             chars[start..end].iter().collect::<String>(),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         ));
         cursor = end;
     }
@@ -3943,6 +4015,7 @@ mod tests {
             preview_header_rows: Vec::new(),
             preview_session_path: None,
             last_browser_nav_at: None,
+            pending_preview_search_jump: None,
         }
     }
 
@@ -4362,6 +4435,7 @@ mod tests {
             preview_header_rows: Vec::new(),
             preview_session_path: None,
             last_browser_nav_at: None,
+            pending_preview_search_jump: None,
         };
         let text = app
             .preview_selected_text((0, 1), (1, 2))
@@ -4420,6 +4494,31 @@ mod tests {
             .current_preview_session_at(now)
             .expect("preview session");
         assert_eq!(preview.id, "aaaaaaa");
+    }
+
+    #[test]
+    fn pending_search_jump_overrides_browser_preview_debounce() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/repo"),
+            sessions: vec![
+                sample_session("/tmp/a.jsonl", "/repo", "aaaaaaa"),
+                sample_session("/tmp/b.jsonl", "/repo", "bbbbbbb"),
+            ],
+        }];
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Session;
+        app.session_idx = 1;
+        app.preview_session_path = Some(PathBuf::from("/tmp/a.jsonl"));
+        app.pending_preview_search_jump =
+            Some((PathBuf::from("/tmp/b.jsonl"), String::from("bbb")));
+        let now = Instant::now();
+        app.last_browser_nav_at = Some(now);
+
+        let preview = app
+            .current_preview_session_at(now)
+            .expect("preview session");
+        assert_eq!(preview.id, "bbbbbbb");
     }
 
     #[test]
@@ -4826,11 +4925,50 @@ mod tests {
             preview_header_rows: Vec::new(),
             preview_session_path: None,
             last_browser_nav_at: None,
+            pending_preview_search_jump: None,
         };
 
         app.apply_search_filter();
         assert_eq!(app.projects.len(), 1);
         assert_eq!(app.projects[0].cwd, "/repo/a");
+        assert_eq!(app.browser_cursor, BrowserCursor::Session);
+        assert_eq!(app.session_idx, 0);
+        assert_eq!(
+            app.pending_preview_search_jump,
+            Some((PathBuf::from("/tmp/a.jsonl"), String::from("alpha")))
+        );
+    }
+
+    #[test]
+    fn search_tab_moves_focus_out_of_search() {
+        let mut app = empty_test_app();
+        app.search_focused = true;
+
+        let quit = handle_normal_mode(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &mut app)
+            .expect("handle");
+        assert!(!quit);
+        assert!(!app.search_focused);
+        assert_eq!(app.focus, Focus::Preview);
+    }
+
+    #[test]
+    fn preview_match_row_finds_first_matching_line() {
+        let preview = PreviewData {
+            lines: vec![
+                Line::from("alpha"),
+                Line::from("hello johyperr world"),
+                Line::from("omega"),
+            ],
+            tone_rows: Vec::new(),
+            header_rows: vec![(1, 0)],
+            block_ranges: vec![(0, 1, 1)],
+        };
+
+        assert_eq!(preview_match_row(&preview, "johyperr"), Some(1));
+        assert_eq!(
+            preview_turn_at_or_before_row(&preview.header_rows, 1),
+            Some(0)
+        );
     }
 
     #[test]
@@ -4877,6 +5015,7 @@ mod tests {
             preview_header_rows: vec![(10, 0), (20, 1), (30, 2)],
             preview_session_path: Some(PathBuf::from("/tmp/x.jsonl")),
             last_browser_nav_at: None,
+            pending_preview_search_jump: None,
         };
 
         app.toggle_fold_all_preview_turns();
