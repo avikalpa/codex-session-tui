@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.1 - 2026-03-08
+
+Packaging follow-up release.
+
+### Changed
+- Switched the npm package name to `@avikalpa/codex-session-tui`.
+- Updated install and `npx` usage examples to the scoped package name.
+
 ## 1.0.0 - 2026-03-08
 
 Major release focused on turning the session explorer into a stable, workflow-grade TUI.
