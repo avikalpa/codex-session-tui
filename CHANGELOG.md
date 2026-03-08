@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- Added a release-workflow guard that fails if the npm package name is changed away from unscoped `codex-session-tui`.
+
 ## 1.0.4 - 2026-03-08
 
 Packaging follow-up.
