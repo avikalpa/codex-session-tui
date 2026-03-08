@@ -1,8 +1,10 @@
 # Changelog
 
-## Unreleased
+## 1.0.5 - 2026-03-08
 
 ### Changed
+- Rewrote the README as a user-facing manual and synced it for npm publication.
+- Added the major-release asciinema demo to the README.
 - Added a release-workflow guard that fails if the npm package name is changed away from unscoped `codex-session-tui`.
 
 ## 1.0.4 - 2026-03-08
