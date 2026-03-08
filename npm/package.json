@@ -1,6 +1,6 @@
 {
   "name": "@avikalpa/codex-session-tui",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Prebuilt codex-session-tui binaries for macOS, Linux, and Windows.",
   "license": "MIT",
   "bin": {
