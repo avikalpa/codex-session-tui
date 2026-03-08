@@ -739,7 +739,6 @@ struct SessionSummary {
     id: String,
     cwd: String,
     started_at: String,
-    modified_at: String,
     modified_epoch: i64,
     #[allow(dead_code)]
     event_count: usize,
@@ -845,8 +844,8 @@ impl App {
             scroll_drag: None,
             status: String::from("Press q to quit, g to refresh"),
             panes: PaneLayout::default(),
-            project_width_pct: 20,
-            session_width_pct: 38,
+            project_width_pct: 24,
+            session_width_pct: 0,
             project_scroll: 0,
             session_scroll: 0,
             preview_scroll: 0,
@@ -1136,8 +1135,7 @@ impl App {
     fn resize_focused_pane(&mut self, delta: i16) {
         let min = 15i16;
         let mut p = self.project_width_pct as i16;
-        let mut s = self.session_width_pct as i16;
-        let mut r = 100i16 - p - s;
+        let mut r = 100i16 - p;
 
         match self.focus {
             Focus::Projects => {
@@ -1146,16 +1144,16 @@ impl App {
             }
             Focus::Preview => {
                 r += delta;
-                s -= delta;
+                p -= delta;
             }
         }
 
-        if p < min || s < min || r < min {
+        if p < min || r < min {
             return;
         }
 
         self.project_width_pct = p as u16;
-        self.session_width_pct = s as u16;
+        self.session_width_pct = 0;
     }
 
     fn resize_from_mouse(&mut self, target: DragTarget, mouse_x: u16) {
@@ -1172,7 +1170,9 @@ impl App {
         let right = x0.saturating_add(total_width);
 
         let split = match target {
-            DragTarget::LeftSplitter => mouse_x.clamp(x0.saturating_add(12), right.saturating_sub(12)),
+            DragTarget::LeftSplitter => {
+                mouse_x.clamp(x0.saturating_add(12), right.saturating_sub(12))
+            }
         };
 
         let p = split.saturating_sub(x0) as f32 / total_width as f32 * 100.0;
@@ -1856,8 +1856,8 @@ fn render_browser(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
             if let Some(session_idx) = row.session_idx {
                 let session = &app.projects[row.project_idx].sessions[session_idx];
                 let selected = app.selected_sessions.contains(&session.path);
-                let mark = if selected { "[x]" } else { "[ ]" };
-                let line = format!("{mark} {}", format_session_browser_line(session));
+                let mark = if selected { "◉" } else { "◌" };
+                let line = format!("  {mark} {}", format_session_browser_line(session));
                 let base = if selected {
                     Style::default()
                         .fg(Color::Yellow)
@@ -1872,7 +1872,8 @@ fn render_browser(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
             } else {
                 let project = &app.projects[row.project_idx];
                 let label = format!(
-                    "📁 {} ({})",
+                    "{}📁 {} ({})",
+                    project_indent(&app.projects, row.project_idx),
                     project_label(&app.projects, row.project_idx),
                     project.sessions.len()
                 );
@@ -1927,26 +1928,20 @@ fn render_browser(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
 }
 
 fn format_session_browser_line(session: &SessionSummary) -> String {
-    let short_id: String = session.id.chars().take(7).collect();
-    let label = session_human_label(session);
-    format!("{short_id}  {}  {label}", session.modified_at)
-}
-
-fn session_human_label(session: &SessionSummary) -> String {
-    let raw = session
-        .search_blob
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or(&session.file_name);
-    let trimmed = raw.trim();
-    if trimmed.chars().count() <= 48 {
-        trimmed.to_string()
-    } else {
-        format!("{}...", trimmed.chars().take(45).collect::<String>())
-    }
+    session.id.chars().take(7).collect()
 }
 
 fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut App) {
+    let session_title = app
+        .current_session()
+        .map(|s| {
+            format!(
+                "{}  {}",
+                s.id.chars().take(7).collect::<String>(),
+                format_human_timestamp(&s.started_at)
+            )
+        })
+        .unwrap_or_else(|| String::from("No session selected"));
     let preview = if let Some(session) = app.current_session().cloned() {
         let inner_width = area.width.saturating_sub(2) as usize;
         match app.preview_for_session(&session, app.preview_mode, inner_width) {
@@ -1991,7 +1986,7 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
         PreviewMode::Events => "Events",
     };
     let block = Block::default()
-        .title(format!("Preview ({mode_name})"))
+        .title(format!("Preview ({mode_name}) {session_title}"))
         .borders(Borders::ALL)
         .border_style(focus_style);
     let para = Paragraph::new(preview.lines.clone())
@@ -2517,7 +2512,9 @@ fn build_preview_from_cached(
             .add_modifier(Modifier::BOLD),
     )));
 
-    if cached.turns.is_empty() {
+    let turns = coalesce_chat_turns(&cached.turns);
+
+    if turns.is_empty() {
         lines.push(Line::from(
             "No user/assistant chat messages found in this session.",
         ));
@@ -2529,17 +2526,13 @@ fn build_preview_from_cached(
         };
     }
 
-    let user_count = cached.turns.iter().filter(|t| t.role == "user").count();
-    let assistant_count = cached
-        .turns
-        .iter()
-        .filter(|t| t.role == "assistant")
-        .count();
+    let user_count = turns.iter().filter(|t| t.role == "user").count();
+    let assistant_count = turns.iter().filter(|t| t.role == "assistant").count();
     lines.push(Line::from(format!(
         "Turns: user={} assistant={} total={}",
         user_count,
         assistant_count,
-        cached.turns.len()
+        turns.len()
     )));
     if assistant_count == 0 {
         lines.push(Line::from(Span::styled(
@@ -2549,7 +2542,7 @@ fn build_preview_from_cached(
     }
     lines.push(Line::from(String::new()));
 
-    for (turn_idx, turn) in cached.turns.iter().enumerate() {
+    for (turn_idx, turn) in turns.iter().enumerate() {
         let tone = if turn.role == "user" {
             BlockTone::User
         } else {
@@ -2575,7 +2568,10 @@ fn build_preview_from_cached(
             Span::styled(format!("{marker} "), Style::default().fg(Color::DarkGray)),
             Span::styled(format!(" {} ", turn.role.to_uppercase()), role_style),
             Span::raw(" "),
-            Span::styled(turn.timestamp.clone(), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format_human_timestamp(&turn.timestamp),
+                Style::default().fg(Color::DarkGray),
+            ),
         ]));
         header_rows.push((lines.len().saturating_sub(1), turn_idx));
         tone_rows.push((lines.len().saturating_sub(1), tone));
@@ -2590,10 +2586,13 @@ fn build_preview_from_cached(
         tone_rows.push((lines.len().saturating_sub(1), tone));
         let block_end = lines.len().saturating_sub(1);
         block_ranges.push((turn_idx, block_start, block_end));
-        if turn_idx + 1 < cached.turns.len() {
+        if turn_idx + 1 < turns.len() {
             if tone == BlockTone::User {
                 // Ensure a terminal-bg hairline gap between USER blocks.
-                lines.push(Line::from(String::new()));
+                lines.push(Line::from(Span::styled(
+                    "─".repeat(inner_width.saturating_sub(1).max(1)),
+                    Style::default().fg(Color::DarkGray),
+                )));
             } else {
                 let width = inner_width.saturating_sub(1).max(1);
                 lines.push(Line::from(Span::styled(
@@ -2996,9 +2995,19 @@ fn project_label(projects: &[ProjectBucket], idx: usize) -> String {
     if rel.is_empty() {
         return cwd.to_string();
     }
+    rel.last().cloned().unwrap_or_else(|| cwd.to_string())
+}
 
-    let indent = "  ".repeat(rel.len().saturating_sub(1).min(6));
-    format!("{indent}{}", rel.last().unwrap_or(&String::from(cwd)))
+fn project_indent(projects: &[ProjectBucket], idx: usize) -> String {
+    let cwd = projects
+        .get(idx)
+        .map(|p| p.cwd.as_str())
+        .unwrap_or("<unknown>");
+    let common = shared_path_prefix(projects);
+    let parts = path_components(cwd);
+    let common_len = common.len().min(parts.len());
+    let rel_depth = parts[common_len..].len().saturating_sub(1).min(6);
+    "  ".repeat(rel_depth)
 }
 
 fn shared_path_prefix(projects: &[ProjectBucket]) -> Vec<String> {
@@ -3109,6 +3118,34 @@ struct ChatTurn {
     role: String,
     timestamp: String,
     text: String,
+}
+
+fn coalesce_chat_turns(turns: &[ChatTurn]) -> Vec<ChatTurn> {
+    let mut out: Vec<ChatTurn> = Vec::new();
+    for turn in turns {
+        if let Some(last) = out.last_mut()
+            && last.role == turn.role
+        {
+            if !last.text.is_empty() && !turn.text.is_empty() {
+                last.text.push_str("\n\n");
+            }
+            last.text.push_str(&turn.text);
+            last.timestamp = turn.timestamp.clone();
+            continue;
+        }
+        out.push(turn.clone());
+    }
+    out
+}
+
+fn format_human_timestamp(raw: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| {
+            dt.with_timezone(&Utc)
+                .format("%B %-d, %Y %-I:%M%p")
+                .to_string()
+        })
+        .unwrap_or_else(|_| raw.to_string())
 }
 
 #[derive(Clone)]
@@ -3395,7 +3432,6 @@ fn parse_session_summary(path: &Path) -> Result<SessionSummary> {
         id: session_id,
         cwd,
         started_at,
-        modified_at: modified_dt.format("%Y-%m-%d %H:%M").to_string(),
         modified_epoch: modified_dt.timestamp(),
         event_count,
         search_blob: search_parts.join("\n"),
@@ -3706,7 +3742,6 @@ mod tests {
             id: String::from(id),
             cwd: String::from(cwd),
             started_at: String::from("2026-01-01T00:00:00Z"),
-            modified_at: String::from("2026-01-02 03:04"),
             modified_epoch: 123,
             event_count: 1,
             search_blob: String::new(),
@@ -4013,22 +4048,52 @@ mod tests {
     }
 
     #[test]
-    fn session_browser_line_uses_short_hash_and_modified_time() {
+    fn session_browser_line_uses_only_short_hash() {
         let s = SessionSummary {
             path: PathBuf::from("/tmp/a.jsonl"),
             file_name: String::from("rollout-a.jsonl"),
             id: String::from("123456789abcdef"),
             cwd: String::from("/tmp"),
             started_at: String::from("2026-01-01T00:00:00Z"),
-            modified_at: String::from("2026-01-02 03:04"),
             modified_epoch: 123,
             event_count: 42,
             search_blob: String::from("first user prompt"),
         };
         let line = format_session_browser_line(&s);
-        assert!(line.starts_with("1234567"));
-        assert!(line.contains("2026-01-02 03:04"));
-        assert!(line.contains("first user prompt"));
+        assert_eq!(line, "1234567");
+    }
+
+    #[test]
+    fn human_timestamp_formats_readably() {
+        assert_eq!(
+            format_human_timestamp("2026-03-31T14:04:00Z"),
+            "March 31, 2026 2:04PM"
+        );
+    }
+
+    #[test]
+    fn coalesce_adjacent_turns_merges_same_role() {
+        let turns = vec![
+            ChatTurn {
+                role: String::from("user"),
+                timestamp: String::from("2026-01-01T00:00:00Z"),
+                text: String::from("one"),
+            },
+            ChatTurn {
+                role: String::from("user"),
+                timestamp: String::from("2026-01-01T00:01:00Z"),
+                text: String::from("two"),
+            },
+            ChatTurn {
+                role: String::from("assistant"),
+                timestamp: String::from("2026-01-01T00:02:00Z"),
+                text: String::from("three"),
+            },
+        ];
+        let merged = coalesce_chat_turns(&turns);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].text, "one\n\ntwo");
+        assert_eq!(merged[0].timestamp, "2026-01-01T00:01:00Z");
     }
 
     #[test]
@@ -4050,7 +4115,6 @@ mod tests {
             id: String::from("abc"),
             cwd: String::from("/tmp/x"),
             started_at: String::from("2026-01-01T00:00:00Z"),
-            modified_at: String::from("2026-01-02 03:04"),
             modified_epoch: 123,
             event_count: 4,
             search_blob: String::from("hello world normalized user"),
@@ -4090,7 +4154,6 @@ mod tests {
             id: String::from("x"),
             cwd: String::from("/tmp"),
             started_at: String::from("2026-01-01T00:00:00Z"),
-            modified_at: String::from("2026-01-02 03:04"),
             modified_epoch: 123,
             event_count: 2,
             search_blob: String::new(),
@@ -4127,13 +4190,12 @@ mod tests {
             id: String::from("x"),
             cwd: String::from("/tmp"),
             started_at: String::from("2026-01-01T00:00:00Z"),
-            modified_at: String::from("2026-01-02 03:04"),
             modified_epoch: 123,
             event_count: 141,
             search_blob: String::new(),
         };
         let preview = build_preview(&s, PreviewMode::Chat, 60).expect("preview");
-        assert_eq!(preview.header_rows.len(), 140);
+        assert_eq!(preview.header_rows.len(), 1);
     }
 
     #[test]
@@ -4153,7 +4215,6 @@ mod tests {
             id: String::from("x"),
             cwd: String::from("/tmp"),
             started_at: String::from("2026-01-01T00:00:00Z"),
-            modified_at: String::from("2026-01-02 03:04"),
             modified_epoch: 123,
             event_count: 2,
             search_blob: String::new(),
@@ -4195,7 +4256,6 @@ mod tests {
             id: String::from("x"),
             cwd: String::from("/tmp"),
             started_at: String::from("t0"),
-            modified_at: String::from("2026-01-02 03:04"),
             modified_epoch: 123,
             event_count: 2,
             search_blob: String::new(),
@@ -4223,7 +4283,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_blocks_have_hairline_separator() {
+    fn adjacent_assistant_turns_merge_into_single_block() {
         let cached = CachedPreviewSource {
             mtime: SystemTime::UNIX_EPOCH,
             turns: vec![
@@ -4246,23 +4306,13 @@ mod tests {
             id: String::from("x"),
             cwd: String::from("/tmp"),
             started_at: String::from("t0"),
-            modified_at: String::from("2026-01-02 03:04"),
             modified_epoch: 123,
             event_count: 2,
             search_blob: String::new(),
         };
         let preview =
             build_preview_from_cached(&s, PreviewMode::Chat, 30, &cached, &HashSet::new());
-        let rows = preview
-            .lines
-            .iter()
-            .map(|l| l.to_string())
-            .collect::<Vec<_>>();
-        let sep_idx = rows
-            .iter()
-            .position(|r| r.contains('─'))
-            .expect("assistant separator");
-        assert!(!preview.tone_rows.iter().any(|(idx, _)| *idx == sep_idx));
+        assert_eq!(preview.header_rows.len(), 1);
     }
 
     #[test]
@@ -4273,7 +4323,6 @@ mod tests {
             id: String::from("a"),
             cwd: String::from("/repo/a"),
             started_at: String::from("2026-01-01T00:00:00Z"),
-            modified_at: String::from("2026-01-02 03:04"),
             modified_epoch: 123,
             event_count: 1,
             search_blob: String::from("deploy fix alpha"),
@@ -4284,7 +4333,6 @@ mod tests {
             id: String::from("b"),
             cwd: String::from("/repo/b"),
             started_at: String::from("2026-01-01T00:00:00Z"),
-            modified_at: String::from("2026-01-02 03:03"),
             modified_epoch: 122,
             event_count: 1,
             search_blob: String::from("unrelated text"),

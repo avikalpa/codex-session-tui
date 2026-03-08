@@ -14,7 +14,8 @@
 - 2-pane TUI: Browser, Preview
 - Operations: move, copy, fork, delete, project-folder rename/copy
 - Multi-select sessions and bulk operations
-- Sessions sorted by last modified, with short hash-style ids and human-readable labels
+- Sessions sorted by last modified, shown as short hash-style ids in the browser
+- Preview headers show readable timestamps and adjacent same-role messages are grouped into one block
 - Foldable preview blocks, mouse selection/copy, draggable splitters/scrollbars
 
 ## Motivation
