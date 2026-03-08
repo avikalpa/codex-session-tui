@@ -984,8 +984,12 @@ impl App {
                     BrowserCursor::Session => {
                         if self.session_idx > 0 {
                             self.session_idx -= 1;
+                            if self.session_idx == 0 {
+                                self.expand_current_project();
+                            }
                         } else {
                             self.browser_cursor = BrowserCursor::Project;
+                            self.expand_current_project();
                         }
                     }
                 }
@@ -1180,7 +1184,7 @@ impl App {
 
         let should_defer = self
             .last_browser_nav_at
-            .is_some_and(|last| now.duration_since(last) < Duration::from_millis(80));
+            .is_some_and(|last| now.duration_since(last) < Duration::from_millis(180));
         if !should_defer {
             return current;
         }
@@ -2210,11 +2214,7 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
         .border_style(focus_style);
     let (visible_start, visible_end) =
         preview_window_bounds(app.preview_content_len, app.preview_scroll, viewport_len);
-    let visible_lines = preview.lines[visible_start..visible_end]
-        .iter()
-        .map(|line| highlight_preview_line(line, &app.search_query))
-        .collect::<Vec<_>>();
-    let para = Paragraph::new(visible_lines).block(block);
+    let para = Paragraph::new(preview.lines[visible_start..visible_end].to_vec()).block(block);
     frame.render_widget(para, area);
 
     let inner_x = area.x.saturating_add(1);
@@ -2236,6 +2236,31 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
             },
             block_tone_style(tone),
         );
+    }
+    if !app.search_query.trim().is_empty() {
+        for row in visible_start..visible_end {
+            let Some(line) = preview.lines.get(row) else {
+                continue;
+            };
+            let screen_y = inner_y + (row - scroll) as u16;
+            for (col_start, col_end) in highlight_ranges(&line.to_string(), &app.search_query) {
+                let x = inner_x.saturating_add(col_start as u16);
+                let width = (col_end.saturating_sub(col_start)) as u16;
+                let max_w = inner_w.saturating_sub(col_start as u16);
+                if width == 0 || max_w == 0 {
+                    continue;
+                }
+                frame.buffer_mut().set_style(
+                    ratatui::layout::Rect {
+                        x,
+                        y: screen_y,
+                        width: width.min(max_w),
+                        height: 1,
+                    },
+                    Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                );
+            }
+        }
     }
     if app.focus == Focus::Preview
         && let Some(focused_turn) = app.preview_focus_turn
@@ -2369,13 +2394,6 @@ fn preview_turn_at_or_before_row(header_rows: &[(usize, usize)], row: usize) -> 
         .filter(|(header_row, _)| *header_row <= row)
         .max_by_key(|(header_row, _)| *header_row)
         .map(|(_, turn_idx)| *turn_idx)
-}
-
-fn highlight_preview_line(line: &Line<'static>, query: &str) -> Line<'static> {
-    if query.trim().is_empty() {
-        return line.clone();
-    }
-    Line::from(highlight_spans(&line.to_string(), query))
 }
 
 fn render_thin_scrollbar(
@@ -2521,6 +2539,19 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::styled("esc", Style::default().fg(Color::Red)),
             Span::raw(" cancel"),
         ])
+    } else if app.search_focused {
+        Line::from(vec![
+            Span::styled("type", Style::default().fg(Color::Cyan)),
+            Span::raw(" filter  "),
+            Span::styled("enter", Style::default().fg(Color::Green)),
+            Span::raw(" keep results  "),
+            Span::styled("esc", Style::default().fg(Color::Red)),
+            Span::raw(" close search  "),
+            Span::styled("tab", Style::default().fg(Color::Cyan)),
+            Span::raw(" next pane  "),
+            Span::styled("shift+tab", Style::default().fg(Color::Cyan)),
+            Span::raw(" prev pane"),
+        ])
     } else if app.focus == Focus::Preview && app.mode == Mode::Normal {
         Line::from(vec![
             Span::styled("esc", Style::default().fg(Color::Red)),
@@ -2604,9 +2635,10 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
         String::from("search: <none>")
     } else {
         format!(
-            "search: '{}' ({} projects)",
+            "search: '{}' ({} projects, {} focus)",
             app.search_query,
-            app.projects.len()
+            app.projects.len(),
+            if app.search_focused { "active" } else { "kept" }
         )
     };
     let preview_mode = match app.preview_mode {
@@ -3154,46 +3186,15 @@ fn search_score(
 }
 
 fn highlight_spans(text: &str, query: &str) -> Vec<Span<'static>> {
-    let tokens = search_tokens(query);
-    if tokens.is_empty() {
-        return vec![Span::raw(text.to_string())];
-    }
-
-    let lower = text.to_lowercase();
-    let mut ranges = Vec::<(usize, usize)>::new();
-    for token in tokens {
-        let mut start_at = 0usize;
-        while let Some(rel) = lower[start_at..].find(&token) {
-            let start = start_at + rel;
-            let end = start + token.len();
-            ranges.push((start, end));
-            start_at = end;
-            if start_at >= lower.len() {
-                break;
-            }
-        }
-    }
+    let ranges = highlight_ranges(text, query);
     if ranges.is_empty() {
         return vec![Span::raw(text.to_string())];
-    }
-    ranges.sort_unstable();
-    let mut merged = Vec::<(usize, usize)>::new();
-    for (start, end) in ranges {
-        if let Some(last) = merged.last_mut()
-            && start <= last.1
-        {
-            last.1 = last.1.max(end);
-        } else {
-            merged.push((start, end));
-        }
     }
 
     let chars = text.chars().collect::<Vec<_>>();
     let mut spans = Vec::new();
     let mut cursor = 0usize;
-    for (start_b, end_b) in merged {
-        let start = text[..start_b].chars().count();
-        let end = text[..end_b].chars().count();
+    for (start, end) in ranges {
         if cursor < start {
             spans.push(Span::raw(chars[cursor..start].iter().collect::<String>()));
         }
@@ -3207,6 +3208,51 @@ fn highlight_spans(text: &str, query: &str) -> Vec<Span<'static>> {
         spans.push(Span::raw(chars[cursor..].iter().collect::<String>()));
     }
     spans
+}
+
+fn highlight_ranges(text: &str, query: &str) -> Vec<(usize, usize)> {
+    let tokens = search_tokens(query);
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let lower = text.to_lowercase();
+    let mut byte_ranges = Vec::<(usize, usize)>::new();
+    for token in tokens {
+        let mut start_at = 0usize;
+        while let Some(rel) = lower[start_at..].find(&token) {
+            let start = start_at + rel;
+            let end = start + token.len();
+            byte_ranges.push((start, end));
+            start_at = end;
+            if start_at >= lower.len() {
+                break;
+            }
+        }
+    }
+    if byte_ranges.is_empty() {
+        return Vec::new();
+    }
+    byte_ranges.sort_unstable();
+    let mut merged = Vec::<(usize, usize)>::new();
+    for (start, end) in byte_ranges {
+        if let Some(last) = merged.last_mut()
+            && start <= last.1
+        {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+        .into_iter()
+        .map(|(start_b, end_b)| {
+            (
+                text[..start_b].chars().count(),
+                text[..end_b].chars().count(),
+            )
+        })
+        .collect()
 }
 
 fn prepend_style(spans: Vec<Span<'static>>, base: Style) -> Vec<Span<'static>> {
@@ -4326,6 +4372,26 @@ mod tests {
     }
 
     #[test]
+    fn moving_up_to_project_row_auto_expands_it() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/repo"),
+            sessions: vec![
+                sample_session("/tmp/a.jsonl", "/repo", "a"),
+                sample_session("/tmp/b.jsonl", "/repo", "b"),
+            ],
+        }];
+        app.collapsed_projects.insert(String::from("/repo"));
+        app.browser_cursor = BrowserCursor::Session;
+        app.session_idx = 0;
+
+        app.move_up();
+
+        assert_eq!(app.browser_cursor, BrowserCursor::Project);
+        assert!(!app.collapsed_projects.contains("/repo"));
+    }
+
+    #[test]
     fn moving_onto_project_row_auto_expands_it() {
         let mut app = empty_test_app();
         app.projects = vec![
@@ -4536,7 +4602,7 @@ mod tests {
         app.session_idx = 1;
         app.preview_session_path = Some(PathBuf::from("/tmp/a.jsonl"));
         let now = Instant::now();
-        app.last_browser_nav_at = Some(now.checked_sub(Duration::from_millis(120)).unwrap_or(now));
+        app.last_browser_nav_at = Some(now.checked_sub(Duration::from_millis(220)).unwrap_or(now));
 
         let preview = app
             .current_preview_session_at(now)
@@ -4968,6 +5034,18 @@ mod tests {
         assert_eq!(
             preview_turn_at_or_before_row(&preview.header_rows, 1),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn highlight_ranges_returns_character_offsets() {
+        assert_eq!(
+            highlight_ranges("hello johyperr world", "johyperr"),
+            vec![(6, 14)]
+        );
+        assert_eq!(
+            highlight_ranges("alpha beta alpha", "alpha"),
+            vec![(0, 5), (11, 16)]
         );
     }
 
