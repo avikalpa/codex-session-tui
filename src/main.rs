@@ -1240,6 +1240,19 @@ impl App {
         self.status = String::from("Expanded all folders");
     }
 
+    fn collapse_all_projects(&mut self) {
+        self.collapsed_projects = self
+            .projects
+            .iter()
+            .map(|project| project.cwd.clone())
+            .collect();
+        self.pinned_open_projects.clear();
+        self.browser_cursor = BrowserCursor::Project;
+        self.project_scroll = 0;
+        self.session_scroll = 0;
+        self.preview_scroll = 0;
+    }
+
     fn jump_project(&mut self, delta: isize) {
         if self.projects.is_empty() {
             return;
@@ -1332,10 +1345,7 @@ impl App {
             self.projects = self.all_projects.clone();
             self.project_idx = self.project_idx.min(self.projects.len().saturating_sub(1));
             self.clamp_session_idx();
-            self.browser_cursor = BrowserCursor::Project;
-            self.project_scroll = 0;
-            self.session_scroll = 0;
-            self.preview_scroll = 0;
+            self.collapse_all_projects();
             self.pending_preview_search_jump = None;
             self.search_dirty = false;
             return;
@@ -2392,16 +2402,6 @@ fn browser_display_path(path: &str) -> String {
 }
 
 fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut App) {
-    let session_title = app
-        .current_preview_session()
-        .map(|s| {
-            format!(
-                "{}  {}",
-                s.id.chars().take(7).collect::<String>(),
-                format_human_timestamp(&s.started_at)
-            )
-        })
-        .unwrap_or_else(|| String::from("No session selected"));
     let preview_session = app.current_preview_session();
     let preview = if let Some(session) = preview_session.clone() {
         let inner_width = area.width.saturating_sub(2) as usize;
@@ -2422,6 +2422,31 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
             block_ranges: Vec::new(),
         })
     };
+    let session_title = preview_session
+        .as_ref()
+        .map(|s| {
+            let (user_count, assistant_count) = app
+                .preview_cache
+                .get(&s.path)
+                .map(|cached| {
+                    let user = cached.turns.iter().filter(|turn| turn.role == "user").count();
+                    let assistant = cached
+                        .turns
+                        .iter()
+                        .filter(|turn| turn.role == "assistant")
+                        .count();
+                    (user, assistant)
+                })
+                .unwrap_or((0, 0));
+            format!(
+                "{}  {}  user={} assistant={}",
+                s.id.chars().take(7).collect::<String>(),
+                format_human_timestamp(&s.started_at),
+                user_count,
+                assistant_count
+            )
+        })
+        .unwrap_or_else(|| String::from("No session selected"));
     app.preview_content_len = preview.lines.len();
     let viewport_len = area.height.saturating_sub(2) as usize;
     let max_scroll = app.preview_content_len.saturating_sub(viewport_len);
@@ -3108,14 +3133,7 @@ fn build_preview_from_cached(
         };
     }
 
-    let user_count = turns.iter().filter(|t| t.role == "user").count();
     let assistant_count = turns.iter().filter(|t| t.role == "assistant").count();
-    lines.push(Line::from(format!(
-        "Turns: user={} assistant={} total={}",
-        user_count,
-        assistant_count,
-        turns.len()
-    )));
     if assistant_count == 0 {
         lines.push(Line::from(Span::styled(
             "Warning: no assistant messages detected in this session.",
@@ -5645,7 +5663,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_includes_assistant_count_line() {
+    fn preview_body_omits_old_count_line_when_assistant_present() {
         let cached = CachedPreviewSource {
             mtime: SystemTime::UNIX_EPOCH,
             turns: vec![
@@ -5680,7 +5698,8 @@ mod tests {
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(joined.contains("assistant=1"));
+        assert!(!joined.contains("assistant=1"));
+        assert!(!joined.contains("Warning: no assistant messages detected"));
     }
 
     #[test]
@@ -5816,6 +5835,30 @@ mod tests {
             app.pending_preview_search_jump,
             Some((PathBuf::from("/tmp/a.jsonl"), String::from("alpha")))
         );
+    }
+
+    #[test]
+    fn apply_search_filter_empty_collapses_all_projects() {
+        let mut app = empty_test_app();
+        app.all_projects = vec![
+            ProjectBucket {
+                cwd: String::from("/repo/a"),
+                sessions: vec![sample_session("/tmp/a.jsonl", "/repo/a", "a")],
+            },
+            ProjectBucket {
+                cwd: String::from("/repo/b"),
+                sessions: vec![sample_session("/tmp/b.jsonl", "/repo/b", "b")],
+            },
+        ];
+        app.search_query = String::new();
+
+        app.apply_search_filter();
+
+        assert_eq!(app.browser_cursor, BrowserCursor::Project);
+        assert!(app.collapsed_projects.contains("/repo/a"));
+        assert!(app.collapsed_projects.contains("/repo/b"));
+        assert!(app.pinned_open_projects.is_empty());
+        assert!(app.current_preview_session().is_none());
     }
 
     #[test]
@@ -6056,6 +6099,83 @@ mod tests {
             }
         }
         assert!(highlighted);
+    }
+
+    #[test]
+    fn render_preview_title_shows_total_message_counts() {
+        let dir = std::env::temp_dir().join(format!("cse-preview-title-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("sample.jsonl");
+        fs::write(&path, sample_chat_jsonl()).expect("write");
+
+        let session = SessionSummary {
+            path: path.clone(),
+            file_name: String::from("sample.jsonl"),
+            id: String::from("abcdef123456"),
+            cwd: String::from("/tmp/x"),
+            started_at: String::from("2026-01-01T00:00:00Z"),
+            modified_epoch: 123,
+            event_count: 4,
+            search_blob: String::from("hello world normalized user"),
+        };
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/tmp/x"),
+            sessions: vec![session],
+        }];
+        app.focus = Focus::Preview;
+        app.browser_cursor = BrowserCursor::Session;
+
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_preview(
+                    frame,
+                    ratatui::layout::Rect {
+                        x: 0,
+                        y: 0,
+                        width: 100,
+                        height: 20,
+                    },
+                    &mut app,
+                );
+            })
+            .expect("draw");
+
+        let backend = terminal.backend();
+        assert!(buffer_contains(backend, "user=2 assistant=1"));
+    }
+
+    #[test]
+    fn render_preview_shows_no_session_selected_on_project_row() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/repo"),
+            sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
+        }];
+        app.browser_cursor = BrowserCursor::Project;
+        app.focus = Focus::Projects;
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_preview(
+                    frame,
+                    ratatui::layout::Rect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 12,
+                    },
+                    &mut app,
+                );
+            })
+            .expect("draw");
+
+        let backend = terminal.backend();
+        assert!(buffer_contains(backend, "No session selected"));
     }
 
     #[test]
