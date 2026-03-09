@@ -107,6 +107,7 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
                 let rows = app.browser_rows();
                 let idx = app.project_scroll + mouse_row_to_index(mouse.row, app.panes.browser);
                 if let Some(row) = rows.get(idx).copied() {
+                    let is_double_click = app.register_browser_click(row, Instant::now());
                     if row.session_idx.is_none()
                         && is_project_toggle_hit(
                             mouse.column,
@@ -120,7 +121,9 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
                         app.toggle_current_project_collapsed_manual();
                     } else {
                         app.set_browser_row(row);
-                        if let Some(session_idx) = row.session_idx {
+                        if row.session_idx.is_none() && is_double_click {
+                            app.toggle_current_project_collapsed_manual();
+                        } else if let Some(session_idx) = row.session_idx {
                             let checkbox_hit = is_sessions_checkbox_hit(
                                 mouse.column,
                                 mouse.row,
@@ -128,6 +131,8 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
                             );
                             if checkbox_hit {
                                 app.toggle_current_session_selection();
+                            } else if is_double_click {
+                                app.focus = Focus::Preview;
                             } else {
                                 app.session_select_anchor = Some(session_idx);
                             }
@@ -518,6 +523,18 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
                 app.expand_all_projects();
                 return Ok(false);
             }
+            KeyCode::Char('c') => {
+                app.copy_browser_selection(BrowserClipboardMode::Copy);
+                return Ok(false);
+            }
+            KeyCode::Char('x') => {
+                app.copy_browser_selection(BrowserClipboardMode::Cut);
+                return Ok(false);
+            }
+            KeyCode::Char('v') => {
+                app.paste_browser_clipboard()?;
+                return Ok(false);
+            }
             _ => {}
         }
     }
@@ -790,6 +807,19 @@ enum Action {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BrowserClipboardMode {
+    Copy,
+    Cut,
+}
+
+#[derive(Clone)]
+struct BrowserClipboard {
+    mode: BrowserClipboardMode,
+    targets: Vec<SessionSummary>,
+    source_label: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {
     Normal,
     Input,
@@ -883,6 +913,8 @@ struct App {
     preview_session_path: Option<PathBuf>,
     last_browser_nav_at: Option<Instant>,
     pending_preview_search_jump: Option<(PathBuf, String)>,
+    browser_clipboard: Option<BrowserClipboard>,
+    last_browser_click: Option<(BrowserRow, Instant)>,
 }
 
 #[derive(Clone)]
@@ -900,7 +932,7 @@ struct RenderedPreviewCache {
     data: Arc<PreviewData>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct BrowserRow {
     project_idx: usize,
     session_idx: Option<usize>,
@@ -955,6 +987,8 @@ impl App {
             preview_session_path: None,
             last_browser_nav_at: None,
             pending_preview_search_jump: None,
+            browser_clipboard: None,
+            last_browser_click: None,
         };
 
         app.reload()?;
@@ -1861,6 +1895,141 @@ impl App {
         }
     }
 
+    fn browser_copy_targets(&self) -> Vec<SessionSummary> {
+        match self.browser_cursor {
+            BrowserCursor::Project => self
+                .current_project()
+                .map(|project| project.sessions.clone())
+                .unwrap_or_default(),
+            BrowserCursor::Session => self.action_targets(Action::Copy),
+        }
+    }
+
+    fn copy_browser_selection(&mut self, mode: BrowserClipboardMode) {
+        let targets = self.browser_copy_targets();
+        if targets.is_empty() {
+            self.status = match self.browser_cursor {
+                BrowserCursor::Project => String::from("No sessions in selected folder"),
+                BrowserCursor::Session => String::from("No session selected"),
+            };
+            return;
+        }
+
+        let source_label = match self.browser_cursor {
+            BrowserCursor::Project => self
+                .current_project()
+                .map(|project| browser_display_path(&project.cwd))
+                .unwrap_or_else(|| String::from("<unknown>")),
+            BrowserCursor::Session => targets
+                .first()
+                .map(|session| browser_display_path(&session.cwd))
+                .unwrap_or_else(|| String::from("<unknown>")),
+        };
+
+        self.browser_clipboard = Some(BrowserClipboard {
+            mode,
+            targets: targets.clone(),
+            source_label: source_label.clone(),
+        });
+        self.status = match mode {
+            BrowserClipboardMode::Copy => format!(
+                "Copied {} session(s) from {}. Select target folder and press Ctrl+V",
+                targets.len(),
+                source_label
+            ),
+            BrowserClipboardMode::Cut => format!(
+                "Cut {} session(s) from {}. Select target folder and press Ctrl+V",
+                targets.len(),
+                source_label
+            ),
+        };
+    }
+
+    fn paste_browser_clipboard(&mut self) -> Result<()> {
+        let Some(clipboard) = self.browser_clipboard.clone() else {
+            self.status = String::from("Clipboard empty");
+            return Ok(());
+        };
+        let Some(target_project) = self.current_project() else {
+            self.status = String::from("No target folder selected");
+            return Ok(());
+        };
+        let target_cwd = target_project.cwd.clone();
+        let mut ok = 0usize;
+        let mut skipped = 0usize;
+        let mut failures = Vec::new();
+
+        for session in &clipboard.targets {
+            let result = match clipboard.mode {
+                BrowserClipboardMode::Copy => {
+                    duplicate_session_file(&self.sessions_root, session, &target_cwd, false)
+                        .map(|_| ())
+                }
+                BrowserClipboardMode::Cut => {
+                    if session.cwd == target_cwd {
+                        skipped += 1;
+                        Ok(())
+                    } else {
+                        rewrite_session_file(&session.path, &target_cwd, false)
+                    }
+                }
+            };
+            match result {
+                Ok(()) => ok += 1,
+                Err(err) => failures.push(format!("{}: {}", session.file_name, err)),
+            }
+        }
+
+        if ok > 0 || skipped > 0 {
+            self.reload()?;
+        }
+        self.selected_sessions.clear();
+        self.session_select_anchor = None;
+
+        if clipboard.mode == BrowserClipboardMode::Cut && failures.is_empty() {
+            self.browser_clipboard = None;
+        }
+
+        let verb = match clipboard.mode {
+            BrowserClipboardMode::Copy => "Pasted",
+            BrowserClipboardMode::Cut => "Moved",
+        };
+        self.status = if failures.is_empty() {
+            if skipped > 0 {
+                format!(
+                    "{verb} {ok} session(s) from {} into {} (skipped {skipped})",
+                    clipboard.source_label,
+                    browser_display_path(&target_cwd)
+                )
+            } else {
+                format!(
+                    "{verb} {ok} session(s) from {} into {}",
+                    clipboard.source_label,
+                    browser_display_path(&target_cwd)
+                )
+            }
+        } else {
+            let first = failures
+                .first()
+                .cloned()
+                .unwrap_or_else(|| String::from("unknown error"));
+            format!(
+                "{verb} {ok} session(s), {} failed, skipped {skipped}. First error: {first}",
+                failures.len()
+            )
+        };
+        Ok(())
+    }
+
+    fn register_browser_click(&mut self, row: BrowserRow, now: Instant) -> bool {
+        const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(450);
+        let is_double = self
+            .last_browser_click
+            .is_some_and(|(last_row, last_at)| last_row == row && now.duration_since(last_at) <= DOUBLE_CLICK_WINDOW);
+        self.last_browser_click = Some((row, now));
+        is_double
+    }
+
     fn start_action(&mut self, action: Action) {
         let targets = self.action_targets(action);
         if targets.is_empty() {
@@ -2671,6 +2840,14 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" collapse others  "),
             Span::styled("ctrl+→", Style::default().fg(Color::Cyan)),
             Span::raw(" expand all  "),
+            Span::styled("ctrl+c", Style::default().fg(Color::Green)),
+            Span::raw(" copy folder  "),
+            Span::styled("ctrl+x", Style::default().fg(Color::Yellow)),
+            Span::raw(" cut folder  "),
+            Span::styled("ctrl+v", Style::default().fg(Color::Green)),
+            Span::raw(" paste into folder  "),
+            Span::styled("dblclick", Style::default().fg(Color::Cyan)),
+            Span::raw(" toggle folder  "),
             Span::styled("m or r", Style::default().fg(Color::Green)),
             Span::raw(" rename folder sessions  "),
             Span::styled("c or y", Style::default().fg(Color::Green)),
@@ -2701,6 +2878,12 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" select-all  "),
             Span::styled("i", Style::default().fg(Color::Yellow)),
             Span::raw(" invert  "),
+            Span::styled("ctrl+c/x/v", Style::default().fg(Color::Green)),
+            Span::raw(" copy/cut/paste  "),
+            Span::styled("del", Style::default().fg(Color::Red)),
+            Span::raw(" delete  "),
+            Span::styled("dblclick", Style::default().fg(Color::Cyan)),
+            Span::raw(" open  "),
             Span::styled("m/c/f/d", Style::default().fg(Color::Green)),
             Span::raw(" move/copy/fork/delete selection  "),
             Span::styled("/", Style::default().fg(Color::Cyan)),
@@ -4192,6 +4375,8 @@ mod tests {
             preview_session_path: None,
             last_browser_nav_at: None,
             pending_preview_search_jump: None,
+            browser_clipboard: None,
+            last_browser_click: None,
         }
     }
 
@@ -4476,6 +4661,139 @@ mod tests {
             assert_eq!(app.mode, Mode::Input);
             assert_eq!(app.pending_action, Some(expected));
         }
+    }
+
+    #[test]
+    fn ctrl_c_copies_browser_selection_into_clipboard() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/repo"),
+            sessions: vec![
+                sample_session("/tmp/a.jsonl", "/repo", "a"),
+                sample_session("/tmp/b.jsonl", "/repo", "b"),
+            ],
+        }];
+        app.browser_cursor = BrowserCursor::Session;
+        app.focus = Focus::Projects;
+        app.session_idx = 1;
+
+        handle_normal_mode(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut app)
+            .expect("handle");
+
+        let clipboard = app.browser_clipboard.expect("clipboard");
+        assert_eq!(clipboard.mode, BrowserClipboardMode::Copy);
+        assert_eq!(clipboard.targets.len(), 1);
+        assert_eq!(clipboard.targets[0].id, "b");
+    }
+
+    #[test]
+    fn ctrl_v_pastes_copied_session_into_current_folder() {
+        let dir = std::env::temp_dir().join(format!("cse-paste-{}", Uuid::new_v4()));
+        let sessions_root = dir.join("sessions");
+        let source_path = sessions_root.join("2026/03/09/source.jsonl");
+        write_test_session(&source_path, &sample_chat_jsonl());
+
+        let mut app = empty_test_app();
+        app.sessions_root = sessions_root.clone();
+        let source = SessionSummary {
+            path: source_path.clone(),
+            file_name: String::from("source.jsonl"),
+            id: String::from("abc"),
+            cwd: String::from("/old"),
+            started_at: String::from("2026-01-01T00:00:00Z"),
+            modified_epoch: 123,
+            event_count: 4,
+            search_blob: String::new(),
+        };
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/new"),
+            sessions: vec![],
+        }];
+        app.browser_cursor = BrowserCursor::Project;
+        app.focus = Focus::Projects;
+        app.browser_clipboard = Some(BrowserClipboard {
+            mode: BrowserClipboardMode::Copy,
+            targets: vec![source],
+            source_label: String::from("/old"),
+        });
+
+        handle_normal_mode(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL), &mut app)
+            .expect("handle");
+
+        let created = fs::read_dir(sessions_root.join("2026/03/09"))
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+            .collect::<Vec<_>>();
+        assert_eq!(created.len(), 2);
+
+        let pasted = created
+            .into_iter()
+            .find(|path| path != &source_path)
+            .expect("pasted file");
+        let content = fs::read_to_string(pasted).expect("read pasted");
+        assert!(content.contains("\"cwd\":\"/new\""));
+    }
+
+    #[test]
+    fn register_browser_click_detects_double_click_on_same_row() {
+        let mut app = empty_test_app();
+        let row = BrowserRow {
+            project_idx: 0,
+            session_idx: None,
+        };
+        let now = Instant::now();
+
+        assert!(!app.register_browser_click(row, now));
+        assert!(app.register_browser_click(
+            row,
+            now.checked_add(Duration::from_millis(200)).unwrap_or(now)
+        ));
+        assert!(!app.register_browser_click(
+            BrowserRow {
+                project_idx: 0,
+                session_idx: Some(0),
+            },
+            now.checked_add(Duration::from_millis(250)).unwrap_or(now)
+        ));
+    }
+
+    #[test]
+    fn double_click_project_row_toggles_folder() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/repo"),
+            sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
+        }];
+        app.panes.browser = ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 8,
+        };
+
+        handle_mouse_event(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut app,
+        );
+        assert!(!app.collapsed_projects.contains("/repo"));
+
+        handle_mouse_event(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut app,
+        );
+        assert!(app.collapsed_projects.contains("/repo"));
     }
 
     #[test]
@@ -4974,6 +5292,8 @@ mod tests {
             preview_session_path: None,
             last_browser_nav_at: None,
             pending_preview_search_jump: None,
+            browser_clipboard: None,
+            last_browser_click: None,
         };
         let text = app
             .preview_selected_text((0, 1), (1, 2))
@@ -5483,6 +5803,8 @@ mod tests {
             preview_session_path: None,
             last_browser_nav_at: None,
             pending_preview_search_jump: None,
+            browser_clipboard: None,
+            last_browser_click: None,
         };
 
         app.apply_search_filter();
@@ -5794,6 +6116,8 @@ mod tests {
             preview_session_path: Some(PathBuf::from("/tmp/x.jsonl")),
             last_browser_nav_at: None,
             pending_preview_search_jump: None,
+            browser_clipboard: None,
+            last_browser_click: None,
         };
 
         app.toggle_fold_all_preview_turns();
