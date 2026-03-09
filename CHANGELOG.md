@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.6 - 2026-03-09
+
+### Changed
+- Collapsed all folders by default on startup so the browser opens in a clean tree state.
+- Prevented Preview from showing a session when the browser is resting on a folder row.
+- Moved total `user` and `assistant` message counts into the Preview title metadata.
+
 ## 1.0.5 - 2026-03-08
 
 ### Changed
