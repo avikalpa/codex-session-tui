@@ -1,6 +1,6 @@
 {
   "name": "codex-session-tui",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "Prebuilt codex-session-tui binaries for macOS, Linux, and Windows.",
   "license": "MIT",
   "bin": {
