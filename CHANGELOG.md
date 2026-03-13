@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.9 - 2026-03-13
+
+### Fixed
+- Fixed the release-assets job so `gh release upload` runs with an explicit repository context in non-checkout jobs.
+- Revalidated the GitHub release publish path after the Node 24-era workflow migration.
+
 ## 1.0.8 - 2026-03-13
 
 ### Changed
