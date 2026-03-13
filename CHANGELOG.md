@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.8 - 2026-03-13
+
+### Changed
+- Updated the GitHub Actions workflow to current Node 24-era action majors.
+- Replaced the JavaScript-based release asset upload action with `gh release upload`.
+- Validated the release path against the updated workflow stack.
+
 ## 1.0.7 - 2026-03-13
 
 ### Added
