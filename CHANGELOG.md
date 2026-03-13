@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.7 - 2026-03-13
+
+### Added
+- Added SSH export for sessions with the `e` action, allowing selected sessions to be uploaded to `user@host:/remote/dir`.
+- Documented the SSH export workflow and requirements in the README.
+
+### Fixed
+- Corrected browser tree labels so descendant projects keep the missing intermediate path segments instead of collapsing to only the last folder name.
+- Corrected browser tree indentation so nesting reflects actual project ancestors shown in the tree rather than raw filesystem depth.
+- Updated the date-sensitive paste regression test to derive its expected date path from the current clock.
+
 ## 1.0.6 - 2026-03-09
 
 ### Changed
