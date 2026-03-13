@@ -110,12 +110,20 @@ On a session, you can:
 - `m`: move session to another folder context
 - `c`: copy session to another folder context
 - `f`: fork session into another folder context
+- `e`: export session over SSH to `user@host:/remote/dir`
 - `d`: delete session
 - `Space`: multi-select sessions
 - `a`: select all sessions in the current project
 - `i`: invert selection
 
 Project-level operations are also available for folder-wide rename/copy workflows.
+
+SSH export behavior:
+
+- enter a remote target in the form `user@host:/remote/dir`
+- selected sessions are uploaded there with their existing `.jsonl` filenames
+- the tool creates the remote directory if needed
+- export refuses to overwrite an existing remote file with the same name
 
 These operations exist for the main recovery use case: sessions whose original project path no longer matches where your repository lives now.
 
@@ -155,6 +163,12 @@ Restore a backup:
 ```bash
 cp "/path/to/session.jsonl.bak.20260224101530" "/path/to/session.jsonl"
 ```
+
+## SSH Export Requirements
+
+- `ssh` must be installed and available on your `PATH`
+- the remote host must accept your normal SSH authentication
+- the target path prompt expects a remote directory, not a local path
 
 ## Platform Support
 

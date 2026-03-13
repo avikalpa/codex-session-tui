@@ -4,6 +4,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -267,6 +268,7 @@ enum StatusButton {
     Move,
     Copy,
     Fork,
+    Export,
     Delete,
     ProjectRename,
     ProjectCopy,
@@ -293,6 +295,7 @@ fn status_buttons(app: &App) -> Vec<StatusButton> {
             StatusButton::Move,
             StatusButton::Copy,
             StatusButton::Fork,
+            StatusButton::Export,
             StatusButton::Delete,
             StatusButton::Refresh,
             StatusButton::Quit,
@@ -302,6 +305,7 @@ fn status_buttons(app: &App) -> Vec<StatusButton> {
         StatusButton::Move,
         StatusButton::Copy,
         StatusButton::Fork,
+        StatusButton::Export,
         StatusButton::Delete,
         StatusButton::Refresh,
         StatusButton::Quit,
@@ -317,6 +321,7 @@ fn status_button_label(button: StatusButton) -> &'static str {
         StatusButton::Move => "[Move]",
         StatusButton::Copy => "[Copy]",
         StatusButton::Fork => "[Fork]",
+        StatusButton::Export => "[Export]",
         StatusButton::Delete => "[Delete]",
         StatusButton::ProjectRename => "[Rename Folder]",
         StatusButton::ProjectCopy => "[Copy Folder]",
@@ -336,6 +341,7 @@ fn trigger_status_button(button: StatusButton, app: &mut App) {
         StatusButton::Move => app.start_action(Action::Move),
         StatusButton::Copy => app.start_action(Action::Copy),
         StatusButton::Fork => app.start_action(Action::Fork),
+        StatusButton::Export => app.start_action(Action::Export),
         StatusButton::Delete => app.start_action(Action::Delete),
         StatusButton::ProjectRename => app.start_action(Action::ProjectRename),
         StatusButton::ProjectCopy => app.start_action(Action::ProjectCopy),
@@ -653,6 +659,11 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
                 app.start_action(Action::Fork);
             }
         }
+        KeyCode::Char('e') => {
+            if app.current_session().is_some() {
+                app.start_action(Action::Export);
+            }
+        }
         KeyCode::Char('d') | KeyCode::Delete => {
             if app.current_session().is_some() {
                 app.start_action(Action::Delete);
@@ -801,6 +812,7 @@ enum Action {
     Move,
     Copy,
     Fork,
+    Export,
     Delete,
     ProjectRename,
     ProjectCopy,
@@ -1894,7 +1906,7 @@ impl App {
                 .current_project()
                 .map(|p| p.sessions.clone())
                 .unwrap_or_default(),
-            Action::Move | Action::Copy | Action::Fork | Action::Delete => {
+            Action::Move | Action::Copy | Action::Fork | Action::Export | Action::Delete => {
                 let selected = self.selected_sessions_in_current_project();
                 if !selected.is_empty() {
                     selected
@@ -2033,9 +2045,9 @@ impl App {
 
     fn register_browser_click(&mut self, row: BrowserRow, now: Instant) -> bool {
         const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(450);
-        let is_double = self
-            .last_browser_click
-            .is_some_and(|(last_row, last_at)| last_row == row && now.duration_since(last_at) <= DOUBLE_CLICK_WINDOW);
+        let is_double = self.last_browser_click.is_some_and(|(last_row, last_at)| {
+            last_row == row && now.duration_since(last_at) <= DOUBLE_CLICK_WINDOW
+        });
         self.last_browser_click = Some((row, now));
         is_double
     }
@@ -2067,6 +2079,10 @@ impl App {
             ),
             Action::Fork => format!(
                 "Fork {} session(s): enter target project path and press Enter",
+                targets.len()
+            ),
+            Action::Export => format!(
+                "Export {} session(s): enter user@host:/remote/dir and press Enter",
                 targets.len()
             ),
             Action::Delete => format!(
@@ -2140,6 +2156,7 @@ impl App {
                     duplicate_session_file(&self.sessions_root, session, &target_str, true)
                         .map(|_| ())
                 }
+                Action::Export => export_session_via_ssh(session, &target_str),
                 Action::Delete => delete_session_file(&session.path),
             };
             match result {
@@ -2154,7 +2171,7 @@ impl App {
         self.input_focused = false;
         self.clear_input_completion_cycle();
 
-        if ok > 0 || skipped > 0 {
+        if action != Action::Export && (ok > 0 || skipped > 0) {
             self.reload()?;
         }
         self.selected_sessions.clear();
@@ -2164,6 +2181,7 @@ impl App {
             Action::Move => "moved",
             Action::Copy => "copied",
             Action::Fork => "forked",
+            Action::Export => "exported",
             Action::Delete => "deleted",
             Action::ProjectRename => "renamed",
             Action::ProjectCopy => "copied",
@@ -2429,7 +2447,11 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
                 .preview_cache
                 .get(&s.path)
                 .map(|cached| {
-                    let user = cached.turns.iter().filter(|turn| turn.role == "user").count();
+                    let user = cached
+                        .turns
+                        .iter()
+                        .filter(|turn| turn.role == "user")
+                        .count();
                     let assistant = cached
                         .turns
                         .iter()
@@ -2785,6 +2807,7 @@ fn status_button_style(button: StatusButton) -> Style {
         | StatusButton::Move
         | StatusButton::Copy
         | StatusButton::Fork
+        | StatusButton::Export
         | StatusButton::ProjectRename
         | StatusButton::ProjectCopy => Style::default().fg(Color::Green),
         StatusButton::Delete => Style::default().fg(Color::Red),
@@ -2911,6 +2934,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" open  "),
             Span::styled("m/c/f/d", Style::default().fg(Color::Green)),
             Span::raw(" move/copy/fork/delete selection  "),
+            Span::styled("e", Style::default().fg(Color::Green)),
+            Span::raw(" export ssh  "),
             Span::styled("/", Style::default().fg(Color::Cyan)),
             Span::raw(" search"),
         ])
@@ -2932,6 +2957,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" splitter  preview-select "),
             Span::styled("m/c/f/d", Style::default().fg(Color::Green)),
             Span::raw(" move/copy/fork/delete  "),
+            Span::styled("e", Style::default().fg(Color::Green)),
+            Span::raw(" export ssh  "),
             Span::styled("g", Style::default().fg(Color::Yellow)),
             Span::raw(" refresh  "),
             Span::styled("q", Style::default().fg(Color::Red)),
@@ -2996,6 +3023,7 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Some(Action::Move) => "MOVE",
             Some(Action::Copy) => "COPY",
             Some(Action::Fork) => "FORK",
+            Some(Action::Export) => "EXPORT",
             Some(Action::Delete) => "DELETE",
             Some(Action::ProjectRename) => "RENAME FOLDER",
             Some(Action::ProjectCopy) => "COPY FOLDER",
@@ -3606,12 +3634,13 @@ fn project_label(projects: &[ProjectBucket], idx: usize) -> String {
     let cwd = display.as_str();
     let common = shared_path_prefix(projects);
     let parts = path_components(cwd);
-    let common_len = common.len().min(parts.len());
-    let rel = &parts[common_len..];
+    let base_len = nearest_project_ancestor_len(projects, idx, &parts).unwrap_or(common.len());
+    let rel = &parts[base_len.min(parts.len())..];
     if rel.is_empty() {
-        return cwd.to_string();
+        cwd.to_string()
+    } else {
+        rel.join("/")
     }
-    rel.last().cloned().unwrap_or_else(|| cwd.to_string())
 }
 
 fn project_indent(projects: &[ProjectBucket], idx: usize) -> String {
@@ -3623,9 +3652,43 @@ fn project_indent(projects: &[ProjectBucket], idx: usize) -> String {
     let cwd = display.as_str();
     let common = shared_path_prefix(projects);
     let parts = path_components(cwd);
-    let common_len = common.len().min(parts.len());
-    let rel_depth = parts[common_len..].len().saturating_sub(1).min(6);
+    let rel_depth = project_ancestor_depth(projects, idx, &parts, common.len()).min(6);
     "  ".repeat(rel_depth)
+}
+
+fn nearest_project_ancestor_len(
+    projects: &[ProjectBucket],
+    idx: usize,
+    parts: &[String],
+) -> Option<usize> {
+    for candidate_len in (1..parts.len()).rev() {
+        if project_exists_with_parts(projects, idx, &parts[..candidate_len]) {
+            return Some(candidate_len);
+        }
+    }
+    None
+}
+
+fn project_ancestor_depth(
+    projects: &[ProjectBucket],
+    idx: usize,
+    parts: &[String],
+    shared_len: usize,
+) -> usize {
+    ((shared_len + 1)..parts.len())
+        .filter(|candidate_len| project_exists_with_parts(projects, idx, &parts[..*candidate_len]))
+        .count()
+}
+
+fn project_exists_with_parts(
+    projects: &[ProjectBucket],
+    skip_idx: usize,
+    wanted_parts: &[String],
+) -> bool {
+    projects.iter().enumerate().any(|(candidate_idx, project)| {
+        candidate_idx != skip_idx
+            && path_components(&browser_display_path(&project.cwd)) == wanted_parts
+    })
 }
 
 fn shared_path_prefix(projects: &[ProjectBucket]) -> Vec<String> {
@@ -4212,6 +4275,104 @@ fn rewrite_session_start_timestamp(value: &mut Value) {
     payload_obj.insert("timestamp".to_string(), Value::String(now));
 }
 
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct RemoteExportTarget {
+    ssh_target: String,
+    remote_dir: String,
+}
+
+fn parse_remote_export_target(input: &str) -> Result<RemoteExportTarget> {
+    let trimmed = input.trim();
+    let Some(colon_idx) = trimmed.rfind(':') else {
+        return Err(anyhow!(
+            "remote target must look like user@host:/remote/dir"
+        ));
+    };
+    let ssh_target = trimmed[..colon_idx].trim();
+    let remote_dir = trimmed[colon_idx + 1..].trim();
+    if ssh_target.is_empty() || remote_dir.is_empty() {
+        return Err(anyhow!(
+            "remote target must look like user@host:/remote/dir"
+        ));
+    }
+    Ok(RemoteExportTarget {
+        ssh_target: ssh_target.to_string(),
+        remote_dir: remote_dir.to_string(),
+    })
+}
+
+fn sh_single_quote(input: &str) -> String {
+    format!("'{}'", input.replace('\'', "'\"'\"'"))
+}
+
+fn remote_join_path(dir: &str, file_name: &str) -> String {
+    if dir.ends_with('/') {
+        format!("{dir}{file_name}")
+    } else {
+        format!("{dir}/{file_name}")
+    }
+}
+
+fn run_ssh_status(ssh_target: &str, script: &str) -> Result<()> {
+    let status = Command::new("ssh")
+        .arg(ssh_target)
+        .arg(script)
+        .status()
+        .with_context(|| format!("failed to start ssh for {ssh_target}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "ssh command failed for {ssh_target} with status {status}"
+        ))
+    }
+}
+
+fn export_session_via_ssh(session: &SessionSummary, target: &str) -> Result<()> {
+    let remote = parse_remote_export_target(target)?;
+    let remote_dir_q = sh_single_quote(&remote.remote_dir);
+    run_ssh_status(&remote.ssh_target, &format!("mkdir -p -- {remote_dir_q}"))?;
+
+    let remote_file = remote_join_path(&remote.remote_dir, &session.file_name);
+    let remote_file_q = sh_single_quote(&remote_file);
+    run_ssh_status(&remote.ssh_target, &format!("test ! -e {remote_file_q}")).with_context(
+        || {
+            format!(
+                "remote file already exists: {}:{}",
+                remote.ssh_target, remote_file
+            )
+        },
+    )?;
+
+    let bytes = fs::read(&session.path)
+        .with_context(|| format!("failed to read {}", session.path.display()))?;
+    let mut child = Command::new("ssh")
+        .arg(&remote.ssh_target)
+        .arg(format!("cat > {remote_file_q}"))
+        .stdin(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start ssh upload for {}", remote.ssh_target))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(&bytes)
+            .with_context(|| format!("failed to stream {}", session.path.display()))?;
+    } else {
+        return Err(anyhow!("ssh stdin unavailable for upload"));
+    }
+    let status = child
+        .wait()
+        .with_context(|| format!("failed waiting for ssh upload to {}", remote.ssh_target))?;
+    if !status.success() {
+        return Err(anyhow!(
+            "ssh upload failed for {}:{} with status {}",
+            remote.ssh_target,
+            remote_file,
+            status
+        ));
+    }
+    Ok(())
+}
+
 fn delete_confirmation_valid(input: &str) -> bool {
     input == "DELETE"
 }
@@ -4469,6 +4630,50 @@ mod tests {
     }
 
     #[test]
+    fn project_tree_label_keeps_missing_parent_segments() {
+        let projects = vec![
+            ProjectBucket {
+                cwd: String::from("/work/src/foo"),
+                sessions: Vec::new(),
+            },
+            ProjectBucket {
+                cwd: String::from("/work/src/bar/baz"),
+                sessions: Vec::new(),
+            },
+        ];
+
+        assert_eq!(project_label(&projects, 0), "foo");
+        assert_eq!(project_label(&projects, 1), "bar/baz");
+    }
+
+    #[test]
+    fn project_tree_indent_only_uses_existing_project_ancestors() {
+        let projects = vec![
+            ProjectBucket {
+                cwd: String::from("/work/src/foo"),
+                sessions: Vec::new(),
+            },
+            ProjectBucket {
+                cwd: String::from("/work/src/bar"),
+                sessions: Vec::new(),
+            },
+            ProjectBucket {
+                cwd: String::from("/work/src/bar/baz"),
+                sessions: Vec::new(),
+            },
+            ProjectBucket {
+                cwd: String::from("/work/src/bar/baz/qux"),
+                sessions: Vec::new(),
+            },
+        ];
+
+        assert_eq!(project_indent(&projects, 0), "");
+        assert_eq!(project_indent(&projects, 1), "");
+        assert_eq!(project_indent(&projects, 2), "  ");
+        assert_eq!(project_indent(&projects, 3), "    ");
+    }
+
+    #[test]
     fn wrap_text_lines_reflows_for_smaller_width() {
         let text = "this is a long sentence for wrapping";
         let wide = wrap_text_lines(text, 40);
@@ -4662,6 +4867,7 @@ mod tests {
             (KeyCode::Char('m'), Action::Move),
             (KeyCode::Char('c'), Action::Copy),
             (KeyCode::Char('f'), Action::Fork),
+            (KeyCode::Char('e'), Action::Export),
         ];
 
         for (code, expected) in actions {
@@ -4682,6 +4888,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_remote_export_target_requires_ssh_destination_format() {
+        let parsed =
+            parse_remote_export_target("avikalpa@example.com:/var/tmp/codex").expect("parse");
+        assert_eq!(
+            parsed,
+            RemoteExportTarget {
+                ssh_target: String::from("avikalpa@example.com"),
+                remote_dir: String::from("/var/tmp/codex"),
+            }
+        );
+        assert!(parse_remote_export_target("/var/tmp/codex").is_err());
+        assert!(parse_remote_export_target("example.com:").is_err());
+    }
+
+    #[test]
+    fn remote_join_path_preserves_single_separator() {
+        assert_eq!(
+            remote_join_path("/var/tmp/codex", "a.jsonl"),
+            "/var/tmp/codex/a.jsonl"
+        );
+        assert_eq!(
+            remote_join_path("/var/tmp/codex/", "a.jsonl"),
+            "/var/tmp/codex/a.jsonl"
+        );
+    }
+
+    #[test]
     fn ctrl_c_copies_browser_selection_into_clipboard() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
@@ -4695,8 +4928,11 @@ mod tests {
         app.focus = Focus::Projects;
         app.session_idx = 1;
 
-        handle_normal_mode(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut app)
-            .expect("handle");
+        handle_normal_mode(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .expect("handle");
 
         let clipboard = app.browser_clipboard.expect("clipboard");
         assert_eq!(clipboard.mode, BrowserClipboardMode::Copy);
@@ -4708,7 +4944,12 @@ mod tests {
     fn ctrl_v_pastes_copied_session_into_current_folder() {
         let dir = std::env::temp_dir().join(format!("cse-paste-{}", Uuid::new_v4()));
         let sessions_root = dir.join("sessions");
-        let source_path = sessions_root.join("2026/03/09/source.jsonl");
+        let now = Utc::now();
+        let dated_dir = sessions_root
+            .join(now.format("%Y").to_string())
+            .join(now.format("%m").to_string())
+            .join(now.format("%d").to_string());
+        let source_path = dated_dir.join("source.jsonl");
         write_test_session(&source_path, &sample_chat_jsonl());
 
         let mut app = empty_test_app();
@@ -4735,10 +4976,13 @@ mod tests {
             source_label: String::from("/old"),
         });
 
-        handle_normal_mode(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL), &mut app)
-            .expect("handle");
+        handle_normal_mode(
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .expect("handle");
 
-        let created = fs::read_dir(sessions_root.join("2026/03/09"))
+        let created = fs::read_dir(dated_dir)
             .expect("read dir")
             .filter_map(Result::ok)
             .map(|entry| entry.path())
@@ -5934,6 +6178,34 @@ mod tests {
         assert!(buffer_contains(backend, "expand all"));
         assert!(buffer_contains(backend, "ctrl+↑/↓"));
         assert!(buffer_contains(backend, "project jump"));
+    }
+
+    #[test]
+    fn render_status_shows_export_shortcut_for_session_rows() {
+        let mut app = empty_test_app();
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Session;
+
+        let backend = TestBackend::new(140, 4);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_status(
+                    frame,
+                    ratatui::layout::Rect {
+                        x: 0,
+                        y: 0,
+                        width: 140,
+                        height: 4,
+                    },
+                    &app,
+                );
+            })
+            .expect("draw");
+
+        let backend = terminal.backend();
+        assert!(buffer_contains(backend, "export ssh"));
+        assert!(buffer_contains(backend, "e"));
     }
 
     #[test]
