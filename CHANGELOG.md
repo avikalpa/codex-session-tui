@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.3 - 2026-03-14
+
+### Changed
+- Republished the current clean history and README after removing a private hostname from recent `v1.3.x` git/npm history.
+- Public examples now use `root@example-host` instead of the removed hostname.
+
 ## 1.3.1 - 2026-03-14
 
 ### Fixed
