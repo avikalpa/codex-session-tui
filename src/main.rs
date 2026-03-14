@@ -39,9 +39,13 @@ fn main() -> Result<()> {
 
     let run_result = run_app(&mut tui, &mut app);
     let restore_result = tui.restore();
+    let launch = app.launch_codex_after_exit.clone();
 
     run_result?;
     restore_result?;
+    if let Some(spec) = launch {
+        launch_codex_resume(&spec)?;
+    }
     Ok(())
 }
 
@@ -108,37 +112,53 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
                 app.focus = Focus::Projects;
                 let rows = app.browser_rows();
                 let idx = app.project_scroll + mouse_row_to_index(mouse.row, app.panes.browser);
-                if let Some(row) = rows.get(idx).copied() {
-                    let is_double_click = app.register_browser_click(row, Instant::now());
-                    if row.session_idx.is_none()
-                        && is_project_toggle_hit(
-                            mouse.column,
-                            app.panes.browser,
-                            row.project_idx,
-                            app,
-                        )
-                    {
-                        app.project_idx = row.project_idx;
-                        app.browser_cursor = BrowserCursor::Project;
-                        app.toggle_current_project_collapsed_manual();
-                    } else {
-                        app.set_browser_row(row);
-                        if row.session_idx.is_none() && is_double_click {
-                            app.toggle_current_project_collapsed_manual();
-                        } else if let Some(session_idx) = row.session_idx {
-                            let checkbox_hit = is_sessions_checkbox_hit(
-                                mouse.column,
-                                mouse.row,
-                                app.panes.browser,
-                            );
-                            if checkbox_hit {
-                                app.toggle_current_session_selection();
-                            } else if is_double_click {
-                                app.focus = Focus::Preview;
-                            } else {
-                                app.session_select_anchor = Some(session_idx);
+                if let Some(row) = rows.get(idx).cloned() {
+                    let is_double_click = app.register_browser_click(row.clone(), Instant::now());
+                    if is_browser_toggle_hit(mouse.column, app.panes.browser, &row) {
+                        match row.kind {
+                            BrowserRowKind::Group { path } => {
+                                app.browser_cursor = BrowserCursor::Group;
+                                app.selected_group_path = Some(path);
+                                app.ensure_selection_visible();
+                                app.toggle_selected_group_collapsed_manual();
                             }
-                            app.preview_scroll = 0;
+                            BrowserRowKind::Project { project_idx } => {
+                                app.project_idx = project_idx;
+                                app.browser_cursor = BrowserCursor::Project;
+                                app.selected_group_path = None;
+                                app.ensure_selection_visible();
+                                app.toggle_current_project_collapsed_manual();
+                            }
+                            BrowserRowKind::Session { .. } => {}
+                        }
+                    } else {
+                        app.set_browser_row(row.clone());
+                        match row.kind {
+                            BrowserRowKind::Group { .. } => {
+                                if is_double_click {
+                                    app.toggle_selected_group_collapsed_manual();
+                                }
+                            }
+                            BrowserRowKind::Project { .. } => {
+                                if is_double_click {
+                                    app.toggle_current_project_collapsed_manual();
+                                }
+                            }
+                            BrowserRowKind::Session { session_idx, .. } => {
+                                let checkbox_hit = is_sessions_checkbox_hit(
+                                    mouse.column,
+                                    mouse.row,
+                                    app.panes.browser,
+                                );
+                                if checkbox_hit {
+                                    app.toggle_current_session_selection();
+                                } else if is_double_click {
+                                    app.focus = Focus::Preview;
+                                } else {
+                                    app.session_select_anchor = Some(session_idx);
+                                }
+                                app.preview_scroll = 0;
+                            }
                         }
                     }
                 }
@@ -460,14 +480,9 @@ fn is_sessions_checkbox_hit(x: u16, _y: u16, pane: ratatui::layout::Rect) -> boo
     col <= 7
 }
 
-fn is_project_toggle_hit(
-    x: u16,
-    pane: ratatui::layout::Rect,
-    project_idx: usize,
-    app: &App,
-) -> bool {
+fn is_browser_toggle_hit(x: u16, pane: ratatui::layout::Rect, row: &BrowserRow) -> bool {
     let col = mouse_col_to_index(x, pane);
-    let indent = project_indent(&app.projects, project_idx).chars().count();
+    let indent = row.depth * 2;
     col >= indent && col <= indent + 3
 }
 
@@ -477,6 +492,23 @@ fn copy_to_clipboard_osc52(text: &str) -> Result<()> {
     write!(out, "\x1b]52;c;{b64}\x1b\\").context("failed OSC52 write")?;
     out.flush().context("failed stdout flush")?;
     Ok(())
+}
+
+fn launch_codex_resume(spec: &CodexLaunchSpec) -> Result<()> {
+    let status = Command::new("codex")
+        .arg("resume")
+        .arg(&spec.session_id)
+        .current_dir(&spec.cwd)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("failed to launch codex resume")?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("codex resume exited with status {status}"))
+    }
 }
 
 fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
@@ -612,13 +644,33 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
                 app.move_down();
             }
         }
+        KeyCode::PageUp => {
+            if app.focus == Focus::Preview {
+                app.page_preview(-1);
+            }
+        }
+        KeyCode::PageDown => {
+            if app.focus == Focus::Preview {
+                app.page_preview(1);
+            }
+        }
+        KeyCode::Home => {
+            if app.focus == Focus::Preview {
+                app.jump_preview_to_edge(true);
+            }
+        }
+        KeyCode::End => {
+            if app.focus == Focus::Preview {
+                app.jump_preview_to_edge(false);
+            }
+        }
         KeyCode::Left => {
             if app.focus == Focus::Preview {
                 app.fold_focused_preview_turn();
             } else if app.focus == Focus::Projects {
                 match app.browser_cursor {
                     BrowserCursor::Session => app.browser_cursor = BrowserCursor::Project,
-                    BrowserCursor::Project => app.collapse_current_project(),
+                    BrowserCursor::Project | BrowserCursor::Group => app.collapse_current_project(),
                 }
             }
         }
@@ -627,6 +679,7 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
                 app.unfold_focused_preview_turn();
             } else if app.focus == Focus::Projects {
                 match app.browser_cursor {
+                    BrowserCursor::Group => app.expand_current_project(),
                     BrowserCursor::Project => {
                         if app.current_project_collapsed() {
                             app.expand_current_project();
@@ -667,6 +720,22 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
         KeyCode::Char('e') => {
             if app.current_session().is_some() {
                 app.start_action(Action::Export);
+            }
+        }
+        KeyCode::Char('n') => {
+            if app.focus == Focus::Preview {
+                app.focus_next_preview_search_match();
+            }
+        }
+        KeyCode::Char('N') => {
+            if app.focus == Focus::Preview {
+                app.focus_prev_preview_search_match();
+            }
+        }
+        KeyCode::Char('o') => {
+            if app.current_session().is_some() {
+                app.plan_open_current_session_in_codex();
+                return Ok(true);
             }
         }
         KeyCode::Char('d') | KeyCode::Delete => {
@@ -808,8 +877,30 @@ enum Focus {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BrowserCursor {
+    Group,
     Project,
     Session,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum BrowserRowKind {
+    Group {
+        path: String,
+    },
+    Project {
+        project_idx: usize,
+    },
+    Session {
+        project_idx: usize,
+        session_idx: usize,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct BrowserRow {
+    kind: BrowserRowKind,
+    depth: usize,
+    label: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -869,6 +960,8 @@ struct SessionSummary {
     modified_epoch: i64,
     #[allow(dead_code)]
     event_count: usize,
+    user_message_count: usize,
+    assistant_message_count: usize,
     search_blob: String,
 }
 
@@ -926,13 +1019,18 @@ struct App {
     rendered_preview_cache: HashMap<PathBuf, RenderedPreviewCache>,
     preview_folded: HashMap<PathBuf, HashSet<usize>>,
     collapsed_projects: HashSet<String>,
+    collapsed_groups: HashSet<String>,
     pinned_open_projects: HashSet<String>,
+    selected_group_path: Option<String>,
     preview_header_rows: Vec<(usize, usize)>,
     preview_session_path: Option<PathBuf>,
+    preview_search_matches: Vec<PreviewMatch>,
+    preview_search_index: Option<usize>,
     last_browser_nav_at: Option<Instant>,
     pending_preview_search_jump: Option<(PathBuf, String)>,
     browser_clipboard: Option<BrowserClipboard>,
     last_browser_click: Option<(BrowserRow, Instant)>,
+    launch_codex_after_exit: Option<CodexLaunchSpec>,
 }
 
 #[derive(Clone)]
@@ -950,10 +1048,18 @@ struct RenderedPreviewCache {
     data: Arc<PreviewData>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct BrowserRow {
-    project_idx: usize,
-    session_idx: Option<usize>,
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct PreviewMatch {
+    row: usize,
+    col_start: usize,
+    col_end: usize,
+    is_primary: bool,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct CodexLaunchSpec {
+    cwd: PathBuf,
+    session_id: String,
 }
 
 impl App {
@@ -1004,13 +1110,18 @@ impl App {
             rendered_preview_cache: HashMap::new(),
             preview_folded: HashMap::new(),
             collapsed_projects: HashSet::new(),
+            collapsed_groups: HashSet::new(),
             pinned_open_projects: HashSet::new(),
+            selected_group_path: None,
             preview_header_rows: Vec::new(),
             preview_session_path: None,
+            preview_search_matches: Vec::new(),
+            preview_search_index: None,
             last_browser_nav_at: None,
             pending_preview_search_jump: None,
             browser_clipboard: None,
             last_browser_click: None,
+            launch_codex_after_exit: None,
         };
 
         app.reload()?;
@@ -1105,6 +1216,26 @@ impl App {
         }
     }
 
+    fn page_preview(&mut self, direction: isize) {
+        let viewport = self.panes.preview.height.saturating_sub(2) as usize;
+        let step = viewport.saturating_sub(1).max(1);
+        let max_scroll = self.preview_content_len.saturating_sub(viewport);
+        if direction >= 0 {
+            self.preview_scroll = (self.preview_scroll + step).min(max_scroll);
+        } else {
+            self.preview_scroll = self.preview_scroll.saturating_sub(step);
+        }
+    }
+
+    fn jump_preview_to_edge(&mut self, to_top: bool) {
+        if to_top {
+            self.preview_scroll = 0;
+            return;
+        }
+        let viewport = self.panes.preview.height.saturating_sub(2) as usize;
+        self.preview_scroll = self.preview_content_len.saturating_sub(viewport);
+    }
+
     fn move_browser_row(&mut self, delta: isize) {
         let rows = self.browser_rows();
         if rows.is_empty() {
@@ -1112,26 +1243,8 @@ impl App {
         }
         let current = self.current_browser_row_index() as isize;
         let next = (current + delta).clamp(0, rows.len().saturating_sub(1) as isize) as usize;
-        self.set_browser_row(rows[next]);
+        self.set_browser_row(rows[next].clone());
         self.session_select_anchor = None;
-    }
-
-    fn set_browser_row(&mut self, row: BrowserRow) {
-        self.project_idx = row.project_idx;
-        match row.session_idx {
-            Some(session_idx) => {
-                self.browser_cursor = BrowserCursor::Session;
-                self.session_idx = session_idx;
-                self.auto_manage_project_expansion();
-            }
-            None => {
-                self.browser_cursor = BrowserCursor::Project;
-                self.auto_manage_project_expansion();
-            }
-        }
-        self.clamp_session_idx();
-        self.note_browser_navigation();
-        self.ensure_selection_visible();
     }
 
     fn current_project_collapsed(&self) -> bool {
@@ -1158,46 +1271,79 @@ impl App {
     }
 
     fn browser_rows(&self) -> Vec<BrowserRow> {
-        let mut rows = Vec::new();
-        for (project_idx, project) in self.projects.iter().enumerate() {
-            rows.push(BrowserRow {
-                project_idx,
-                session_idx: None,
-            });
-            if !self.collapsed_projects.contains(&project.cwd) {
-                for session_idx in 0..project.sessions.len() {
-                    rows.push(BrowserRow {
-                        project_idx,
-                        session_idx: Some(session_idx),
-                    });
-                }
-            }
-        }
-        rows
+        self.browser_render_rows()
+    }
+
+    fn browser_render_rows(&self) -> Vec<BrowserRow> {
+        build_browser_rows(
+            &self.projects,
+            &self.collapsed_groups,
+            &self.collapsed_projects,
+            &self.selected_sessions,
+        )
     }
 
     fn current_browser_row_index(&self) -> usize {
-        let mut row = 0usize;
-        for (project_idx, project) in self.projects.iter().enumerate() {
-            if project_idx == self.project_idx {
-                let expanded = !self.collapsed_projects.contains(&project.cwd);
-                return row
-                    + match self.browser_cursor {
-                        BrowserCursor::Project => 0,
-                        BrowserCursor::Session if expanded => {
-                            1 + self
-                                .session_idx
-                                .min(project.sessions.len().saturating_sub(1))
-                        }
-                        BrowserCursor::Session => 0,
-                    };
+        let rows = self.browser_rows();
+        if let Some(idx) = rows
+            .iter()
+            .position(|row| match (&self.browser_cursor, &row.kind) {
+                (BrowserCursor::Group, BrowserRowKind::Group { path }) => {
+                    self.selected_group_path.as_deref() == Some(path.as_str())
+                }
+                (BrowserCursor::Project, BrowserRowKind::Project { project_idx }) => {
+                    *project_idx == self.project_idx
+                }
+                (
+                    BrowserCursor::Session,
+                    BrowserRowKind::Session {
+                        project_idx,
+                        session_idx,
+                    },
+                ) => *project_idx == self.project_idx && *session_idx == self.session_idx,
+                _ => false,
+            })
+        {
+            return idx;
+        }
+        rows.iter()
+            .position(|row| {
+                matches!(
+                    row.kind,
+                    BrowserRowKind::Project { project_idx } if project_idx == self.project_idx
+                )
+            })
+            .unwrap_or(0)
+    }
+
+    fn set_browser_row(&mut self, row: BrowserRow) {
+        match row.kind {
+            BrowserRowKind::Group { path } => {
+                self.browser_cursor = BrowserCursor::Group;
+                self.selected_group_path = Some(path.clone());
+                self.project_idx = first_project_index_for_group(&self.projects, &path)
+                    .unwrap_or(self.project_idx.min(self.projects.len().saturating_sub(1)));
             }
-            row += 1;
-            if !self.collapsed_projects.contains(&project.cwd) {
-                row += project.sessions.len();
+            BrowserRowKind::Project { project_idx } => {
+                self.project_idx = project_idx;
+                self.browser_cursor = BrowserCursor::Project;
+                self.selected_group_path = None;
+                self.auto_manage_project_expansion();
+            }
+            BrowserRowKind::Session {
+                project_idx,
+                session_idx,
+            } => {
+                self.project_idx = project_idx;
+                self.browser_cursor = BrowserCursor::Session;
+                self.session_idx = session_idx;
+                self.selected_group_path = None;
+                self.auto_manage_project_expansion();
             }
         }
-        0
+        self.clamp_session_idx();
+        self.note_browser_navigation();
+        self.ensure_selection_visible();
     }
 
     fn toggle_current_project_collapsed_manual(&mut self) {
@@ -1218,7 +1364,29 @@ impl App {
         self.ensure_selection_visible();
     }
 
+    fn toggle_selected_group_collapsed_manual(&mut self) {
+        let Some(path) = self.selected_group_path.clone() else {
+            return;
+        };
+        if self.collapsed_groups.contains(&path) {
+            self.collapsed_groups.remove(&path);
+            self.status = format!("Expanded {path}");
+        } else {
+            self.collapsed_groups.insert(path.clone());
+            self.status = format!("Collapsed {path}");
+        }
+        self.note_browser_navigation();
+        self.ensure_selection_visible();
+    }
+
     fn collapse_current_project(&mut self) {
+        if self.browser_cursor == BrowserCursor::Group {
+            if let Some(path) = self.selected_group_path.clone() {
+                self.collapsed_groups.insert(path.clone());
+                self.status = format!("Collapsed {path}");
+            }
+            return;
+        }
         if self.projects.is_empty() || self.current_project_collapsed() {
             return;
         }
@@ -1226,6 +1394,13 @@ impl App {
     }
 
     fn expand_current_project(&mut self) {
+        if self.browser_cursor == BrowserCursor::Group {
+            if let Some(path) = self.selected_group_path.clone() {
+                self.collapsed_groups.remove(&path);
+                self.status = format!("Expanded {path}");
+            }
+            return;
+        }
         if self.projects.is_empty() || !self.current_project_collapsed() {
             return;
         }
@@ -1248,6 +1423,7 @@ impl App {
         let current_cwd = self.current_project().map(|project| project.cwd.clone());
         self.collapsed_projects.clear();
         self.pinned_open_projects.clear();
+        self.collapsed_groups.clear();
         for project in &self.projects {
             if Some(project.cwd.as_str()) != current_cwd.as_deref() {
                 self.collapsed_projects.insert(project.cwd.clone());
@@ -1262,6 +1438,7 @@ impl App {
 
     fn expand_all_projects(&mut self) {
         self.collapsed_projects.clear();
+        self.collapsed_groups.clear();
         self.pinned_open_projects = self
             .projects
             .iter()
@@ -1277,8 +1454,10 @@ impl App {
             .iter()
             .map(|project| project.cwd.clone())
             .collect();
+        self.collapsed_groups = default_collapsed_group_paths(&self.projects);
         self.pinned_open_projects.clear();
         self.browser_cursor = BrowserCursor::Project;
+        self.selected_group_path = None;
         self.project_scroll = 0;
         self.session_scroll = 0;
         self.preview_scroll = 0;
@@ -1292,6 +1471,7 @@ impl App {
         let next = (current + delta).clamp(0, self.projects.len().saturating_sub(1) as isize);
         self.project_idx = next as usize;
         self.browser_cursor = BrowserCursor::Project;
+        self.selected_group_path = None;
         self.auto_manage_project_expansion();
         self.session_select_anchor = None;
         self.note_browser_navigation();
@@ -1305,6 +1485,9 @@ impl App {
         }
 
         match self.browser_cursor {
+            BrowserCursor::Group => {
+                self.toggle_selected_group_collapsed_manual();
+            }
             BrowserCursor::Project => {
                 self.toggle_current_project_collapsed_manual();
             }
@@ -1377,6 +1560,8 @@ impl App {
             self.project_idx = self.project_idx.min(self.projects.len().saturating_sub(1));
             self.clamp_session_idx();
             self.collapse_all_projects();
+            self.preview_search_matches.clear();
+            self.preview_search_index = None;
             self.pending_preview_search_jump = None;
             self.search_dirty = false;
             return;
@@ -1422,10 +1607,17 @@ impl App {
         self.project_idx = 0;
         self.session_idx = 0;
         self.browser_cursor = BrowserCursor::Project;
+        self.selected_group_path = None;
+        self.collapsed_groups = default_collapsed_group_paths(&self.projects);
         if let Some(first_project) = self.projects.first() {
             if let Some(first_session) = first_project.sessions.first() {
                 self.browser_cursor = BrowserCursor::Session;
                 self.collapsed_projects.remove(&first_project.cwd);
+                expand_group_ancestors_for_project(
+                    &self.projects,
+                    &mut self.collapsed_groups,
+                    &first_project.cwd,
+                );
                 self.pending_preview_search_jump =
                     Some((first_session.path.clone(), self.search_query.clone()));
             } else {
@@ -1788,6 +1980,47 @@ impl App {
         }
     }
 
+    fn focus_next_preview_search_match(&mut self) {
+        if self.preview_search_matches.is_empty() {
+            return;
+        }
+        let next = match self.preview_search_index {
+            Some(idx) => (idx + 1).min(self.preview_search_matches.len().saturating_sub(1)),
+            None => 0,
+        };
+        self.preview_search_index = Some(next);
+        self.scroll_preview_match_into_view(next);
+    }
+
+    fn focus_prev_preview_search_match(&mut self) {
+        if self.preview_search_matches.is_empty() {
+            return;
+        }
+        let prev = self.preview_search_index.unwrap_or(0).saturating_sub(1);
+        self.preview_search_index = Some(prev);
+        self.scroll_preview_match_into_view(prev);
+    }
+
+    fn scroll_preview_match_into_view(&mut self, match_idx: usize) {
+        let Some(found) = self.preview_search_matches.get(match_idx) else {
+            return;
+        };
+        let viewport = self.panes.preview.height.saturating_sub(2) as usize;
+        self.preview_scroll = found.row.saturating_sub(viewport / 3);
+        self.preview_focus_turn =
+            preview_turn_at_or_before_row(&self.preview_header_rows, found.row);
+    }
+
+    fn plan_open_current_session_in_codex(&mut self) -> Option<CodexLaunchSpec> {
+        let session = self.current_session()?.clone();
+        let launch = CodexLaunchSpec {
+            cwd: PathBuf::from(&session.cwd),
+            session_id: session.id.clone(),
+        };
+        self.launch_codex_after_exit = Some(launch.clone());
+        Some(launch)
+    }
+
     fn clamp_preview_pos(&self, row: usize, col: usize) -> (usize, usize) {
         if self.preview_rendered_lines.is_empty() {
             return (0, 0);
@@ -1940,6 +2173,7 @@ impl App {
 
     fn browser_copy_targets(&self) -> Vec<SessionSummary> {
         match self.browser_cursor {
+            BrowserCursor::Group => Vec::new(),
             BrowserCursor::Project => self
                 .current_project()
                 .map(|project| project.sessions.clone())
@@ -1952,6 +2186,7 @@ impl App {
         let targets = self.browser_copy_targets();
         if targets.is_empty() {
             self.status = match self.browser_cursor {
+                BrowserCursor::Group => String::from("Select a project folder or session"),
                 BrowserCursor::Project => String::from("No sessions in selected folder"),
                 BrowserCursor::Session => String::from("No session selected"),
             };
@@ -1959,6 +2194,10 @@ impl App {
         }
 
         let source_label = match self.browser_cursor {
+            BrowserCursor::Group => self
+                .selected_group_path
+                .clone()
+                .unwrap_or_else(|| String::from("<group>")),
             BrowserCursor::Project => self
                 .current_project()
                 .map(|project| browser_display_path(&project.cwd))
@@ -2066,9 +2305,12 @@ impl App {
 
     fn register_browser_click(&mut self, row: BrowserRow, now: Instant) -> bool {
         const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(450);
-        let is_double = self.last_browser_click.is_some_and(|(last_row, last_at)| {
-            last_row == row && now.duration_since(last_at) <= DOUBLE_CLICK_WINDOW
-        });
+        let is_double = self
+            .last_browser_click
+            .clone()
+            .is_some_and(|(last_row, last_at)| {
+                last_row == row && now.duration_since(last_at) <= DOUBLE_CLICK_WINDOW
+            });
         self.last_browser_click = Some((row, now));
         is_double
     }
@@ -2103,7 +2345,7 @@ impl App {
                 targets.len()
             ),
             Action::Export => format!(
-                "Export {} session(s): enter user@host:/remote/dir and press Enter",
+                "Export {} session(s): enter user@host:/remote/project/path and press Enter",
                 targets.len()
             ),
             Action::Delete => format!(
@@ -2368,38 +2610,58 @@ fn render_browser(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
     let items: Vec<ListItem> = rows
         .iter()
         .map(|row| {
-            if let Some(session_idx) = row.session_idx {
-                let session = &app.projects[row.project_idx].sessions[session_idx];
-                let selected = app.selected_sessions.contains(&session.path);
-                let mark = if selected { "◉" } else { "◌" };
-                let line = format!("  {mark} {}", format_session_browser_line(session));
-                let base = if selected {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-                ListItem::new(Line::from(prepend_style(
-                    highlight_spans(&line, &app.search_query),
-                    base,
-                )))
-            } else {
-                let project = &app.projects[row.project_idx];
-                let collapsed = app.collapsed_projects.contains(&project.cwd);
-                let label = format!(
-                    "{}{} 📁 {} ({})",
-                    project_indent(&app.projects, row.project_idx),
-                    if collapsed { "▶" } else { "▼" },
-                    project_label(&app.projects, row.project_idx),
-                    project.sessions.len()
-                );
-                ListItem::new(Line::from(prepend_style(
-                    highlight_spans(&label, &app.search_query),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )))
+            let indent = "  ".repeat(row.depth);
+            match &row.kind {
+                BrowserRowKind::Session {
+                    project_idx,
+                    session_idx,
+                } => {
+                    let session = &app.projects[*project_idx].sessions[*session_idx];
+                    let selected = app.selected_sessions.contains(&session.path);
+                    let mark = if selected { "◉" } else { "◌" };
+                    let line = format!("{indent}  {mark} 🗨 {}", row.label);
+                    let base = if selected {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+                    ListItem::new(Line::from(prepend_style(
+                        highlight_spans(&line, &app.search_query),
+                        base,
+                    )))
+                }
+                BrowserRowKind::Group { path } => {
+                    let collapsed = app.collapsed_groups.contains(path);
+                    let label = format!(
+                        "{indent}{} 📁 {}",
+                        if collapsed { "▶" } else { "▼" },
+                        row.label
+                    );
+                    ListItem::new(Line::from(prepend_style(
+                        highlight_spans(&label, &app.search_query),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )))
+                }
+                BrowserRowKind::Project { project_idx } => {
+                    let project = &app.projects[*project_idx];
+                    let collapsed = app.collapsed_projects.contains(&project.cwd);
+                    let label = format!(
+                        "{indent}{} 📁 {} ({})",
+                        if collapsed { "▶" } else { "▼" },
+                        row.label,
+                        project.sessions.len()
+                    );
+                    ListItem::new(Line::from(prepend_style(
+                        highlight_spans(&label, &app.search_query),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )))
+                }
             }
         })
         .collect();
@@ -2447,7 +2709,11 @@ fn browser_highlight_style() -> Style {
 fn format_session_browser_line(session: &SessionSummary) -> String {
     let chars = session.id.chars().collect::<Vec<_>>();
     let start = chars.len().saturating_sub(7);
-    chars[start..].iter().collect()
+    let mut out = chars[start..].iter().collect::<String>();
+    if is_user_only_session(session) {
+        out.push_str(" !");
+    }
+    out
 }
 
 fn browser_display_path(path: &str) -> String {
@@ -2460,6 +2726,10 @@ fn browser_display_path(path: &str) -> String {
     path.strip_prefix("/root/")
         .map(|rest| format!("/{rest}"))
         .unwrap_or_else(|| path.to_string())
+}
+
+fn is_user_only_session(session: &SessionSummary) -> bool {
+    session.user_message_count > 0 && session.assistant_message_count == 0
 }
 
 fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut App) {
@@ -2486,29 +2756,18 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
     let session_title = preview_session
         .as_ref()
         .map(|s| {
-            let (user_count, assistant_count) = app
-                .preview_cache
-                .get(&s.path)
-                .map(|cached| {
-                    let user = cached
-                        .turns
-                        .iter()
-                        .filter(|turn| turn.role == "user")
-                        .count();
-                    let assistant = cached
-                        .turns
-                        .iter()
-                        .filter(|turn| turn.role == "assistant")
-                        .count();
-                    (user, assistant)
-                })
-                .unwrap_or((0, 0));
+            let warning = if is_user_only_session(s) {
+                "  [user-only; may not resume in codex]"
+            } else {
+                ""
+            };
             format!(
-                "{}  {}  user={} assistant={}",
-                s.id.chars().take(7).collect::<String>(),
+                "{}  {}  user={} assistant={}{}",
+                s.id,
                 format_human_timestamp(&s.started_at),
-                user_count,
-                assistant_count
+                s.user_message_count,
+                s.assistant_message_count,
+                warning
             )
         })
         .unwrap_or_else(|| String::from("No session selected"));
@@ -2520,17 +2779,31 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
     let content_len_changed = app.preview_rendered_lines.len() != preview.lines.len();
     if session_changed {
         app.preview_scroll = default_preview_scroll(app.preview_content_len, viewport_len);
+        app.preview_focus_turn = preview.header_rows.last().map(|(_, turn_idx)| *turn_idx);
     } else {
         app.preview_scroll = app.preview_scroll.min(max_scroll);
+    }
+    let search_matches = if app.search_query.trim().is_empty() {
+        Vec::new()
+    } else {
+        preview_match_positions(&preview, &app.search_query)
+    };
+    let search_changed = search_matches != app.preview_search_matches;
+    app.preview_search_matches = search_matches;
+    if app.preview_search_matches.is_empty() {
+        app.preview_search_index = None;
+    } else if session_changed || search_changed || app.preview_search_index.is_none() {
+        app.preview_search_index = Some(0);
     }
     if let Some((path, query)) = app.pending_preview_search_jump.clone()
         && preview_session
             .as_ref()
             .is_some_and(|session| session.path == path)
     {
-        if let Some(row) = preview_match_row(&preview, &query) {
-            app.preview_scroll = row.saturating_sub(viewport_len / 3);
-            app.preview_focus_turn = preview_turn_at_or_before_row(&preview.header_rows, row);
+        if let Some(found) = preview_match_positions(&preview, &query).first().cloned() {
+            app.preview_scroll = found.row.saturating_sub(viewport_len / 3);
+            app.preview_focus_turn = preview_turn_at_or_before_row(&preview.header_rows, found.row);
+            app.preview_search_index = Some(0);
         }
         app.pending_preview_search_jump = None;
     }
@@ -2542,7 +2815,14 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
         app.preview_rendered_lines = preview.lines.iter().map(|l| l.to_string()).collect();
     }
     app.preview_header_rows = preview.header_rows.clone();
-    app.preview_session_path = preview_session.map(|s| s.path);
+    app.preview_session_path = preview_session.as_ref().map(|s| s.path.clone());
+    if let Some(session) = preview_session.as_ref()
+        && is_user_only_session(session)
+    {
+        app.status = String::from(
+            "Selected session has user messages but no assistant reply; codex may not resume it",
+        );
+    }
     app.ensure_preview_focus_valid();
 
     let focus_style = if app.focus == Focus::Preview && app.mode == Mode::Normal {
@@ -2584,28 +2864,32 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
         );
     }
     if !app.search_query.trim().is_empty() {
-        for row in visible_start..visible_end {
-            let Some(line) = preview.lines.get(row) else {
+        for (match_idx, found) in app.preview_search_matches.iter().enumerate() {
+            let row = found.row;
+            if row < visible_start || row >= visible_end {
                 continue;
-            };
-            let screen_y = inner_y + (row - scroll) as u16;
-            for (col_start, col_end) in highlight_ranges(&line.to_string(), &app.search_query) {
-                let x = inner_x.saturating_add(col_start as u16);
-                let width = (col_end.saturating_sub(col_start)) as u16;
-                let max_w = inner_w.saturating_sub(col_start as u16);
-                if width == 0 || max_w == 0 {
-                    continue;
-                }
-                frame.buffer_mut().set_style(
-                    ratatui::layout::Rect {
-                        x,
-                        y: screen_y,
-                        width: width.min(max_w),
-                        height: 1,
-                    },
-                    Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-                );
             }
+            let screen_y = inner_y + (row - scroll) as u16;
+            let x = inner_x.saturating_add(found.col_start as u16);
+            let width = (found.col_end.saturating_sub(found.col_start)) as u16;
+            let max_w = inner_w.saturating_sub(found.col_start as u16);
+            if width == 0 || max_w == 0 {
+                continue;
+            }
+            let style = if Some(match_idx) == app.preview_search_index || found.is_primary {
+                Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            };
+            frame.buffer_mut().set_style(
+                ratatui::layout::Rect {
+                    x,
+                    y: screen_y,
+                    width: width.min(max_w),
+                    height: 1,
+                },
+                style,
+            );
         }
     }
     if app.focus == Focus::Preview
@@ -2717,21 +3001,36 @@ fn preview_window_bounds(content_len: usize, scroll: usize, viewport_len: usize)
     (start, end)
 }
 
+#[cfg(test)]
 fn preview_match_row(preview: &PreviewData, query: &str) -> Option<usize> {
+    preview_match_positions(preview, query)
+        .first()
+        .map(|found| found.row)
+}
+
+fn preview_match_positions(preview: &PreviewData, query: &str) -> Vec<PreviewMatch> {
     let tokens = search_tokens(query);
     if tokens.is_empty() {
-        return None;
+        return Vec::new();
     }
-    preview.lines.iter().enumerate().find_map(|(idx, line)| {
-        let lower = line.to_string().to_lowercase();
-        if tokens.iter().all(|token| lower.contains(token))
-            || tokens.iter().any(|token| lower.contains(token))
-        {
-            Some(idx)
-        } else {
-            None
+
+    let mut matches = Vec::new();
+    for (row, line) in preview.lines.iter().enumerate() {
+        let line_text = line.to_string();
+        let ranges = highlight_ranges(&line_text, query);
+        for (col_start, col_end) in ranges {
+            matches.push(PreviewMatch {
+                row,
+                col_start,
+                col_end,
+                is_primary: false,
+            });
         }
-    })
+    }
+    if let Some(first) = matches.first_mut() {
+        first.is_primary = true;
+    }
+    matches
 }
 
 fn preview_turn_at_or_before_row(header_rows: &[(usize, usize)], row: usize) -> Option<usize> {
@@ -2905,12 +3204,20 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" browser  "),
             Span::styled("↑/↓", Style::default().fg(Color::Cyan)),
             Span::raw(" block prev/next  "),
+            Span::styled("pgup/pgdn", Style::default().fg(Color::Cyan)),
+            Span::raw(" page  "),
+            Span::styled("home/end", Style::default().fg(Color::Cyan)),
+            Span::raw(" top/bottom  "),
             Span::styled("←/→", Style::default().fg(Color::Cyan)),
             Span::raw(" fold/unfold block  "),
+            Span::styled("n/N", Style::default().fg(Color::Cyan)),
+            Span::raw(" next/prev match  "),
             Span::styled("tab", Style::default().fg(Color::Cyan)),
             Span::raw(" toggle block  "),
             Span::styled("shift+tab", Style::default().fg(Color::Cyan)),
             Span::raw(" toggle all blocks  "),
+            Span::styled("o", Style::default().fg(Color::Green)),
+            Span::raw(" open in codex  "),
             Span::styled("drag", Style::default().fg(Color::Cyan)),
             Span::raw(" preview-select+copy  "),
             Span::styled("drag", Style::default().fg(Color::Cyan)),
@@ -2918,7 +3225,10 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
         ])
     } else if app.focus == Focus::Projects
         && app.mode == Mode::Normal
-        && app.browser_cursor == BrowserCursor::Project
+        && matches!(
+            app.browser_cursor,
+            BrowserCursor::Project | BrowserCursor::Group
+        )
     {
         Line::from(vec![
             Span::styled("j/k", Style::default().fg(Color::Cyan)),
@@ -3731,6 +4041,235 @@ fn split_markdown_prefix(raw: &str) -> (String, &str) {
     (indent, trimmed)
 }
 
+#[derive(Default)]
+struct BrowserTreeNode {
+    name: String,
+    full_path: String,
+    project_idx: Option<usize>,
+    children: BTreeMap<String, BrowserTreeNode>,
+}
+
+fn build_browser_rows(
+    projects: &[ProjectBucket],
+    collapsed_groups: &HashSet<String>,
+    collapsed_projects: &HashSet<String>,
+    _selected_sessions: &HashSet<PathBuf>,
+) -> Vec<BrowserRow> {
+    let tree = build_browser_tree(projects);
+    let mut rows = Vec::new();
+    for node in tree.values() {
+        append_browser_rows(
+            node,
+            projects,
+            collapsed_groups,
+            collapsed_projects,
+            &mut rows,
+            0,
+        );
+    }
+    rows
+}
+
+fn build_browser_tree(projects: &[ProjectBucket]) -> BTreeMap<String, BrowserTreeNode> {
+    let mut roots = BTreeMap::<String, BrowserTreeNode>::new();
+    for (project_idx, project) in projects.iter().enumerate() {
+        let segments = browser_tree_segments(&project.cwd);
+        let Some((root_name, rest)) = segments.split_first() else {
+            continue;
+        };
+        let root = roots
+            .entry(root_name.clone())
+            .or_insert_with(|| BrowserTreeNode {
+                name: root_name.clone(),
+                full_path: root_name.clone(),
+                ..BrowserTreeNode::default()
+            });
+        insert_browser_tree_path(root, rest, project_idx);
+    }
+    compress_browser_tree_children(&mut roots);
+    roots
+}
+
+fn insert_browser_tree_path(node: &mut BrowserTreeNode, segments: &[String], project_idx: usize) {
+    if segments.is_empty() {
+        node.project_idx = Some(project_idx);
+        return;
+    }
+    let name = &segments[0];
+    let child_path = if node.full_path == "/" {
+        format!("/{name}")
+    } else {
+        format!("{}/{}", node.full_path, name)
+    };
+    let child = node
+        .children
+        .entry(name.clone())
+        .or_insert_with(|| BrowserTreeNode {
+            name: name.clone(),
+            full_path: child_path,
+            ..BrowserTreeNode::default()
+        });
+    insert_browser_tree_path(child, &segments[1..], project_idx);
+}
+
+fn compress_browser_tree_children(nodes: &mut BTreeMap<String, BrowserTreeNode>) {
+    let keys = nodes.keys().cloned().collect::<Vec<_>>();
+    for key in keys {
+        if let Some(node) = nodes.get_mut(&key) {
+            compress_browser_tree_node(node, false);
+        }
+    }
+}
+
+fn compress_browser_tree_node(node: &mut BrowserTreeNode, can_compress_self: bool) {
+    let child_keys = node.children.keys().cloned().collect::<Vec<_>>();
+    for key in child_keys {
+        if let Some(child) = node.children.get_mut(&key) {
+            compress_browser_tree_node(child, true);
+        }
+    }
+    if !can_compress_self {
+        return;
+    }
+    while node.project_idx.is_none() && node.children.len() == 1 {
+        let (_, child) = node.children.pop_first().expect("child exists");
+        node.name = format!("{}/{}", node.name, child.name);
+        node.full_path = child.full_path;
+        node.project_idx = child.project_idx;
+        node.children = child.children;
+    }
+}
+
+fn append_browser_rows(
+    node: &BrowserTreeNode,
+    projects: &[ProjectBucket],
+    collapsed_groups: &HashSet<String>,
+    collapsed_projects: &HashSet<String>,
+    rows: &mut Vec<BrowserRow>,
+    depth: usize,
+) {
+    let group_only = node.project_idx.is_none();
+    rows.push(BrowserRow {
+        kind: if let Some(project_idx) = node.project_idx {
+            BrowserRowKind::Project { project_idx }
+        } else {
+            BrowserRowKind::Group {
+                path: node.full_path.clone(),
+            }
+        },
+        depth,
+        label: node.name.clone(),
+    });
+
+    let collapsed = if group_only {
+        collapsed_groups.contains(&node.full_path)
+    } else {
+        let project_idx = node.project_idx.expect("project idx");
+        collapsed_projects.contains(&projects[project_idx].cwd)
+    };
+    if collapsed {
+        return;
+    }
+
+    if let Some(project_idx) = node.project_idx {
+        for session_idx in 0..projects[project_idx].sessions.len() {
+            rows.push(BrowserRow {
+                kind: BrowserRowKind::Session {
+                    project_idx,
+                    session_idx,
+                },
+                depth: depth + 1,
+                label: format_session_browser_line(&projects[project_idx].sessions[session_idx]),
+            });
+        }
+    }
+    for child in node.children.values() {
+        append_browser_rows(
+            child,
+            projects,
+            collapsed_groups,
+            collapsed_projects,
+            rows,
+            depth + 1,
+        );
+    }
+}
+
+fn browser_tree_segments(cwd: &str) -> Vec<String> {
+    if cwd == "/" {
+        return vec![String::from("/")];
+    }
+    if cwd == "/root" {
+        return vec![String::from("/root")];
+    }
+    if let Some(rest) = cwd.strip_prefix("/root/") {
+        let mut parts = vec![String::from("/root")];
+        parts.extend(rest.split('/').map(|s| s.to_string()));
+        return parts;
+    }
+    let mut parts = vec![String::from("/")];
+    parts.extend(
+        cwd.trim_start_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+    );
+    parts
+}
+
+fn default_collapsed_group_paths(projects: &[ProjectBucket]) -> HashSet<String> {
+    let mut collapsed = HashSet::new();
+    for node in build_browser_tree(projects).values() {
+        collect_group_paths(node, &mut collapsed);
+    }
+    collapsed
+}
+
+fn collect_group_paths(node: &BrowserTreeNode, out: &mut HashSet<String>) {
+    if node.project_idx.is_none() {
+        out.insert(node.full_path.clone());
+    }
+    for child in node.children.values() {
+        collect_group_paths(child, out);
+    }
+}
+
+fn first_project_index_for_group(projects: &[ProjectBucket], group_path: &str) -> Option<usize> {
+    let prefix = if group_path == "/" {
+        String::from("/")
+    } else {
+        format!("{group_path}/")
+    };
+    projects.iter().position(|project| {
+        let display = browser_display_path(&project.cwd);
+        display == group_path || display.starts_with(&prefix)
+    })
+}
+
+fn expand_group_ancestors_for_project(
+    projects: &[ProjectBucket],
+    collapsed_groups: &mut HashSet<String>,
+    cwd: &str,
+) {
+    let segments = browser_tree_segments(cwd);
+    if segments.is_empty() {
+        return;
+    }
+    let mut current = String::new();
+    for (idx, segment) in segments.iter().enumerate() {
+        if idx == 0 {
+            current = segment.clone();
+        } else if current == "/" {
+            current = format!("/{segment}");
+        } else {
+            current = format!("{current}/{segment}");
+        }
+        collapsed_groups.remove(&current);
+    }
+    let _ = projects;
+}
+
+#[cfg(test)]
 fn project_label(projects: &[ProjectBucket], idx: usize) -> String {
     let cwd = projects
         .get(idx)
@@ -3752,6 +4291,7 @@ fn project_label(projects: &[ProjectBucket], idx: usize) -> String {
     }
 }
 
+#[cfg(test)]
 fn project_indent(projects: &[ProjectBucket], idx: usize) -> String {
     let cwd = projects
         .get(idx)
@@ -3765,6 +4305,7 @@ fn project_indent(projects: &[ProjectBucket], idx: usize) -> String {
     "  ".repeat(rel_depth)
 }
 
+#[cfg(test)]
 fn nearest_project_ancestor_len(
     projects: &[ProjectBucket],
     idx: usize,
@@ -3778,6 +4319,7 @@ fn nearest_project_ancestor_len(
     None
 }
 
+#[cfg(test)]
 fn project_ancestor_depth(
     projects: &[ProjectBucket],
     idx: usize,
@@ -3789,6 +4331,7 @@ fn project_ancestor_depth(
         .count()
 }
 
+#[cfg(test)]
 fn project_exists_with_parts(
     projects: &[ProjectBucket],
     skip_idx: usize,
@@ -3800,6 +4343,7 @@ fn project_exists_with_parts(
     })
 }
 
+#[cfg(test)]
 fn shared_path_prefix(projects: &[ProjectBucket]) -> Vec<String> {
     let mut iter = projects.iter();
     let Some(first) = iter.next() else {
@@ -3821,6 +4365,7 @@ fn shared_path_prefix(projects: &[ProjectBucket]) -> Vec<String> {
     prefix
 }
 
+#[cfg(test)]
 fn path_components(path: &str) -> Vec<String> {
     Path::new(path)
         .components()
@@ -4164,6 +4709,8 @@ fn parse_session_summary(path: &Path) -> Result<SessionSummary> {
     let mut cwd = String::from("<unknown>");
     let mut started_at = String::from("unknown");
     let mut event_count = 0usize;
+    let mut user_message_count = 0usize;
+    let mut assistant_message_count = 0usize;
     let mut search_parts = Vec::new();
 
     for line in content.lines() {
@@ -4196,6 +4743,11 @@ fn parse_session_summary(path: &Path) -> Result<SessionSummary> {
                 if let Some(payload) = value.get("payload")
                     && payload.get("type").and_then(Value::as_str) == Some("message")
                 {
+                    match payload.get("role").and_then(Value::as_str) {
+                        Some("user") | Some("developer") => user_message_count += 1,
+                        Some("assistant") => assistant_message_count += 1,
+                        _ => {}
+                    }
                     if let Some(content_items) = payload.get("content").and_then(Value::as_array) {
                         for item in content_items {
                             if let Some(text) = item
@@ -4236,6 +4788,8 @@ fn parse_session_summary(path: &Path) -> Result<SessionSummary> {
         started_at,
         modified_epoch: modified_dt.timestamp(),
         event_count,
+        user_message_count,
+        assistant_message_count,
         search_blob: search_parts.join("\n"),
     })
 }
@@ -4250,24 +4804,13 @@ fn rewrite_session_file(path: &Path, target_cwd: &str, rewrite_id: bool) -> Resu
         None
     };
 
-    let mut out = String::with_capacity(content.len() + 1024);
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            out.push('\n');
-            continue;
-        }
-
-        let mut value: Value = serde_json::from_str(line)
-            .with_context(|| format!("invalid JSON line in {}", path.display()))?;
-
-        rewrite_cwd_fields(&mut value, target_cwd);
-        if let Some(id) = new_id.as_deref() {
-            rewrite_session_id(&mut value, id);
-        }
-
-        out.push_str(&serde_json::to_string(&value)?);
-        out.push('\n');
-    }
+    let out = rewrite_session_content(
+        &content,
+        target_cwd,
+        new_id.as_deref(),
+        false,
+        path.display().to_string().as_str(),
+    )?;
 
     backup_file(path)?;
     atomic_write(path, &out)?;
@@ -4302,25 +4845,13 @@ fn duplicate_session_file(
         None
     };
 
-    let mut out = String::with_capacity(content.len() + 1024);
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            out.push('\n');
-            continue;
-        }
-
-        let mut value: Value = serde_json::from_str(line)
-            .with_context(|| format!("invalid JSON line in {}", source.path.display()))?;
-
-        rewrite_cwd_fields(&mut value, target_cwd);
-        if let Some(id) = new_id.as_deref() {
-            rewrite_session_id(&mut value, id);
-            rewrite_session_start_timestamp(&mut value);
-        }
-
-        out.push_str(&serde_json::to_string(&value)?);
-        out.push('\n');
-    }
+    let out = rewrite_session_content(
+        &content,
+        target_cwd,
+        new_id.as_deref(),
+        fork,
+        source.path.display().to_string().as_str(),
+    )?;
 
     let now = Utc::now();
     let mut target_path = sessions_root
@@ -4343,6 +4874,37 @@ fn duplicate_session_file(
 
     atomic_write(&final_path, &out)?;
     Ok(final_path)
+}
+
+fn rewrite_session_content(
+    content: &str,
+    target_cwd: &str,
+    new_id: Option<&str>,
+    rewrite_start_timestamp: bool,
+    source_label: &str,
+) -> Result<String> {
+    let mut out = String::with_capacity(content.len() + 1024);
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            out.push('\n');
+            continue;
+        }
+
+        let mut value: Value = serde_json::from_str(line)
+            .with_context(|| format!("invalid JSON line in {source_label}"))?;
+
+        rewrite_cwd_fields(&mut value, target_cwd);
+        if let Some(id) = new_id {
+            rewrite_session_id(&mut value, id);
+            if rewrite_start_timestamp {
+                rewrite_session_start_timestamp(&mut value);
+            }
+        }
+
+        out.push_str(&serde_json::to_string(&value)?);
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 fn rewrite_cwd_fields(value: &mut Value, target_cwd: &str) {
@@ -4637,26 +5199,26 @@ fn rewrite_session_start_timestamp(value: &mut Value) {
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct RemoteExportTarget {
     ssh_target: String,
-    remote_dir: String,
+    remote_cwd: String,
 }
 
 fn parse_remote_export_target(input: &str) -> Result<RemoteExportTarget> {
     let trimmed = input.trim();
     let Some(colon_idx) = trimmed.rfind(':') else {
         return Err(anyhow!(
-            "remote target must look like user@host:/remote/dir"
+            "remote target must look like user@host:/remote/project/path"
         ));
     };
     let ssh_target = trimmed[..colon_idx].trim();
-    let remote_dir = trimmed[colon_idx + 1..].trim();
-    if ssh_target.is_empty() || remote_dir.is_empty() {
+    let remote_cwd = trimmed[colon_idx + 1..].trim();
+    if ssh_target.is_empty() || remote_cwd.is_empty() {
         return Err(anyhow!(
-            "remote target must look like user@host:/remote/dir"
+            "remote target must look like user@host:/remote/project/path"
         ));
     }
     Ok(RemoteExportTarget {
         ssh_target: ssh_target.to_string(),
-        remote_dir: remote_dir.to_string(),
+        remote_cwd: remote_cwd.to_string(),
     })
 }
 
@@ -4670,6 +5232,35 @@ fn remote_join_path(dir: &str, file_name: &str) -> String {
     } else {
         format!("{dir}/{file_name}")
     }
+}
+
+fn remote_session_dir(codex_home: &str, now: DateTime<Utc>) -> String {
+    format!(
+        "{}/sessions/{}/{}/{}",
+        codex_home.trim_end_matches('/'),
+        now.format("%Y"),
+        now.format("%m"),
+        now.format("%d")
+    )
+}
+
+fn remote_session_path(codex_home: &str, now: DateTime<Utc>, file_name: &str) -> String {
+    remote_join_path(&remote_session_dir(codex_home, now), file_name)
+}
+
+fn run_ssh_output(ssh_target: &str, script: &str) -> Result<String> {
+    let output = Command::new("ssh")
+        .arg(ssh_target)
+        .arg(script)
+        .output()
+        .with_context(|| format!("failed to start ssh for {ssh_target}"))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "ssh command failed for {ssh_target} with status {}",
+            output.status
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn run_ssh_status(ssh_target: &str, script: &str) -> Result<()> {
@@ -4689,10 +5280,16 @@ fn run_ssh_status(ssh_target: &str, script: &str) -> Result<()> {
 
 fn export_session_via_ssh(session: &SessionSummary, target: &str) -> Result<()> {
     let remote = parse_remote_export_target(target)?;
-    let remote_dir_q = sh_single_quote(&remote.remote_dir);
+    let remote_codex_home = run_ssh_output(
+        &remote.ssh_target,
+        "python3 -c 'import os; print(os.environ.get(\"CODEX_HOME\") or os.path.expanduser(\"~/.codex\"))'",
+    )?;
+    let now = Utc::now();
+    let remote_dir = remote_session_dir(&remote_codex_home, now);
+    let remote_dir_q = sh_single_quote(&remote_dir);
     run_ssh_status(&remote.ssh_target, &format!("mkdir -p -- {remote_dir_q}"))?;
 
-    let remote_file = remote_join_path(&remote.remote_dir, &session.file_name);
+    let remote_file = remote_session_path(&remote_codex_home, now, &session.file_name);
     let remote_file_q = sh_single_quote(&remote_file);
     run_ssh_status(&remote.ssh_target, &format!("test ! -e {remote_file_q}")).with_context(
         || {
@@ -4703,8 +5300,15 @@ fn export_session_via_ssh(session: &SessionSummary, target: &str) -> Result<()> 
         },
     )?;
 
-    let bytes = fs::read(&session.path)
+    let content = fs::read_to_string(&session.path)
         .with_context(|| format!("failed to read {}", session.path.display()))?;
+    let rewritten = rewrite_session_content(
+        &content,
+        &remote.remote_cwd,
+        None,
+        false,
+        &session.path.display().to_string(),
+    )?;
     let mut child = Command::new("ssh")
         .arg(&remote.ssh_target)
         .arg(format!("cat > {remote_file_q}"))
@@ -4713,7 +5317,7 @@ fn export_session_via_ssh(session: &SessionSummary, target: &str) -> Result<()> 
         .with_context(|| format!("failed to start ssh upload for {}", remote.ssh_target))?;
     if let Some(stdin) = child.stdin.as_mut() {
         stdin
-            .write_all(&bytes)
+            .write_all(rewritten.as_bytes())
             .with_context(|| format!("failed to stream {}", session.path.display()))?;
     } else {
         return Err(anyhow!("ssh stdin unavailable for upload"));
@@ -4726,6 +5330,147 @@ fn export_session_via_ssh(session: &SessionSummary, target: &str) -> Result<()> 
             "ssh upload failed for {}:{} with status {}",
             remote.ssh_target,
             remote_file,
+            status
+        ));
+    }
+    sync_remote_thread_index(
+        &remote.ssh_target,
+        &remote_file,
+        &remote.remote_cwd,
+        session,
+    )?;
+    Ok(())
+}
+
+fn sync_remote_thread_index(
+    ssh_target: &str,
+    remote_rollout_path: &str,
+    remote_cwd: &str,
+    session: &SessionSummary,
+) -> Result<()> {
+    let mut child = Command::new("ssh")
+        .arg(ssh_target)
+        .arg("python3 -")
+        .stdin(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start remote index sync for {ssh_target}"))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        let script = format!(
+            r#"import glob, json, os, sqlite3, sys
+from datetime import datetime, timezone
+
+remote_rollout_path = {rollout_path}
+remote_cwd = {remote_cwd}
+session_id_hint = {session_id}
+session_title_hint = ""
+
+def parse_ts(raw):
+    try:
+        return int(datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return 0
+
+codex_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+dbs = sorted(glob.glob(os.path.join(codex_home, "state_*.sqlite")))
+if not dbs:
+    sys.exit(0)
+db_path = dbs[-1]
+
+session_id = session_id_hint
+created_at = 0
+updated_at = 0
+source = "cli"
+model_provider = "openai"
+cli_version = ""
+title = session_title_hint
+first_user_message = session_title_hint
+sandbox_policy = "{{}}"
+approval_mode = ""
+memory_mode = "enabled"
+
+with open(remote_rollout_path, "r", encoding="utf-8") as f:
+    for raw in f:
+        raw = raw.strip()
+        if not raw:
+            continue
+        obj = json.loads(raw)
+        ts = parse_ts(obj.get("timestamp", ""))
+        updated_at = max(updated_at, ts)
+        if obj.get("type") == "session_meta":
+            payload = obj.get("payload") or {{}}
+            session_id = payload.get("id") or session_id
+            created_at = parse_ts(payload.get("timestamp", "")) or created_at
+            source = payload.get("source") or source
+            model_provider = payload.get("model_provider") or model_provider
+            cli_version = payload.get("cli_version") or cli_version
+        elif obj.get("type") == "turn_context":
+            payload = obj.get("payload") or {{}}
+            if payload.get("sandbox_policy") is not None:
+                sandbox_policy = json.dumps(payload.get("sandbox_policy"))
+            approval_mode = payload.get("approval_policy") or approval_mode
+            collab = payload.get("collaboration_mode") or {{}}
+            memory_mode = collab.get("memory_mode") or payload.get("memory_mode") or memory_mode
+        elif obj.get("type") == "response_item":
+            payload = obj.get("payload") or {{}}
+            if payload.get("type") == "message" and payload.get("role") in ("user", "developer") and not first_user_message:
+                for item in payload.get("content") or []:
+                    text = item.get("text") or item.get("input_text") or item.get("output_text")
+                    if text:
+                        first_user_message = text
+                        title = text
+                        break
+        elif obj.get("type") == "event_msg":
+            payload = obj.get("payload") or {{}}
+            if payload.get("type") == "user_message" and not first_user_message:
+                text = payload.get("message") or ""
+                if text:
+                    first_user_message = text
+                    title = text
+
+if not title:
+    title = first_user_message or session_id
+if not first_user_message:
+    first_user_message = title
+if not created_at:
+    created_at = updated_at
+
+con = sqlite3.connect(db_path)
+cur = con.cursor()
+cur.execute(
+    "SELECT id FROM threads WHERE id = ? OR rollout_path = ? LIMIT 1",
+    (session_id, remote_rollout_path),
+)
+row = cur.fetchone()
+if row:
+    cur.execute(
+        "UPDATE threads SET cwd = ?, rollout_path = ?, updated_at = ?, title = ?, first_user_message = ?, source = ?, model_provider = ?, cli_version = ? WHERE id = ?",
+        (remote_cwd, remote_rollout_path, updated_at, title, first_user_message, source, model_provider, cli_version, row[0]),
+    )
+else:
+    cur.execute(
+        "INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, tokens_used, has_user_event, archived, cli_version, first_user_message, memory_mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?)",
+        (session_id, remote_rollout_path, created_at, updated_at, source, model_provider, remote_cwd, title, sandbox_policy, approval_mode, cli_version, first_user_message, memory_mode),
+    )
+con.commit()
+"#,
+            rollout_path = serde_json::to_string(remote_rollout_path)?,
+            remote_cwd = serde_json::to_string(remote_cwd)?,
+            session_id = serde_json::to_string(&session.id)?,
+        );
+        stdin
+            .write_all(script.as_bytes())
+            .context("failed to stream remote index sync script")?;
+    } else {
+        return Err(anyhow!("ssh stdin unavailable for remote index sync"));
+    }
+    let status = child
+        .wait()
+        .with_context(|| format!("failed waiting for remote index sync on {ssh_target}"))?;
+    if !status.success() {
+        return Err(anyhow!(
+            "remote index sync failed for {}:{} with status {}",
+            ssh_target,
+            remote_rollout_path,
             status
         ));
     }
@@ -4909,13 +5654,18 @@ mod tests {
             rendered_preview_cache: HashMap::new(),
             preview_folded: HashMap::new(),
             collapsed_projects: HashSet::new(),
+            collapsed_groups: HashSet::new(),
             pinned_open_projects: HashSet::new(),
+            selected_group_path: None,
             preview_header_rows: Vec::new(),
             preview_session_path: None,
+            preview_search_matches: Vec::new(),
+            preview_search_index: None,
             last_browser_nav_at: None,
             pending_preview_search_jump: None,
             browser_clipboard: None,
             last_browser_click: None,
+            launch_codex_after_exit: None,
         }
     }
 
@@ -4959,6 +5709,8 @@ mod tests {
             started_at: String::from("2026-01-01T00:00:00Z"),
             modified_epoch: 123,
             event_count: 1,
+            user_message_count: 1,
+            assistant_message_count: 1,
             search_blob: String::new(),
         }
     }
@@ -5247,9 +5999,9 @@ mod tests {
                 sample_session("/tmp/b.jsonl", "/repo", "b"),
             ],
         }];
-        assert_eq!(app.browser_rows().len(), 3);
+        assert_eq!(app.browser_rows().len(), 4);
         app.collapsed_projects.insert(String::from("/repo"));
-        assert_eq!(app.browser_rows().len(), 1);
+        assert_eq!(app.browser_rows().len(), 2);
     }
 
     #[test]
@@ -5268,7 +6020,7 @@ mod tests {
         app.project_idx = 1;
         app.browser_cursor = BrowserCursor::Project;
 
-        assert_eq!(app.current_browser_row_index(), 2);
+        assert_eq!(app.current_browser_row_index(), 3);
     }
 
     #[test]
@@ -5315,16 +6067,16 @@ mod tests {
 
     #[test]
     fn parse_remote_export_target_requires_ssh_destination_format() {
-        let parsed =
-            parse_remote_export_target("avikalpa@example.com:/var/tmp/codex").expect("parse");
+        let parsed = parse_remote_export_target("avikalpa@example.com:/var/tmp/codex/project")
+            .expect("parse");
         assert_eq!(
             parsed,
             RemoteExportTarget {
                 ssh_target: String::from("avikalpa@example.com"),
-                remote_dir: String::from("/var/tmp/codex"),
+                remote_cwd: String::from("/var/tmp/codex/project"),
             }
         );
-        assert!(parse_remote_export_target("/var/tmp/codex").is_err());
+        assert!(parse_remote_export_target("/var/tmp/codex/project").is_err());
         assert!(parse_remote_export_target("example.com:").is_err());
     }
 
@@ -5338,6 +6090,34 @@ mod tests {
             remote_join_path("/var/tmp/codex/", "a.jsonl"),
             "/var/tmp/codex/a.jsonl"
         );
+    }
+
+    #[test]
+    fn remote_session_path_uses_remote_codex_home_layout() {
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-03-14T17:00:00Z")
+            .expect("ts")
+            .with_timezone(&Utc);
+        assert_eq!(
+            remote_session_dir("/home/pi/.codex", ts),
+            "/home/pi/.codex/sessions/2026/03/14"
+        );
+        assert_eq!(
+            remote_session_path("/home/pi/.codex", ts, "session.jsonl"),
+            "/home/pi/.codex/sessions/2026/03/14/session.jsonl"
+        );
+    }
+
+    #[test]
+    fn rewrite_session_content_rewrites_export_target_cwd() {
+        let input = [
+            r#"{"timestamp":"2026-03-14T00:00:00Z","type":"session_meta","payload":{"id":"sess-1","timestamp":"2026-03-14T00:00:00Z","cwd":"/old/path"}}"#,
+            r#"{"timestamp":"2026-03-14T00:00:01Z","type":"turn_context","payload":{"cwd":"/old/path"}}"#,
+        ]
+        .join("\n");
+        let out = rewrite_session_content(&input, "/remote/project/path", None, false, "test")
+            .expect("rewrite");
+        assert!(out.contains("\"cwd\":\"/remote/project/path\""));
+        assert!(!out.contains("\"cwd\":\"/old/path\""));
     }
 
     #[test]
@@ -5388,6 +6168,8 @@ mod tests {
             started_at: String::from("2026-01-01T00:00:00Z"),
             modified_epoch: 123,
             event_count: 4,
+            user_message_count: 2,
+            assistant_message_count: 1,
             search_blob: String::new(),
         };
         app.projects = vec![ProjectBucket {
@@ -5560,6 +6342,8 @@ mod tests {
                 started_at: String::from("2026-03-14T00:00:00Z"),
                 modified_epoch: 1,
                 event_count: 1,
+                user_message_count: 1,
+                assistant_message_count: 0,
                 search_blob: String::new(),
             }],
         }];
@@ -5610,6 +6394,8 @@ mod tests {
                 started_at: String::from("2026-03-14T00:00:00Z"),
                 modified_epoch: 1,
                 event_count: 1,
+                user_message_count: 1,
+                assistant_message_count: 0,
                 search_blob: String::new(),
             }],
         }];
@@ -5635,20 +6421,25 @@ mod tests {
     fn register_browser_click_detects_double_click_on_same_row() {
         let mut app = empty_test_app();
         let row = BrowserRow {
-            project_idx: 0,
-            session_idx: None,
+            kind: BrowserRowKind::Project { project_idx: 0 },
+            depth: 0,
+            label: String::from("repo"),
         };
         let now = Instant::now();
 
-        assert!(!app.register_browser_click(row, now));
+        assert!(!app.register_browser_click(row.clone(), now));
         assert!(app.register_browser_click(
             row,
             now.checked_add(Duration::from_millis(200)).unwrap_or(now)
         ));
         assert!(!app.register_browser_click(
             BrowserRow {
-                project_idx: 0,
-                session_idx: Some(0),
+                kind: BrowserRowKind::Session {
+                    project_idx: 0,
+                    session_idx: 0,
+                },
+                depth: 1,
+                label: String::from("sess"),
             },
             now.checked_add(Duration::from_millis(250)).unwrap_or(now)
         ));
@@ -5671,8 +6462,8 @@ mod tests {
         handle_mouse_event(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
-                column: 5,
-                row: 1,
+                column: 8,
+                row: 2,
                 modifiers: KeyModifiers::NONE,
             },
             &mut app,
@@ -5682,8 +6473,8 @@ mod tests {
         handle_mouse_event(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
-                column: 5,
-                row: 1,
+                column: 8,
+                row: 2,
                 modifiers: KeyModifiers::NONE,
             },
             &mut app,
@@ -5777,17 +6568,25 @@ mod tests {
         let rows = app.browser_rows();
         let shape = rows
             .iter()
-            .map(|row| (row.project_idx, row.session_idx))
+            .map(|row| match &row.kind {
+                BrowserRowKind::Group { path } => format!("g:{path}"),
+                BrowserRowKind::Project { project_idx } => format!("p:{project_idx}"),
+                BrowserRowKind::Session {
+                    project_idx,
+                    session_idx,
+                } => format!("s:{project_idx}:{session_idx}"),
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             shape,
             vec![
-                (0, None),
-                (0, Some(0)),
-                (0, Some(1)),
-                (1, None),
-                (2, None),
-                (2, Some(0)),
+                "g:/".to_string(),
+                "p:0".to_string(),
+                "s:0:0".to_string(),
+                "s:0:1".to_string(),
+                "p:1".to_string(),
+                "p:2".to_string(),
+                "s:2:0".to_string(),
             ]
         );
     }
@@ -5813,23 +6612,32 @@ mod tests {
             app.move_down();
         }
         let rows = app.browser_rows();
-        let last = rows.last().copied().expect("last row");
-        assert_eq!(app.project_idx, last.project_idx);
-        assert_eq!(app.session_idx, last.session_idx.unwrap_or(0));
-        assert_eq!(
-            app.browser_cursor,
-            if last.session_idx.is_some() {
-                BrowserCursor::Session
-            } else {
-                BrowserCursor::Project
+        let last = rows.last().cloned().expect("last row");
+        match last.kind {
+            BrowserRowKind::Group { path } => {
+                assert_eq!(app.browser_cursor, BrowserCursor::Group);
+                assert_eq!(app.selected_group_path.as_deref(), Some(path.as_str()));
             }
-        );
+            BrowserRowKind::Project { project_idx } => {
+                assert_eq!(app.browser_cursor, BrowserCursor::Project);
+                assert_eq!(app.project_idx, project_idx);
+            }
+            BrowserRowKind::Session {
+                project_idx,
+                session_idx,
+            } => {
+                assert_eq!(app.browser_cursor, BrowserCursor::Session);
+                assert_eq!(app.project_idx, project_idx);
+                assert_eq!(app.session_idx, session_idx);
+            }
+        }
 
         for _ in 0..12 {
             app.move_up();
         }
         assert_eq!(app.project_idx, 0);
-        assert_eq!(app.browser_cursor, BrowserCursor::Project);
+        assert_eq!(app.browser_cursor, BrowserCursor::Group);
+        assert_eq!(app.selected_group_path.as_deref(), Some("/"));
     }
 
     #[test]
@@ -6002,7 +6810,6 @@ mod tests {
                 sample_session("/tmp/b.jsonl", "/repo", "b"),
             ],
         }];
-        app.collapsed_projects.insert(String::from("/repo"));
         app.browser_cursor = BrowserCursor::Session;
         app.session_idx = 0;
 
@@ -6077,8 +6884,8 @@ mod tests {
         handle_mouse_event(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
-                column: 1,
-                row: 1,
+                column: 4,
+                row: 2,
                 modifiers: KeyModifiers::NONE,
             },
             &mut app,
@@ -6089,8 +6896,8 @@ mod tests {
         handle_mouse_event(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
-                column: 1,
-                row: 1,
+                column: 4,
+                row: 2,
                 modifiers: KeyModifiers::NONE,
             },
             &mut app,
@@ -6183,13 +6990,18 @@ mod tests {
             rendered_preview_cache: HashMap::new(),
             preview_folded: HashMap::new(),
             collapsed_projects: HashSet::new(),
+            collapsed_groups: HashSet::new(),
             pinned_open_projects: HashSet::new(),
+            selected_group_path: None,
             preview_header_rows: Vec::new(),
             preview_session_path: None,
+            preview_search_matches: Vec::new(),
+            preview_search_index: None,
             last_browser_nav_at: None,
             pending_preview_search_jump: None,
             browser_clipboard: None,
             last_browser_click: None,
+            launch_codex_after_exit: None,
         };
         let text = app
             .preview_selected_text((0, 1), (1, 2))
@@ -6221,10 +7033,31 @@ mod tests {
             started_at: String::from("2026-01-01T00:00:00Z"),
             modified_epoch: 123,
             event_count: 42,
+            user_message_count: 1,
+            assistant_message_count: 1,
             search_blob: String::from("first user prompt"),
         };
         let line = format_session_browser_line(&s);
         assert_eq!(line, "9abcdef");
+    }
+
+    #[test]
+    fn session_browser_line_marks_user_only_sessions() {
+        let s = SessionSummary {
+            path: PathBuf::from("/tmp/a.jsonl"),
+            file_name: String::from("rollout-a.jsonl"),
+            id: String::from("123456789abcdef"),
+            cwd: String::from("/tmp"),
+            started_at: String::from("2026-01-01T00:00:00Z"),
+            modified_epoch: 123,
+            event_count: 1,
+            user_message_count: 3,
+            assistant_message_count: 0,
+            search_blob: String::from("first user prompt"),
+        };
+        let line = format_session_browser_line(&s);
+        assert_eq!(line, "9abcdef !");
+        assert!(is_user_only_session(&s));
     }
 
     #[test]
@@ -6425,6 +7258,8 @@ mod tests {
             started_at: String::from("2026-01-01T00:00:00Z"),
             modified_epoch: 123,
             event_count: 4,
+            user_message_count: 2,
+            assistant_message_count: 1,
             search_blob: String::from("hello world normalized user"),
         };
         let preview = build_preview(&session, PreviewMode::Chat, 80).expect("preview");
@@ -6464,6 +7299,8 @@ mod tests {
             started_at: String::from("2026-01-01T00:00:00Z"),
             modified_epoch: 123,
             event_count: 2,
+            user_message_count: 1,
+            assistant_message_count: 0,
             search_blob: String::new(),
         };
         let preview = build_preview(&s, PreviewMode::Chat, 24).expect("preview");
@@ -6500,6 +7337,8 @@ mod tests {
             started_at: String::from("2026-01-01T00:00:00Z"),
             modified_epoch: 123,
             event_count: 141,
+            user_message_count: 140,
+            assistant_message_count: 0,
             search_blob: String::new(),
         };
         let preview = build_preview(&s, PreviewMode::Chat, 60).expect("preview");
@@ -6525,6 +7364,8 @@ mod tests {
             started_at: String::from("2026-01-01T00:00:00Z"),
             modified_epoch: 123,
             event_count: 2,
+            user_message_count: 1,
+            assistant_message_count: 0,
             search_blob: String::new(),
         };
         let mut folded = HashSet::new();
@@ -6566,6 +7407,8 @@ mod tests {
             started_at: String::from("t0"),
             modified_epoch: 123,
             event_count: 2,
+            user_message_count: 1,
+            assistant_message_count: 1,
             search_blob: String::new(),
         };
         let preview =
@@ -6617,6 +7460,8 @@ mod tests {
             started_at: String::from("t0"),
             modified_epoch: 123,
             event_count: 2,
+            user_message_count: 0,
+            assistant_message_count: 2,
             search_blob: String::new(),
         };
         let preview =
@@ -6634,6 +7479,8 @@ mod tests {
             started_at: String::from("2026-01-01T00:00:00Z"),
             modified_epoch: 123,
             event_count: 1,
+            user_message_count: 1,
+            assistant_message_count: 1,
             search_blob: String::from("deploy fix alpha"),
         };
         let s2 = SessionSummary {
@@ -6644,6 +7491,8 @@ mod tests {
             started_at: String::from("2026-01-01T00:00:00Z"),
             modified_epoch: 122,
             event_count: 1,
+            user_message_count: 1,
+            assistant_message_count: 1,
             search_blob: String::from("unrelated text"),
         };
 
@@ -6696,13 +7545,18 @@ mod tests {
             rendered_preview_cache: HashMap::new(),
             preview_folded: HashMap::new(),
             collapsed_projects: HashSet::new(),
+            collapsed_groups: HashSet::new(),
             pinned_open_projects: HashSet::new(),
+            selected_group_path: None,
             preview_header_rows: Vec::new(),
             preview_session_path: None,
+            preview_search_matches: Vec::new(),
+            preview_search_index: None,
             last_browser_nav_at: None,
             pending_preview_search_jump: None,
             browser_clipboard: None,
             last_browser_click: None,
+            launch_codex_after_exit: None,
         };
 
         app.apply_search_filter();
@@ -6727,6 +7581,8 @@ mod tests {
             started_at: String::from("2026-01-01T00:00:00Z"),
             modified_epoch: 200,
             event_count: 1,
+            user_message_count: 1,
+            assistant_message_count: 1,
             search_blob: String::from("johyperr exact hit"),
         };
         let weak1 = SessionSummary {
@@ -6737,6 +7593,8 @@ mod tests {
             started_at: String::from("2026-01-01T00:00:00Z"),
             modified_epoch: 100,
             event_count: 1,
+            user_message_count: 1,
+            assistant_message_count: 1,
             search_blob: String::from("johyperr appears once"),
         };
         let weak2 = SessionSummary {
@@ -6747,6 +7605,8 @@ mod tests {
             started_at: String::from("2026-01-01T00:00:01Z"),
             modified_epoch: 99,
             event_count: 1,
+            user_message_count: 1,
+            assistant_message_count: 1,
             search_blob: String::from("another johyperr match"),
         };
 
@@ -6988,7 +7848,7 @@ mod tests {
         };
 
         let rows = app.browser_rows();
-        let target = rows[2];
+        let target = rows[2].clone();
         handle_mouse_event(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
@@ -6999,9 +7859,17 @@ mod tests {
             &mut app,
         );
 
-        assert_eq!(app.project_idx, target.project_idx);
-        assert_eq!(app.session_idx, target.session_idx.unwrap_or(0));
-        assert_eq!(app.browser_cursor, BrowserCursor::Session);
+        match target.kind {
+            BrowserRowKind::Session {
+                project_idx,
+                session_idx,
+            } => {
+                assert_eq!(app.project_idx, project_idx);
+                assert_eq!(app.session_idx, session_idx);
+                assert_eq!(app.browser_cursor, BrowserCursor::Session);
+            }
+            _ => panic!("expected session row"),
+        }
     }
 
     #[test]
@@ -7073,6 +7941,8 @@ mod tests {
                 started_at: String::from("2026-01-01T00:00:00Z"),
                 modified_epoch: 1,
                 event_count: 2,
+                user_message_count: 1,
+                assistant_message_count: 0,
                 search_blob: String::from("hello johyperr world"),
             }],
         }];
@@ -7113,14 +7983,16 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("");
             if let Some(start) = line.find("johyperr") {
-                let mut any_underlined = false;
+                let mut any_highlight = false;
                 for x in start as u16..(start + "johyperr".len()) as u16 {
                     let cell = &backend.buffer()[(x, y)];
-                    if cell.modifier.contains(Modifier::UNDERLINED) {
-                        any_underlined = true;
+                    if cell.modifier.contains(Modifier::UNDERLINED)
+                        || cell.modifier.contains(Modifier::REVERSED)
+                    {
+                        any_highlight = true;
                     }
                 }
-                highlighted = any_underlined;
+                highlighted = any_highlight;
                 if highlighted {
                     break;
                 }
@@ -7144,6 +8016,8 @@ mod tests {
             started_at: String::from("2026-01-01T00:00:00Z"),
             modified_epoch: 123,
             event_count: 4,
+            user_message_count: 2,
+            assistant_message_count: 1,
             search_blob: String::from("hello world normalized user"),
         };
         let mut app = empty_test_app();
@@ -7173,6 +8047,63 @@ mod tests {
 
         let backend = terminal.backend();
         assert!(buffer_contains(backend, "user=2 assistant=1"));
+    }
+
+    #[test]
+    fn render_preview_title_marks_user_only_session() {
+        let dir = std::env::temp_dir().join(format!("cse-preview-user-only-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("sample.jsonl");
+        let body = [
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"abcdef123456","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/x"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello world"}]}}"#,
+        ]
+        .join("\n");
+        fs::write(&path, body).expect("write");
+
+        let session = SessionSummary {
+            path: path.clone(),
+            file_name: String::from("sample.jsonl"),
+            id: String::from("abcdef123456"),
+            cwd: String::from("/tmp/x"),
+            started_at: String::from("2026-01-01T00:00:00Z"),
+            modified_epoch: 123,
+            event_count: 2,
+            user_message_count: 1,
+            assistant_message_count: 0,
+            search_blob: String::from("hello world"),
+        };
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/tmp/x"),
+            sessions: vec![session],
+        }];
+        app.browser_cursor = BrowserCursor::Session;
+        app.preview_folded.insert(path, HashSet::new());
+
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_preview(
+                    frame,
+                    ratatui::layout::Rect {
+                        x: 0,
+                        y: 0,
+                        width: 120,
+                        height: 20,
+                    },
+                    &mut app,
+                );
+            })
+            .expect("draw");
+
+        let backend = terminal.backend();
+        assert!(buffer_contains(
+            backend,
+            "user-only; may not resume in codex"
+        ));
+        assert!(app.status.contains("may not resume"));
     }
 
     #[test]
@@ -7260,13 +8191,18 @@ mod tests {
             rendered_preview_cache: HashMap::new(),
             preview_folded: HashMap::new(),
             collapsed_projects: HashSet::new(),
+            collapsed_groups: HashSet::new(),
             pinned_open_projects: HashSet::new(),
+            selected_group_path: None,
             preview_header_rows: vec![(10, 0), (20, 1), (30, 2)],
             preview_session_path: Some(PathBuf::from("/tmp/x.jsonl")),
+            preview_search_matches: Vec::new(),
+            preview_search_index: None,
             last_browser_nav_at: None,
             pending_preview_search_jump: None,
             browser_clipboard: None,
             last_browser_click: None,
+            launch_codex_after_exit: None,
         };
 
         app.toggle_fold_all_preview_turns();
@@ -7282,5 +8218,196 @@ mod tests {
             .get(&PathBuf::from("/tmp/x.jsonl"))
             .expect("folded set");
         assert!(folded2.is_empty());
+    }
+
+    #[test]
+    fn browser_tree_groups_common_parent_segments() {
+        let mut app = empty_test_app();
+        app.projects = vec![
+            ProjectBucket {
+                cwd: String::from("/root/git/this"),
+                sessions: vec![sample_session("/tmp/this.jsonl", "/root/git/this", "this")],
+            },
+            ProjectBucket {
+                cwd: String::from("/root/git/that"),
+                sessions: vec![sample_session("/tmp/that.jsonl", "/root/git/that", "that")],
+            },
+            ProjectBucket {
+                cwd: String::from("/root/misc"),
+                sessions: vec![sample_session("/tmp/misc.jsonl", "/root/misc", "misc")],
+            },
+        ];
+        app.collapse_all_projects();
+        app.collapsed_groups.clear();
+        app.collapsed_projects.clear();
+
+        let labels = app
+            .browser_render_rows()
+            .into_iter()
+            .filter(|row| !matches!(row.kind, BrowserRowKind::Session { .. }))
+            .map(|row| row.label)
+            .collect::<Vec<_>>();
+
+        assert_eq!(labels, vec!["/root", "git", "that", "this", "misc"]);
+    }
+
+    #[test]
+    fn browser_tree_shows_sessions_under_project_leaf_only() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/root/git/this"),
+            sessions: vec![sample_session(
+                "/tmp/this.jsonl",
+                "/root/git/this",
+                "abcdef012345",
+            )],
+        }];
+        app.collapsed_projects.clear();
+        app.collapsed_groups.clear();
+
+        let rows = app.browser_render_rows();
+        assert_eq!(rows[0].label, "/root");
+        assert_eq!(rows[1].label, "git/this");
+        assert_eq!(rows[2].label, "f012345");
+    }
+
+    #[test]
+    fn preview_match_positions_marks_primary_and_secondary_occurrences() {
+        let preview = PreviewData {
+            lines: vec![
+                Line::from("alpha johyperr"),
+                Line::from("beta johyperr"),
+                Line::from("gamma"),
+            ],
+            tone_rows: Vec::new(),
+            header_rows: vec![(0, 0), (1, 1)],
+            block_ranges: vec![(0, 0, 0), (1, 1, 1)],
+        };
+
+        let matches = preview_match_positions(&preview, "johyperr");
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].row, 0);
+        assert!(matches[0].is_primary);
+        assert_eq!(matches[1].row, 1);
+        assert!(!matches[1].is_primary);
+    }
+
+    #[test]
+    fn preview_search_navigation_moves_between_occurrences() {
+        let mut app = empty_test_app();
+        app.preview_search_matches = vec![
+            PreviewMatch {
+                row: 10,
+                col_start: 3,
+                col_end: 11,
+                is_primary: true,
+            },
+            PreviewMatch {
+                row: 25,
+                col_start: 1,
+                col_end: 9,
+                is_primary: false,
+            },
+        ];
+        app.preview_search_index = Some(0);
+        app.panes.preview.height = 12;
+
+        app.focus_next_preview_search_match();
+        assert_eq!(app.preview_search_index, Some(1));
+        assert_eq!(app.preview_scroll, 22);
+
+        app.focus_prev_preview_search_match();
+        assert_eq!(app.preview_search_index, Some(0));
+        assert_eq!(app.preview_scroll, 7);
+    }
+
+    #[test]
+    fn page_navigation_scrolls_preview_by_view_height() {
+        let mut app = empty_test_app();
+        app.focus = Focus::Preview;
+        app.preview_content_len = 200;
+        app.preview_scroll = 50;
+        app.panes.preview.height = 20;
+
+        app.page_preview(1);
+        assert_eq!(app.preview_scroll, 67);
+
+        app.page_preview(-1);
+        assert_eq!(app.preview_scroll, 50);
+    }
+
+    #[test]
+    fn home_end_navigation_jumps_preview_bounds() {
+        let mut app = empty_test_app();
+        app.focus = Focus::Preview;
+        app.preview_content_len = 200;
+        app.panes.preview.height = 20;
+        app.preview_scroll = 50;
+
+        app.jump_preview_to_edge(false);
+        assert_eq!(app.preview_scroll, 182);
+
+        app.jump_preview_to_edge(true);
+        assert_eq!(app.preview_scroll, 0);
+    }
+
+    #[test]
+    fn preview_header_shows_full_session_id() {
+        let dir = std::env::temp_dir().join(format!("cse-preview-full-id-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("sample.jsonl");
+        fs::write(&path, sample_chat_jsonl()).expect("write");
+
+        let session = SessionSummary {
+            path: path.clone(),
+            file_name: String::from("sample.jsonl"),
+            id: String::from("abcdef1234567890"),
+            cwd: String::from("/tmp/x"),
+            started_at: String::from("2026-01-01T00:00:00Z"),
+            modified_epoch: 123,
+            event_count: 4,
+            user_message_count: 2,
+            assistant_message_count: 1,
+            search_blob: String::from("hello world"),
+        };
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/tmp/x"),
+            sessions: vec![session],
+        }];
+        app.browser_cursor = BrowserCursor::Session;
+
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_preview(
+                    frame,
+                    ratatui::layout::Rect {
+                        x: 0,
+                        y: 0,
+                        width: 120,
+                        height: 20,
+                    },
+                    &mut app,
+                );
+            })
+            .expect("draw");
+
+        assert!(buffer_contains(terminal.backend(), "abcdef1234567890"));
+    }
+
+    #[test]
+    fn codex_launch_spec_uses_current_session_id_and_cwd() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/tmp/work"),
+            sessions: vec![sample_session("/tmp/a.jsonl", "/tmp/work", "abcdef123456")],
+        }];
+        app.browser_cursor = BrowserCursor::Session;
+
+        let launch = app.plan_open_current_session_in_codex().expect("launch");
+        assert_eq!(launch.cwd, PathBuf::from("/tmp/work"));
+        assert_eq!(launch.session_id, String::from("abcdef123456"));
     }
 }

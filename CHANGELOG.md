@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.1.0 - 2026-03-14
+
+### Added
+- Reworked the Browser into a grouped GitHub-style tree so shared folder ancestry is shown once instead of repeated in each project label.
+- Added in-preview match navigation with `n` / `N`, plus `PageUp` / `PageDown` / `Home` / `End` navigation for large conversations.
+- Added `o` to leave the TUI and launch the selected session directly in `codex resume`.
+
+### Changed
+- Preview headers now show the full session id instead of only the short hash.
+- Preview search highlighting now distinguishes the primary match from later matches.
+- Updated the README manual for grouped browser navigation, preview paging, in-chat match navigation, and open-in-Codex flow.
+
+### Fixed
+- Fixed mouse toggle behavior on grouped browser folders and project rows.
+- Fixed preview-on-session-change behavior so newly opened sessions default to the latest conversation content.
+
 ## 1.0.11 - 2026-03-14
 
 ### Fixed

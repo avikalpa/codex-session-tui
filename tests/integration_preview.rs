@@ -23,6 +23,8 @@ fn integration_preview_chat_mode_contains_turn_labels() {
         started_at: "2026-01-01T00:00:00Z".to_string(),
         modified_epoch: 123,
         event_count: 3,
+        user_message_count: 1,
+        assistant_message_count: 1,
         search_blob: "one two".to_string(),
     };
 

@@ -42,7 +42,7 @@ If you rename a repository, move a folder, or restore work into a different path
 ## What The UI Shows
 
 - `Browser` pane:
-  project tree plus sessions, sorted by most recent activity
+  grouped folder tree plus sessions, sorted by most recent activity
 - `Preview` pane:
   grouped conversation blocks with timestamps and folding
 - `Status bar`:
@@ -58,15 +58,16 @@ codex-session-tui
 
 On launch:
 
-- the left pane shows projects and sessions
-- the right pane shows the selected session
-- preview starts at the end of the conversation so you see the latest exchange first
+- the left pane shows a grouped folder tree
+- all folders start collapsed
+- selecting a session opens the preview at the end of the conversation so you see the latest exchange first
 
 ## Core Navigation
 
 Browser:
 
 - `Up` / `Down`: move through visible rows
+- grouped folders compress single-child path chains in a GitHub-style tree
 - `Right`: expand a folder or enter its sessions
 - `Left`: collapse a folder or return from a session to its folder row
 - `Enter`: expand/collapse folder or open the selected session
@@ -82,7 +83,11 @@ Preview:
 - `Esc`: return focus to the browser
 - `Tab`: fold/unfold the current block
 - `Shift+Tab`: fold/unfold all blocks
-- arrow keys: move between preview blocks
+- `Up` / `Down`: move between preview blocks
+- `PageUp` / `PageDown`: move by a preview page
+- `Home` / `End`: jump to top/bottom of the chat
+- `n` / `N`: jump to next/previous search hit inside the current chat
+- `o`: quit the TUI and open the selected session in `codex resume`
 - mouse:
   scroll, fold blocks, select text, drag scrollbar
 
@@ -98,6 +103,8 @@ Search behavior:
 - selects the best matching session
 - jumps the preview to the first relevant match
 - highlights matches in both browser and preview
+- the first preview hit is emphasized more strongly than later hits
+- `n` / `N` in Preview moves between hits inside the current session
 
 Tips:
 
@@ -112,7 +119,8 @@ On a session, you can:
 - `m`: move session to another folder context
 - `c`: copy session to another folder context
 - `f`: fork session into another folder context
-- `e`: export session over SSH to `user@host:/remote/dir`
+- `e`: export session over SSH to `user@host:/remote/project/path`
+- `o`: leave the TUI and open the selected session in `codex resume`
 - `d`: delete session
 - `Space`: multi-select sessions
 - `a`: select all sessions in the current project
@@ -120,12 +128,19 @@ On a session, you can:
 
 Project-level operations are also available for folder-wide rename/copy workflows.
 
+User-only sessions:
+
+- sessions with user messages but no assistant reply are marked with `!` in the Browser
+- the Preview header warns that such sessions may not be resumable by Codex
+
 SSH export behavior:
 
-- enter a remote target in the form `user@host:/remote/dir`
-- selected sessions are uploaded there with their existing `.jsonl` filenames
-- the tool creates the remote directory if needed
-- export refuses to overwrite an existing remote file with the same name
+- enter a remote target in the form `user@host:/remote/project/path`
+- the path is the remote project `cwd`, not the remote `~/.codex` storage directory
+- the tool installs the session under the remote machine's `${CODEX_HOME:-~/.codex}/sessions/...`
+- the exported session JSONL is rewritten to the remote project path
+- the tool also updates the remote Codex thread index so `codex resume` can see the session
+- export refuses to overwrite an existing remote rollout file with the same name
 
 These operations exist for the main recovery use case: sessions whose original project path no longer matches where your repository lives now.
 
