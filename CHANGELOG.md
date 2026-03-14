@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.11 - 2026-03-14
+
+### Fixed
+- Fixed the actual `codex resume` visibility bug by syncing repaired session `cwd` values into Codex's local `threads` SQLite state index, not just the JSONL rollout files.
+- Updated move and folder-wide rewrite flows to update the matching `threads` row immediately after rewriting a session.
+- Added regression tests for stale thread-index repair and move-action state sync.
+
 ## 1.0.10 - 2026-03-14
 
 ### Fixed

@@ -29,6 +29,7 @@ use ratatui::widgets::{
     Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
     ScrollbarState, Wrap,
 };
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -887,6 +888,7 @@ struct PaneLayout {
 
 struct App {
     sessions_root: PathBuf,
+    state_db_path: Option<PathBuf>,
     all_projects: Vec<ProjectBucket>,
     projects: Vec<ProjectBucket>,
     project_idx: usize,
@@ -958,11 +960,13 @@ impl App {
     fn load() -> Result<Self> {
         let codex_home = resolve_codex_home()?;
         let sessions_root = codex_home.join("sessions");
+        let state_db_path = resolve_state_db_path(&codex_home);
         let cwd_base = env::current_dir().context("failed to resolve current directory")?;
         let repaired_count = repair_session_cwds(&sessions_root, &cwd_base)?;
 
         let mut app = Self {
             sessions_root,
+            state_db_path,
             all_projects: Vec::new(),
             projects: Vec::new(),
             project_idx: 0,
@@ -1010,11 +1014,13 @@ impl App {
         };
 
         app.reload()?;
-        if repaired_count > 0 {
+        let synced_threads = app.sync_state_index()?;
+        if repaired_count > 0 || synced_threads > 0 {
             app.status = format!(
-                "Loaded {} projects and repaired {} session file(s)",
+                "Loaded {} projects, repaired {} session file(s), synced {} thread row(s)",
                 app.projects.len(),
-                repaired_count
+                repaired_count,
+                synced_threads
             );
         }
         Ok(app)
@@ -2160,7 +2166,9 @@ impl App {
                         skipped += 1;
                         Ok(())
                     } else {
-                        rewrite_session_file(&session.path, &target_str, false)
+                        rewrite_session_file(&session.path, &target_str, false)?;
+                        self.sync_state_thread(session, &target_str)?;
+                        Ok(())
                     }
                 }
                 Action::Copy | Action::ProjectCopy => {
@@ -2307,6 +2315,26 @@ impl App {
         } else {
             self.status = format!("{} matches (Tab again to list)", matches.len());
         }
+    }
+
+    fn sync_state_index(&self) -> Result<usize> {
+        let Some(db_path) = self.state_db_path.as_deref() else {
+            return Ok(0);
+        };
+        sync_threads_db_from_projects(db_path, &self.all_projects)
+    }
+
+    fn sync_state_thread(&self, session: &SessionSummary, target_cwd: &str) -> Result<bool> {
+        let Some(db_path) = self.state_db_path.as_deref() else {
+            return Ok(false);
+        };
+        sync_thread_record(
+            db_path,
+            &session.id,
+            &session.path,
+            target_cwd,
+            &session.path,
+        )
     }
 }
 
@@ -4452,6 +4480,127 @@ fn repair_session_cwds(root: &Path, cwd_base: &Path) -> Result<usize> {
     Ok(repaired)
 }
 
+fn resolve_state_db_path(codex_home: &Path) -> Option<PathBuf> {
+    let mut candidates = fs::read_dir(codex_home)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("state_")
+                        && name.ends_with(".sqlite")
+                        && !name.ends_with(".sqlite-shm")
+                        && !name.ends_with(".sqlite-wal")
+                })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|path| state_db_sort_key(path));
+    candidates.pop()
+}
+
+fn state_db_sort_key(path: &Path) -> i64 {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|stem| stem.strip_prefix("state_"))
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(i64::MIN)
+}
+
+fn sync_threads_db_from_projects(db_path: &Path, projects: &[ProjectBucket]) -> Result<usize> {
+    if !db_path.exists() {
+        return Ok(0);
+    }
+
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("failed opening {}", db_path.display()))?;
+    let tx = conn
+        .unchecked_transaction()
+        .with_context(|| format!("failed starting transaction on {}", db_path.display()))?;
+
+    let mut synced = 0usize;
+    for session in projects.iter().flat_map(|project| project.sessions.iter()) {
+        if sync_thread_record_tx(&tx, &session.id, &session.path, &session.cwd, &session.path)? {
+            synced += 1;
+        }
+    }
+
+    tx.commit()
+        .with_context(|| format!("failed committing {}", db_path.display()))?;
+    Ok(synced)
+}
+
+fn sync_thread_record(
+    db_path: &Path,
+    session_id: &str,
+    rollout_path: &Path,
+    target_cwd: &str,
+    target_rollout_path: &Path,
+) -> Result<bool> {
+    if !db_path.exists() {
+        return Ok(false);
+    }
+
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("failed opening {}", db_path.display()))?;
+    let tx = conn
+        .unchecked_transaction()
+        .with_context(|| format!("failed starting transaction on {}", db_path.display()))?;
+    let changed = sync_thread_record_tx(
+        &tx,
+        session_id,
+        rollout_path,
+        target_cwd,
+        target_rollout_path,
+    )?;
+    tx.commit()
+        .with_context(|| format!("failed committing {}", db_path.display()))?;
+    Ok(changed)
+}
+
+fn sync_thread_record_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    rollout_path: &Path,
+    target_cwd: &str,
+    target_rollout_path: &Path,
+) -> Result<bool> {
+    let rollout_path_s = path_to_string(rollout_path);
+    let target_rollout_path_s = path_to_string(target_rollout_path);
+
+    let mut stmt = tx.prepare(
+        "SELECT id, cwd, rollout_path
+         FROM threads
+         WHERE id = ?1 OR rollout_path = ?2
+         LIMIT 1",
+    )?;
+    let existing = stmt
+        .query_row(params![session_id, rollout_path_s], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .optional()?;
+    drop(stmt);
+
+    let Some((row_id, current_cwd, current_rollout_path)) = existing else {
+        return Ok(false);
+    };
+
+    if current_cwd == target_cwd && current_rollout_path == target_rollout_path_s {
+        return Ok(false);
+    }
+
+    tx.execute(
+        "UPDATE threads SET cwd = ?1, rollout_path = ?2 WHERE id = ?3",
+        params![target_cwd, target_rollout_path_s, row_id],
+    )?;
+    Ok(true)
+}
+
 fn rewrite_session_id(value: &mut Value, new_id: &str) {
     if value.get("type").and_then(Value::as_str) != Some("session_meta") {
         return;
@@ -4722,6 +4871,7 @@ mod tests {
     fn empty_test_app() -> App {
         App {
             sessions_root: PathBuf::from("/tmp"),
+            state_db_path: None,
             all_projects: Vec::new(),
             projects: Vec::new(),
             project_idx: 0,
@@ -4767,6 +4917,37 @@ mod tests {
             browser_clipboard: None,
             last_browser_click: None,
         }
+    }
+
+    fn init_test_state_db(path: &Path) {
+        let conn = Connection::open(path).expect("open sqlite");
+        conn.execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                rollout_path TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                source TEXT NOT NULL DEFAULT '',
+                model_provider TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                sandbox_policy TEXT NOT NULL DEFAULT '',
+                approval_mode TEXT NOT NULL DEFAULT '',
+                tokens_used INTEGER NOT NULL DEFAULT 0,
+                has_user_event INTEGER NOT NULL DEFAULT 0,
+                archived INTEGER NOT NULL DEFAULT 0,
+                archived_at INTEGER,
+                git_sha TEXT,
+                git_branch TEXT,
+                git_origin_url TEXT,
+                cli_version TEXT NOT NULL DEFAULT '',
+                first_user_message TEXT NOT NULL DEFAULT '',
+                agent_nickname TEXT,
+                agent_role TEXT,
+                memory_mode TEXT NOT NULL DEFAULT 'enabled'
+            );",
+        )
+        .expect("create threads table");
     }
 
     fn sample_session(path: &str, cwd: &str, id: &str) -> SessionSummary {
@@ -5308,6 +5489,149 @@ mod tests {
     }
 
     #[test]
+    fn resolve_state_db_path_picks_latest_state_db() {
+        let dir = std::env::temp_dir().join(format!("cse-state-db-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        fs::write(dir.join("state_2.sqlite"), "").expect("write");
+        fs::write(dir.join("state_5.sqlite"), "").expect("write");
+        fs::write(dir.join("state_5.sqlite-wal"), "").expect("write");
+
+        let picked = resolve_state_db_path(&dir).expect("picked");
+        assert_eq!(picked, dir.join("state_5.sqlite"));
+    }
+
+    #[test]
+    fn sync_thread_record_updates_stale_cwd_in_state_db() {
+        let dir = std::env::temp_dir().join(format!("cse-sync-thread-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let db = dir.join("state_5.sqlite");
+        init_test_state_db(&db);
+
+        let rollout = dir.join("sessions/2026/03/14/session.jsonl");
+        let rollout_s = path_to_string(&rollout);
+        let conn = Connection::open(&db).expect("open");
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path, cwd, title, first_user_message) VALUES (?1, ?2, ?3, '', '')",
+            params!["sess-1", rollout_s, "/old/path"],
+        )
+        .expect("insert");
+        drop(conn);
+
+        let changed =
+            sync_thread_record(&db, "sess-1", &rollout, "/new/path", &rollout).expect("sync");
+        assert!(changed);
+
+        let conn = Connection::open(&db).expect("open");
+        let row = conn
+            .query_row(
+                "SELECT cwd, rollout_path FROM threads WHERE id = 'sess-1'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("select");
+        assert_eq!(row.0, "/new/path");
+        assert_eq!(row.1, path_to_string(&rollout));
+    }
+
+    #[test]
+    fn sync_threads_db_from_projects_repairs_existing_stale_index_rows() {
+        let dir = std::env::temp_dir().join(format!("cse-sync-projects-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let db = dir.join("state_5.sqlite");
+        init_test_state_db(&db);
+
+        let rollout = dir.join("sessions/2026/03/14/session.jsonl");
+        let rollout_s = path_to_string(&rollout);
+        let conn = Connection::open(&db).expect("open");
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path, cwd, title, first_user_message) VALUES (?1, ?2, ?3, '', '')",
+            params!["sess-1", rollout_s, "/old/path"],
+        )
+        .expect("insert");
+        drop(conn);
+
+        let projects = vec![ProjectBucket {
+            cwd: String::from("/new/path"),
+            sessions: vec![SessionSummary {
+                path: rollout.clone(),
+                file_name: String::from("session.jsonl"),
+                id: String::from("sess-1"),
+                cwd: String::from("/new/path"),
+                started_at: String::from("2026-03-14T00:00:00Z"),
+                modified_epoch: 1,
+                event_count: 1,
+                search_blob: String::new(),
+            }],
+        }];
+
+        let repaired = sync_threads_db_from_projects(&db, &projects).expect("sync all");
+        assert_eq!(repaired, 1);
+
+        let conn = Connection::open(&db).expect("open");
+        let cwd = conn
+            .query_row("SELECT cwd FROM threads WHERE id = 'sess-1'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .expect("select");
+        assert_eq!(cwd, "/new/path");
+    }
+
+    #[test]
+    fn submit_input_move_updates_state_db_for_session() {
+        let dir = std::env::temp_dir().join(format!("cse-move-state-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let db = dir.join("state_5.sqlite");
+        init_test_state_db(&db);
+
+        let session_path = dir.join("sessions/2026/03/14/session.jsonl");
+        write_test_session(
+            &session_path,
+            r#"{"timestamp":"2026-03-14T00:00:00Z","type":"session_meta","payload":{"id":"sess-1","timestamp":"2026-03-14T00:00:00Z","cwd":"/old/path"}}"#,
+        );
+
+        let conn = Connection::open(&db).expect("open");
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path, cwd, title, first_user_message) VALUES (?1, ?2, ?3, '', '')",
+            params!["sess-1", path_to_string(&session_path), "/old/path"],
+        )
+        .expect("insert");
+        drop(conn);
+
+        let mut app = empty_test_app();
+        app.sessions_root = dir.join("sessions");
+        app.state_db_path = Some(db.clone());
+        app.projects = vec![ProjectBucket {
+            cwd: String::from("/old/path"),
+            sessions: vec![SessionSummary {
+                path: session_path.clone(),
+                file_name: String::from("session.jsonl"),
+                id: String::from("sess-1"),
+                cwd: String::from("/old/path"),
+                started_at: String::from("2026-03-14T00:00:00Z"),
+                modified_epoch: 1,
+                event_count: 1,
+                search_blob: String::new(),
+            }],
+        }];
+        app.all_projects = app.projects.clone();
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Session;
+        app.pending_action = Some(Action::Move);
+        app.mode = Mode::Input;
+        app.input = String::from("/new/path/");
+
+        app.submit_input().expect("submit");
+
+        let conn = Connection::open(&db).expect("open");
+        let cwd = conn
+            .query_row("SELECT cwd FROM threads WHERE id = 'sess-1'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .expect("select");
+        assert_eq!(cwd, "/new/path");
+    }
+
+    #[test]
     fn register_browser_click_detects_double_click_on_same_row() {
         let mut app = empty_test_app();
         let row = BrowserRow {
@@ -5821,6 +6145,7 @@ mod tests {
     fn preview_selected_text_uses_character_bounds() {
         let app = App {
             sessions_root: PathBuf::from("/tmp"),
+            state_db_path: None,
             all_projects: Vec::new(),
             projects: Vec::new(),
             project_idx: 0,
@@ -6324,6 +6649,7 @@ mod tests {
 
         let mut app = App {
             sessions_root: PathBuf::from("/tmp"),
+            state_db_path: None,
             all_projects: vec![
                 ProjectBucket {
                     cwd: String::from("/repo/a"),
@@ -6896,6 +7222,7 @@ mod tests {
     fn preview_toggle_all_folds_collapses_and_expands() {
         let mut app = App {
             sessions_root: PathBuf::from("/tmp"),
+            state_db_path: None,
             all_projects: Vec::new(),
             projects: Vec::new(),
             project_idx: 0,
