@@ -70,6 +70,7 @@ Browser:
 - `Right`: expand a folder or enter its sessions
 - `Left`: collapse a folder or return from a session to its folder row
 - `Enter`: expand/collapse folder or open the selected session
+- `F5` / `Ctrl+R`: refresh the session tree
 - `Ctrl+Up` / `Ctrl+Down`: jump between projects
 - `Ctrl+Left`: collapse all folders except the current one
 - `Ctrl+Right`: expand all folders
@@ -93,6 +94,7 @@ Search behavior:
 
 - filters the browser tree
 - tokenizes multi-word queries
+- supports quoted phrases such as `"openrouter error" auth`
 - selects the best matching session
 - jumps the preview to the first relevant match
 - highlights matches in both browser and preview
@@ -126,6 +128,13 @@ SSH export behavior:
 - export refuses to overwrite an existing remote file with the same name
 
 These operations exist for the main recovery use case: sessions whose original project path no longer matches where your repository lives now.
+
+Path rewrite behavior:
+
+- move, copy, fork, and folder-wide rewrite operations normalize local target paths before writing
+- relative paths are converted to absolute paths
+- trailing slashes and `.` / `..` path segments are cleaned up
+- on startup, the app repairs previously rewritten session files that still contain non-canonical local `cwd` values
 
 ## Typical Recovery Workflow
 
