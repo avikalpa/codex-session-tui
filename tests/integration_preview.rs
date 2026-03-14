@@ -16,10 +16,14 @@ fn integration_preview_chat_mode_contains_turn_labels() {
     std::fs::write(&path, data).expect("write");
 
     let s = SessionSummary {
-        path,
+        path: path.clone(),
+        storage_path: path_to_string(&path),
         file_name: "sess.jsonl".to_string(),
         id: "x".to_string(),
         cwd: "/tmp/int".to_string(),
+        machine_name: "local".to_string(),
+        machine_target: None,
+        machine_codex_home: None,
         started_at: "2026-01-01T00:00:00Z".to_string(),
         modified_epoch: 123,
         event_count: 3,

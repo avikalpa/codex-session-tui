@@ -30,6 +30,7 @@ use ratatui::widgets::{
     ScrollbarState, Wrap,
 };
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -293,6 +294,7 @@ enum StatusButton {
     Delete,
     ProjectRename,
     ProjectCopy,
+    AddRemote,
     Refresh,
     Quit,
 }
@@ -301,10 +303,16 @@ fn status_buttons(app: &App) -> Vec<StatusButton> {
     if app.mode == Mode::Input {
         return vec![StatusButton::Apply, StatusButton::Cancel];
     }
-    if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Project {
+    if app.focus == Focus::Projects
+        && matches!(
+            app.browser_cursor,
+            BrowserCursor::Project | BrowserCursor::Group
+        )
+    {
         return vec![
             StatusButton::ProjectRename,
             StatusButton::ProjectCopy,
+            StatusButton::AddRemote,
             StatusButton::Refresh,
             StatusButton::Quit,
         ];
@@ -346,6 +354,7 @@ fn status_button_label(button: StatusButton) -> &'static str {
         StatusButton::Delete => "[Delete]",
         StatusButton::ProjectRename => "[Rename Folder]",
         StatusButton::ProjectCopy => "[Copy Folder]",
+        StatusButton::AddRemote => "[Connect Remote]",
         StatusButton::Refresh => "[Refresh]",
         StatusButton::Quit => "[Quit]",
     }
@@ -366,6 +375,7 @@ fn trigger_status_button(button: StatusButton, app: &mut App) {
         StatusButton::Delete => app.start_action(Action::Delete),
         StatusButton::ProjectRename => app.start_action(Action::ProjectRename),
         StatusButton::ProjectCopy => app.start_action(Action::ProjectCopy),
+        StatusButton::AddRemote => app.start_action(Action::AddRemote),
         StatusButton::Refresh => {
             let _ = app.reload();
         }
@@ -495,15 +505,34 @@ fn copy_to_clipboard_osc52(text: &str) -> Result<()> {
 }
 
 fn launch_codex_resume(spec: &CodexLaunchSpec) -> Result<()> {
-    let status = Command::new("codex")
-        .arg("resume")
-        .arg(&spec.session_id)
-        .current_dir(&spec.cwd)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .context("failed to launch codex resume")?;
+    let status = if let Some(ssh_target) = &spec.ssh_target {
+        let remote_cmd = format!(
+            "cd {} && codex resume {}",
+            sh_single_quote(&path_to_string(&spec.cwd)),
+            sh_single_quote(&spec.session_id)
+        );
+        Command::new("ssh")
+            .arg("-t")
+            .arg(ssh_target)
+            .arg("sh")
+            .arg("-lc")
+            .arg(remote_cmd)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .with_context(|| format!("failed to launch remote codex resume via {}", ssh_target))?
+    } else {
+        Command::new("codex")
+            .arg("resume")
+            .arg(&spec.session_id)
+            .current_dir(&spec.cwd)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .context("failed to launch codex resume")?
+    };
     if status.success() {
         Ok(())
     } else {
@@ -748,6 +777,11 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
                 app.start_action(Action::ProjectRename);
             }
         }
+        KeyCode::Char('R') => {
+            if app.focus == Focus::Projects {
+                app.start_action(Action::AddRemote);
+            }
+        }
         KeyCode::Char('y') => {
             if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Project {
                 app.start_action(Action::ProjectCopy);
@@ -912,6 +946,7 @@ enum Action {
     Delete,
     ProjectRename,
     ProjectCopy,
+    AddRemote,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -953,9 +988,15 @@ enum ScrollTarget {
 #[derive(Clone)]
 struct SessionSummary {
     path: PathBuf,
+    storage_path: String,
     file_name: String,
     id: String,
     cwd: String,
+    #[allow(dead_code)]
+    machine_name: String,
+    machine_target: Option<String>,
+    #[allow(dead_code)]
+    machine_codex_home: Option<String>,
     started_at: String,
     modified_epoch: i64,
     #[allow(dead_code)]
@@ -967,8 +1008,24 @@ struct SessionSummary {
 
 #[derive(Clone)]
 struct ProjectBucket {
+    machine_name: String,
+    machine_target: Option<String>,
+    machine_codex_home: Option<String>,
     cwd: String,
     sessions: Vec<SessionSummary>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct ConfigMachine {
+    name: String,
+    ssh_target: String,
+    codex_home: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct AppConfig {
+    #[serde(default)]
+    machines: Vec<ConfigMachine>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -980,6 +1037,8 @@ struct PaneLayout {
 }
 
 struct App {
+    config_path: PathBuf,
+    config: AppConfig,
     sessions_root: PathBuf,
     state_db_path: Option<PathBuf>,
     all_projects: Vec<ProjectBucket>,
@@ -1060,17 +1119,30 @@ struct PreviewMatch {
 struct CodexLaunchSpec {
     cwd: PathBuf,
     session_id: String,
+    ssh_target: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MachineTargetSpec {
+    name: String,
+    ssh_target: Option<String>,
+    codex_home: String,
+    cwd: String,
 }
 
 impl App {
     fn load() -> Result<Self> {
         let codex_home = resolve_codex_home()?;
+        let config_path = resolve_config_path()?;
+        let config = load_app_config(&config_path)?;
         let sessions_root = codex_home.join("sessions");
         let state_db_path = resolve_state_db_path(&codex_home);
         let cwd_base = env::current_dir().context("failed to resolve current directory")?;
         let repaired_count = repair_session_cwds(&sessions_root, &cwd_base)?;
 
         let mut app = Self {
+            config_path,
+            config,
             sessions_root,
             state_db_path,
             all_projects: Vec::new(),
@@ -1138,7 +1210,7 @@ impl App {
     }
 
     fn reload(&mut self) -> Result<()> {
-        self.all_projects = scan_sessions(&self.sessions_root)?;
+        self.all_projects = scan_sessions(&self.sessions_root, &self.config)?;
         self.prune_selected_sessions();
         self.apply_search_filter();
 
@@ -1249,7 +1321,7 @@ impl App {
 
     fn current_project_collapsed(&self) -> bool {
         self.current_project()
-            .is_some_and(|project| self.collapsed_projects.contains(&project.cwd))
+            .is_some_and(|project| project_set_contains(&self.collapsed_projects, project))
     }
 
     fn clamp_session_idx(&mut self) {
@@ -1350,12 +1422,20 @@ impl App {
         let Some(cwd) = self.current_project().map(|project| project.cwd.clone()) else {
             return;
         };
-        if self.collapsed_projects.contains(&cwd) {
+        let Some(project) = self.current_project().cloned() else {
+            return;
+        };
+        let key = project_bucket_key(&project);
+        if project_set_contains(&self.collapsed_projects, &project) {
+            self.collapsed_projects.remove(&key);
             self.collapsed_projects.remove(&cwd);
+            self.pinned_open_projects.insert(key.clone());
             self.pinned_open_projects.insert(cwd.clone());
             self.status = format!("Expanded {}", browser_display_path(&cwd));
         } else {
+            self.collapsed_projects.insert(key.clone());
             self.collapsed_projects.insert(cwd.clone());
+            self.pinned_open_projects.remove(&key);
             self.pinned_open_projects.remove(&cwd);
             self.browser_cursor = BrowserCursor::Project;
             self.status = format!("Collapsed {}", browser_display_path(&cwd));
@@ -1408,26 +1488,33 @@ impl App {
     }
 
     fn auto_manage_project_expansion(&mut self) {
-        let Some(current_cwd) = self.current_project().map(|project| project.cwd.clone()) else {
+        let Some(current_project) = self.current_project().cloned() else {
             return;
         };
+        let current_key = project_bucket_key(&current_project);
         for project in &self.projects {
-            if project.cwd != current_cwd && !self.pinned_open_projects.contains(&project.cwd) {
+            let key = project_bucket_key(project);
+            if key != current_key && !pinned_set_contains(&self.pinned_open_projects, project) {
+                self.collapsed_projects.insert(key);
                 self.collapsed_projects.insert(project.cwd.clone());
             }
         }
-        self.collapsed_projects.remove(&current_cwd);
+        self.collapsed_projects.remove(&current_key);
+        self.collapsed_projects.remove(&current_project.cwd);
     }
 
     fn collapse_all_projects_except_current(&mut self) {
-        let current_cwd = self.current_project().map(|project| project.cwd.clone());
+        let current_key = self.current_project().map(project_bucket_key);
         self.collapsed_projects.clear();
         self.pinned_open_projects.clear();
         self.collapsed_groups.clear();
         for project in &self.projects {
-            if Some(project.cwd.as_str()) != current_cwd.as_deref() {
+            let key = project_bucket_key(project);
+            if Some(key.as_str()) != current_key.as_deref() {
+                self.collapsed_projects.insert(key);
                 self.collapsed_projects.insert(project.cwd.clone());
             } else {
+                self.pinned_open_projects.insert(key);
                 self.pinned_open_projects.insert(project.cwd.clone());
             }
         }
@@ -1442,7 +1529,7 @@ impl App {
         self.pinned_open_projects = self
             .projects
             .iter()
-            .map(|project| project.cwd.clone())
+            .flat_map(|project| [project_bucket_key(project), project.cwd.clone()])
             .collect();
         self.ensure_selection_visible();
         self.status = String::from("Expanded all folders");
@@ -1452,15 +1539,37 @@ impl App {
         self.collapsed_projects = self
             .projects
             .iter()
-            .map(|project| project.cwd.clone())
+            .flat_map(|project| [project_bucket_key(project), project.cwd.clone()])
             .collect();
         self.collapsed_groups = default_collapsed_group_paths(&self.projects);
+        self.expand_initial_browser_groups();
         self.pinned_open_projects.clear();
         self.browser_cursor = BrowserCursor::Project;
         self.selected_group_path = None;
         self.project_scroll = 0;
         self.session_scroll = 0;
         self.preview_scroll = 0;
+    }
+
+    fn expand_initial_browser_groups(&mut self) {
+        let Some(first_project) = self.projects.first() else {
+            return;
+        };
+        let segments = browser_tree_segments_for_project(first_project);
+        if segments.is_empty() {
+            return;
+        }
+        let mut current = String::new();
+        for (idx, segment) in segments.iter().enumerate().take(2) {
+            if idx == 0 {
+                current = segment.clone();
+            } else if current == "/" {
+                current = format!("/{segment}");
+            } else {
+                current = format!("{current}/{segment}");
+            }
+            self.collapsed_groups.remove(&current);
+        }
     }
 
     fn jump_project(&mut self, delta: isize) {
@@ -1595,6 +1704,9 @@ impl App {
                 filtered.push((
                     best_score,
                     ProjectBucket {
+                        machine_name: project.machine_name.clone(),
+                        machine_target: project.machine_target.clone(),
+                        machine_codex_home: project.machine_codex_home.clone(),
                         cwd: project.cwd.clone(),
                         sessions: scored.into_iter().map(|(_, s)| s).collect(),
                     },
@@ -1612,6 +1724,8 @@ impl App {
         if let Some(first_project) = self.projects.first() {
             if let Some(first_session) = first_project.sessions.first() {
                 self.browser_cursor = BrowserCursor::Session;
+                self.collapsed_projects
+                    .remove(&project_bucket_key(first_project));
                 self.collapsed_projects.remove(&first_project.cwd);
                 expand_group_ancestors_for_project(
                     &self.projects,
@@ -1723,18 +1837,35 @@ impl App {
         mode: PreviewMode,
         inner_width: usize,
     ) -> Result<Arc<PreviewData>> {
-        let meta = fs::metadata(&session.path)
-            .with_context(|| format!("failed metadata {}", session.path.display()))?;
-        let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-
-        let stale = self
-            .preview_cache
-            .get(&session.path)
-            .is_none_or(|cached| cached.mtime < mtime);
+        let (mtime, content, stale) = if session.machine_target.is_none() {
+            let meta = fs::metadata(&session.storage_path)
+                .with_context(|| format!("failed metadata {}", session.storage_path))?;
+            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            let stale = self
+                .preview_cache
+                .get(&session.path)
+                .is_none_or(|cached| cached.mtime < mtime);
+            let content = if stale {
+                Some(
+                    fs::read_to_string(&session.storage_path)
+                        .with_context(|| format!("failed to read {}", session.storage_path))?,
+                )
+            } else {
+                None
+            };
+            (mtime, content, stale)
+        } else {
+            let stale = !self.preview_cache.contains_key(&session.path);
+            let content = if stale {
+                Some(fetch_remote_session_content(session)?)
+            } else {
+                None
+            };
+            (SystemTime::UNIX_EPOCH, content, stale)
+        };
 
         if stale {
-            let content = fs::read_to_string(&session.path)
-                .with_context(|| format!("failed to read {}", session.path.display()))?;
+            let content = content.unwrap_or_default();
             let turns = extract_chat_turns(&content);
             let events = content
                 .lines()
@@ -2016,6 +2147,7 @@ impl App {
         let launch = CodexLaunchSpec {
             cwd: PathBuf::from(&session.cwd),
             session_id: session.id.clone(),
+            ssh_target: session.machine_target.clone(),
         };
         self.launch_codex_after_exit = Some(launch.clone());
         Some(launch)
@@ -2089,6 +2221,77 @@ impl App {
         self.selected_sessions_in_current_project().len()
     }
 
+    fn machine_specs(&self) -> Vec<(String, Option<String>, String)> {
+        let mut out = vec![(
+            String::from("local"),
+            None,
+            path_to_string(
+                self.sessions_root
+                    .parent()
+                    .unwrap_or_else(|| Path::new("/")),
+            ),
+        )];
+        for machine in &self.config.machines {
+            out.push((
+                machine.name.clone(),
+                Some(machine.ssh_target.clone()),
+                machine
+                    .codex_home
+                    .clone()
+                    .unwrap_or_else(|| String::from("~/.codex")),
+            ));
+        }
+        out
+    }
+
+    fn resolve_machine_target(&self, raw: &str) -> Result<MachineTargetSpec> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow!("Target path is empty"));
+        }
+
+        if let Some(colon_idx) = trimmed.find(':') {
+            let prefix = trimmed[..colon_idx].trim();
+            let rest = trimmed[colon_idx + 1..].trim();
+            if !prefix.is_empty() {
+                if let Some((name, ssh_target, codex_home)) = self
+                    .machine_specs()
+                    .into_iter()
+                    .find(|(name, _, _)| name == prefix)
+                {
+                    let cwd = if ssh_target.is_none() {
+                        normalize_local_target_cwd(
+                            rest,
+                            &env::current_dir().context("failed to resolve current directory")?,
+                        )?
+                    } else {
+                        rest.to_string()
+                    };
+                    return Ok(MachineTargetSpec {
+                        name,
+                        ssh_target,
+                        codex_home,
+                        cwd,
+                    });
+                }
+            }
+        }
+
+        Ok(MachineTargetSpec {
+            name: String::from("local"),
+            ssh_target: None,
+            codex_home: path_to_string(
+                self.sessions_root
+                    .parent()
+                    .unwrap_or_else(|| Path::new("/")),
+            ),
+            cwd: normalize_local_target_cwd(
+                trimmed,
+                &env::current_dir().context("failed to resolve current directory")?,
+            )?,
+        })
+    }
+
     fn toggle_current_session_selection(&mut self) {
         let Some(session) = self.current_session().cloned() else {
             self.status = String::from("No session selected");
@@ -2160,6 +2363,7 @@ impl App {
                 .current_project()
                 .map(|p| p.sessions.clone())
                 .unwrap_or_default(),
+            Action::AddRemote => Vec::new(),
             Action::Move | Action::Copy | Action::Fork | Action::Export | Action::Delete => {
                 let selected = self.selected_sessions_in_current_project();
                 if !selected.is_empty() {
@@ -2236,7 +2440,21 @@ impl App {
             self.status = String::from("No target folder selected");
             return Ok(());
         };
-        let target_cwd = target_project.cwd.clone();
+        let target = MachineTargetSpec {
+            name: target_project.machine_name.clone(),
+            ssh_target: target_project.machine_target.clone(),
+            codex_home: target_project
+                .machine_codex_home
+                .clone()
+                .unwrap_or_else(|| {
+                    path_to_string(
+                        self.sessions_root
+                            .parent()
+                            .unwrap_or_else(|| Path::new("/")),
+                    )
+                }),
+            cwd: target_project.cwd.clone(),
+        };
         let mut ok = 0usize;
         let mut skipped = 0usize;
         let mut failures = Vec::new();
@@ -2244,15 +2462,14 @@ impl App {
         for session in &clipboard.targets {
             let result = match clipboard.mode {
                 BrowserClipboardMode::Copy => {
-                    duplicate_session_file(&self.sessions_root, session, &target_cwd, false)
-                        .map(|_| ())
+                    self.apply_session_action_to_target(Action::Copy, session, &target)
                 }
                 BrowserClipboardMode::Cut => {
-                    if session.cwd == target_cwd {
+                    if session.machine_target == target.ssh_target && session.cwd == target.cwd {
                         skipped += 1;
                         Ok(())
                     } else {
-                        rewrite_session_file(&session.path, &target_cwd, false)
+                        self.apply_session_action_to_target(Action::Move, session, &target)
                     }
                 }
             };
@@ -2281,13 +2498,13 @@ impl App {
                 format!(
                     "{verb} {ok} session(s) from {} into {} (skipped {skipped})",
                     clipboard.source_label,
-                    browser_display_path(&target_cwd)
+                    format!("{}:{}", target.name, browser_display_path(&target.cwd))
                 )
             } else {
                 format!(
                     "{verb} {ok} session(s) from {} into {}",
                     clipboard.source_label,
-                    browser_display_path(&target_cwd)
+                    format!("{}:{}", target.name, browser_display_path(&target.cwd))
                 )
             }
         } else {
@@ -2317,9 +2534,10 @@ impl App {
 
     fn start_action(&mut self, action: Action) {
         let targets = self.action_targets(action);
-        if targets.is_empty() {
+        if action != Action::AddRemote && targets.is_empty() {
             self.status = match action {
                 Action::ProjectRename | Action::ProjectCopy => String::from("No project selected"),
+                Action::AddRemote => String::from("Enter remote connection details"),
                 _ => String::from("No session selected"),
             };
             return;
@@ -2333,15 +2551,15 @@ impl App {
         self.search_focused = false;
         self.status = match action {
             Action::Move => format!(
-                "Move {} session(s): enter target project path and press Enter",
+                "Move {} session(s): enter target path (`/path` or `machine:/path`) and press Enter",
                 targets.len()
             ),
             Action::Copy => format!(
-                "Copy {} session(s): enter target project path and press Enter",
+                "Copy {} session(s): enter target path (`/path` or `machine:/path`) and press Enter",
                 targets.len()
             ),
             Action::Fork => format!(
-                "Fork {} session(s): enter target project path and press Enter",
+                "Fork {} session(s): enter target path (`/path` or `machine:/path`) and press Enter",
                 targets.len()
             ),
             Action::Export => format!(
@@ -2357,8 +2575,11 @@ impl App {
                 targets.len()
             ),
             Action::ProjectCopy => format!(
-                "Copy folder sessions ({}) to target path and press Enter",
+                "Copy folder sessions ({}) to target path (`/path` or `machine:/path`) and press Enter",
                 targets.len()
+            ),
+            Action::AddRemote => String::from(
+                "Add remote: enter name=user@host or name=user@host:/remote/.codex and press Enter",
             ),
         };
     }
@@ -2379,10 +2600,11 @@ impl App {
         };
 
         let targets = self.action_targets(action);
-        if targets.is_empty() {
+        if action != Action::AddRemote && targets.is_empty() {
             self.status = String::from("No applicable sessions for this action");
             return Ok(());
         }
+        let target_display = self.input.trim().to_string();
         let target_str = match action {
             Action::Delete => {
                 if !delete_confirmation_valid(&self.input) {
@@ -2392,41 +2614,60 @@ impl App {
                 String::new()
             }
             Action::Export => self.input.trim().to_string(),
-            _ => normalize_local_target_cwd(
-                &self.input,
-                &env::current_dir().context("failed to resolve current directory")?,
-            )?,
+            Action::AddRemote => self.input.trim().to_string(),
+            _ => self.resolve_machine_target(&self.input)?.cwd,
         };
         let mut ok = 0usize;
         let mut skipped = 0usize;
         let mut failures = Vec::new();
 
-        for session in &targets {
-            let result = match action {
-                Action::Move | Action::ProjectRename => {
-                    if session.cwd == target_str {
-                        skipped += 1;
-                        Ok(())
-                    } else {
-                        rewrite_session_file(&session.path, &target_str, false)?;
-                        self.sync_state_thread(session, &target_str)?;
-                        Ok(())
+        match action {
+            Action::AddRemote => {
+                let machine = parse_config_machine_input(&self.input)?;
+                upsert_config_machine(&mut self.config, machine);
+                save_app_config(&self.config_path, &self.config)?;
+                ok = 1;
+                self.reload()?;
+            }
+            _ => {
+                let target_machine = if matches!(
+                    action,
+                    Action::Move
+                        | Action::Copy
+                        | Action::Fork
+                        | Action::ProjectRename
+                        | Action::ProjectCopy
+                ) {
+                    Some(self.resolve_machine_target(&self.input)?)
+                } else {
+                    None
+                };
+                for session in &targets {
+                    let result = match action {
+                        Action::Move
+                        | Action::ProjectRename
+                        | Action::Copy
+                        | Action::ProjectCopy
+                        | Action::Fork => {
+                            let target = target_machine.as_ref().expect("target machine");
+                            if session.machine_target == target.ssh_target
+                                && session.cwd == target.cwd
+                            {
+                                skipped += 1;
+                                Ok(())
+                            } else {
+                                self.apply_session_action_to_target(action, session, target)
+                            }
+                        }
+                        Action::Export => export_session_via_ssh(session, &target_str),
+                        Action::Delete => self.apply_delete_action(session),
+                        Action::AddRemote => Ok(()),
+                    };
+                    match result {
+                        Ok(()) => ok += 1,
+                        Err(err) => failures.push(format!("{}: {}", session.file_name, err)),
                     }
                 }
-                Action::Copy | Action::ProjectCopy => {
-                    duplicate_session_file(&self.sessions_root, session, &target_str, false)
-                        .map(|_| ())
-                }
-                Action::Fork => {
-                    duplicate_session_file(&self.sessions_root, session, &target_str, true)
-                        .map(|_| ())
-                }
-                Action::Export => export_session_via_ssh(session, &target_str),
-                Action::Delete => delete_session_file(&session.path),
-            };
-            match result {
-                Ok(()) => ok += 1,
-                Err(err) => failures.push(format!("{}: {}", session.file_name, err)),
             }
         }
 
@@ -2436,7 +2677,7 @@ impl App {
         self.input_focused = false;
         self.clear_input_completion_cycle();
 
-        if action != Action::Export && (ok > 0 || skipped > 0) {
+        if !matches!(action, Action::Export | Action::AddRemote) && (ok > 0 || skipped > 0) {
             self.reload()?;
         }
         self.selected_sessions.clear();
@@ -2450,16 +2691,17 @@ impl App {
             Action::Delete => "deleted",
             Action::ProjectRename => "renamed",
             Action::ProjectCopy => "copied",
+            Action::AddRemote => "connected",
         };
         self.status = if failures.is_empty() {
             if action == Action::Delete {
                 format!("{action_name} {ok} session(s)")
             } else if skipped > 0 {
                 format!(
-                    "{action_name} {ok} session(s), skipped {skipped} unchanged -> {target_str}"
+                    "{action_name} {ok} session(s), skipped {skipped} unchanged -> {target_display}"
                 )
             } else {
-                format!("{action_name} {ok} session(s) -> {target_str}")
+                format!("{action_name} {ok} session(s) -> {target_display}")
             }
         } else {
             let first = failures
@@ -2578,6 +2820,78 @@ impl App {
             &session.path,
         )
     }
+
+    fn apply_session_action_to_target(
+        &self,
+        action: Action,
+        session: &SessionSummary,
+        target: &MachineTargetSpec,
+    ) -> Result<()> {
+        match action {
+            Action::Move | Action::ProjectRename => {
+                if session.machine_target == target.ssh_target && session.cwd == target.cwd {
+                    return Ok(());
+                }
+                if session.machine_target == target.ssh_target {
+                    if session.machine_target.is_none() {
+                        rewrite_session_file(Path::new(&session.storage_path), &target.cwd, false)?;
+                        self.sync_state_thread(session, &target.cwd)?;
+                    } else {
+                        rewrite_remote_session_file(session, &target.cwd, false)?;
+                    }
+                    return Ok(());
+                }
+                self.apply_session_action_to_target(Action::Copy, session, target)?;
+                self.apply_delete_action(session)?;
+                Ok(())
+            }
+            Action::Copy | Action::ProjectCopy | Action::Fork | Action::Export => {
+                let fork = matches!(action, Action::Fork);
+                let (out, session_id, _) = duplicate_session_content(session, &target.cwd, fork)?;
+                if let Some(ssh_target) = &target.ssh_target {
+                    let remote_path = write_new_remote_session(
+                        ssh_target,
+                        &target.codex_home,
+                        &session_id,
+                        &out,
+                    )?;
+                    let sync_session = SessionSummary {
+                        id: session_id,
+                        cwd: target.cwd.clone(),
+                        storage_path: remote_path.clone(),
+                        ..session.clone()
+                    };
+                    sync_remote_thread_index(ssh_target, &remote_path, &target.cwd, &sync_session)?;
+                } else {
+                    let new_path = write_new_local_session(&self.sessions_root, &session_id, &out)?;
+                    let _ = self.sync_state_thread(
+                        &SessionSummary {
+                            id: session_id,
+                            cwd: target.cwd.clone(),
+                            storage_path: path_to_string(&new_path),
+                            path: new_path.clone(),
+                            machine_name: String::from("local"),
+                            machine_target: None,
+                            machine_codex_home: None,
+                            ..session.clone()
+                        },
+                        &target.cwd,
+                    )?;
+                }
+                Ok(())
+            }
+            Action::Delete => self.apply_delete_action(session),
+            Action::AddRemote => Ok(()),
+        }
+    }
+
+    fn apply_delete_action(&self, session: &SessionSummary) -> Result<()> {
+        if session.machine_target.is_none() {
+            delete_session_file(Path::new(&session.storage_path))
+        } else {
+            delete_remote_session_file(session)
+        }
+    }
 }
 
 fn render_search(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
@@ -2634,9 +2948,11 @@ fn render_browser(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
                 }
                 BrowserRowKind::Group { path } => {
                     let collapsed = app.collapsed_groups.contains(path);
+                    let icon = if row.depth == 0 { "🖥" } else { "📁" };
                     let label = format!(
-                        "{indent}{} 📁 {}",
+                        "{indent}{} {} {}",
                         if collapsed { "▶" } else { "▼" },
+                        icon,
                         row.label
                     );
                     ListItem::new(Line::from(prepend_style(
@@ -2648,7 +2964,7 @@ fn render_browser(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
                 }
                 BrowserRowKind::Project { project_idx } => {
                     let project = &app.projects[*project_idx];
-                    let collapsed = app.collapsed_projects.contains(&project.cwd);
+                    let collapsed = project_set_contains(&app.collapsed_projects, project);
                     let label = format!(
                         "{indent}{} 📁 {} ({})",
                         if collapsed { "▶" } else { "▼" },
@@ -2728,6 +3044,18 @@ fn browser_display_path(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
+fn project_bucket_key(project: &ProjectBucket) -> String {
+    format!("{}::{}", project.machine_name, project.cwd)
+}
+
+fn project_set_contains(set: &HashSet<String>, project: &ProjectBucket) -> bool {
+    set.contains(&project_bucket_key(project)) || set.contains(&project.cwd)
+}
+
+fn pinned_set_contains(set: &HashSet<String>, project: &ProjectBucket) -> bool {
+    project_set_contains(set, project)
+}
+
 fn is_user_only_session(session: &SessionSummary) -> bool {
     session.user_message_count > 0 && session.assistant_message_count == 0
 }
@@ -2762,8 +3090,9 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
                 ""
             };
             format!(
-                "{}  {}  user={} assistant={}{}",
+                "{}  [{}]  {}  user={} assistant={}{}",
                 s.id,
+                s.machine_name,
                 format_human_timestamp(&s.started_at),
                 s.user_message_count,
                 s.assistant_message_count,
@@ -3151,7 +3480,8 @@ fn status_button_style(button: StatusButton) -> Style {
         | StatusButton::Fork
         | StatusButton::Export
         | StatusButton::ProjectRename
-        | StatusButton::ProjectCopy => Style::default().fg(Color::Green),
+        | StatusButton::ProjectCopy
+        | StatusButton::AddRemote => Style::default().fg(Color::Green),
         StatusButton::Delete => Style::default().fg(Color::Red),
         StatusButton::SelectAll | StatusButton::Invert => Style::default().fg(Color::Yellow),
         StatusButton::Cancel | StatusButton::Quit => Style::default().fg(Color::Red),
@@ -3253,6 +3583,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" rename folder sessions  "),
             Span::styled("c or y", Style::default().fg(Color::Green)),
             Span::raw(" copy folder sessions  "),
+            Span::styled("R", Style::default().fg(Color::Green)),
+            Span::raw(" connect remote  "),
             Span::styled("/", Style::default().fg(Color::Cyan)),
             Span::raw(" search  "),
             Span::styled("f5/ctrl+r", Style::default().fg(Color::Yellow)),
@@ -3289,6 +3621,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" open  "),
             Span::styled("m/c/f/d", Style::default().fg(Color::Green)),
             Span::raw(" move/copy/fork/delete selection  "),
+            Span::styled("target", Style::default().fg(Color::Cyan)),
+            Span::raw(" /path or machine:/path  "),
             Span::styled("e", Style::default().fg(Color::Green)),
             Span::raw(" export ssh  "),
             Span::styled("/", Style::default().fg(Color::Cyan)),
@@ -3314,6 +3648,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" splitter  preview-select "),
             Span::styled("m/c/f/d", Style::default().fg(Color::Green)),
             Span::raw(" move/copy/fork/delete  "),
+            Span::styled("R", Style::default().fg(Color::Green)),
+            Span::raw(" connect remote  "),
             Span::styled("e", Style::default().fg(Color::Green)),
             Span::raw(" export ssh  "),
             Span::styled("g/f5/ctrl+r", Style::default().fg(Color::Yellow)),
@@ -3390,6 +3726,7 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Some(Action::Delete) => "DELETE",
             Some(Action::ProjectRename) => "RENAME FOLDER",
             Some(Action::ProjectCopy) => "COPY FOLDER",
+            Some(Action::AddRemote) => "CONNECT REMOTE",
             None => "ACTION",
         };
 
@@ -4073,7 +4410,7 @@ fn build_browser_rows(
 fn build_browser_tree(projects: &[ProjectBucket]) -> BTreeMap<String, BrowserTreeNode> {
     let mut roots = BTreeMap::<String, BrowserTreeNode>::new();
     for (project_idx, project) in projects.iter().enumerate() {
-        let segments = browser_tree_segments(&project.cwd);
+        let segments = browser_tree_segments_for_project(project);
         let Some((root_name, rest)) = segments.split_first() else {
             continue;
         };
@@ -4098,6 +4435,8 @@ fn insert_browser_tree_path(node: &mut BrowserTreeNode, segments: &[String], pro
     let name = &segments[0];
     let child_path = if node.full_path == "/" {
         format!("/{name}")
+    } else if name == "/" {
+        format!("{}/", node.full_path)
     } else {
         format!("{}/{}", node.full_path, name)
     };
@@ -4165,7 +4504,7 @@ fn append_browser_rows(
         collapsed_groups.contains(&node.full_path)
     } else {
         let project_idx = node.project_idx.expect("project idx");
-        collapsed_projects.contains(&projects[project_idx].cwd)
+        project_set_contains(collapsed_projects, &projects[project_idx])
     };
     if collapsed {
         return;
@@ -4217,6 +4556,12 @@ fn browser_tree_segments(cwd: &str) -> Vec<String> {
     parts
 }
 
+fn browser_tree_segments_for_project(project: &ProjectBucket) -> Vec<String> {
+    let mut parts = vec![project.machine_name.clone()];
+    parts.extend(browser_tree_segments(&project.cwd));
+    parts
+}
+
 fn default_collapsed_group_paths(projects: &[ProjectBucket]) -> HashSet<String> {
     let mut collapsed = HashSet::new();
     for node in build_browser_tree(projects).values() {
@@ -4251,7 +4596,10 @@ fn expand_group_ancestors_for_project(
     collapsed_groups: &mut HashSet<String>,
     cwd: &str,
 ) {
-    let segments = browser_tree_segments(cwd);
+    let Some(project) = projects.iter().find(|project| project.cwd == cwd) else {
+        return;
+    };
+    let segments = browser_tree_segments_for_project(project);
     if segments.is_empty() {
         return;
     }
@@ -4639,7 +4987,25 @@ fn fuzzy_score(query: &str, haystack: &str) -> Option<i64> {
     }
 }
 
-fn scan_sessions(root: &Path) -> Result<Vec<ProjectBucket>> {
+fn scan_sessions(root: &Path, config: &AppConfig) -> Result<Vec<ProjectBucket>> {
+    let mut all_projects = scan_local_sessions(root)?;
+    for machine in &config.machines {
+        match scan_remote_sessions(machine) {
+            Ok(mut projects) => all_projects.append(&mut projects),
+            Err(err) => {
+                eprintln!("remote scan failed for {}: {err:#}", machine.name);
+            }
+        }
+    }
+    all_projects.sort_by(|a, b| {
+        a.machine_name
+            .cmp(&b.machine_name)
+            .then_with(|| a.cwd.cmp(&b.cwd))
+    });
+    Ok(all_projects)
+}
+
+fn scan_local_sessions(root: &Path) -> Result<Vec<ProjectBucket>> {
     if !root.exists() {
         return Ok(Vec::new());
     }
@@ -4649,7 +5015,7 @@ fn scan_sessions(root: &Path) -> Result<Vec<ProjectBucket>> {
 
     let mut projects: HashMap<String, Vec<SessionSummary>> = HashMap::new();
     for path in files {
-        if let Ok(summary) = parse_session_summary(&path) {
+        if let Ok(summary) = parse_local_session_summary(&path) {
             projects
                 .entry(summary.cwd.clone())
                 .or_default()
@@ -4669,7 +5035,13 @@ fn scan_sessions(root: &Path) -> Result<Vec<ProjectBucket>> {
 
     Ok(sorted_projects
         .into_iter()
-        .map(|(cwd, sessions)| ProjectBucket { cwd, sessions })
+        .map(|(cwd, sessions)| ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            cwd,
+            sessions,
+        })
         .collect())
 }
 
@@ -4697,7 +5069,7 @@ fn collect_jsonl_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn parse_session_summary(path: &Path) -> Result<SessionSummary> {
+fn parse_local_session_summary(path: &Path) -> Result<SessionSummary> {
     let content =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     let metadata =
@@ -4782,9 +5154,13 @@ fn parse_session_summary(path: &Path) -> Result<SessionSummary> {
 
     Ok(SessionSummary {
         path: path.to_path_buf(),
+        storage_path: path_to_string(path),
         file_name,
         id: session_id,
         cwd,
+        machine_name: String::from("local"),
+        machine_target: None,
+        machine_codex_home: None,
         started_at,
         modified_epoch: modified_dt.timestamp(),
         event_count,
@@ -4792,6 +5168,107 @@ fn parse_session_summary(path: &Path) -> Result<SessionSummary> {
         assistant_message_count,
         search_blob: search_parts.join("\n"),
     })
+}
+
+fn parse_remote_session_summary_line(
+    machine: &ConfigMachine,
+    line: &str,
+) -> Result<SessionSummary> {
+    let value: Value = serde_json::from_str(line).context("invalid remote summary line")?;
+    let storage_path = value
+        .get("rollout_path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("remote summary missing rollout_path"))?;
+    let file_name = value
+        .get("file_name")
+        .and_then(Value::as_str)
+        .unwrap_or("rollout.jsonl");
+    let id = value.get("id").and_then(Value::as_str).unwrap_or("unknown");
+    let cwd = value
+        .get("cwd")
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
+    let started_at = value
+        .get("started_at")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let modified_epoch = value
+        .get("modified_epoch")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let event_count = value
+        .get("event_count")
+        .and_then(Value::as_u64)
+        .unwrap_or_default() as usize;
+    let user_message_count = value
+        .get("user_message_count")
+        .and_then(Value::as_u64)
+        .unwrap_or_default() as usize;
+    let assistant_message_count = value
+        .get("assistant_message_count")
+        .and_then(Value::as_u64)
+        .unwrap_or_default() as usize;
+    let search_blob = value
+        .get("search_blob")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Ok(SessionSummary {
+        path: PathBuf::from(format!("ssh://{}/{}", machine.name, storage_path)),
+        storage_path: storage_path.to_string(),
+        file_name: file_name.to_string(),
+        id: id.to_string(),
+        cwd: cwd.to_string(),
+        machine_name: machine.name.clone(),
+        machine_target: Some(machine.ssh_target.clone()),
+        machine_codex_home: machine.codex_home.clone(),
+        started_at: started_at.to_string(),
+        modified_epoch,
+        event_count,
+        user_message_count,
+        assistant_message_count,
+        search_blob: search_blob.to_string(),
+    })
+}
+
+fn scan_remote_sessions(machine: &ConfigMachine) -> Result<Vec<ProjectBucket>> {
+    let lines = run_remote_python_lines(
+        &machine.ssh_target,
+        REMOTE_SCAN_SCRIPT,
+        &[machine
+            .codex_home
+            .clone()
+            .unwrap_or_else(|| String::from("~/.codex"))],
+    )?;
+
+    let mut projects: HashMap<String, Vec<SessionSummary>> = HashMap::new();
+    for line in lines {
+        let summary = parse_remote_session_summary_line(machine, &line)?;
+        projects
+            .entry(summary.cwd.clone())
+            .or_default()
+            .push(summary);
+    }
+
+    let mut sorted_projects = BTreeMap::new();
+    for (cwd, mut sessions) in projects {
+        sessions.sort_by(|a, b| {
+            b.modified_epoch
+                .cmp(&a.modified_epoch)
+                .then_with(|| b.started_at.cmp(&a.started_at))
+        });
+        sorted_projects.insert(cwd, sessions);
+    }
+
+    Ok(sorted_projects
+        .into_iter()
+        .map(|(cwd, sessions)| ProjectBucket {
+            machine_name: machine.name.clone(),
+            machine_target: Some(machine.ssh_target.clone()),
+            machine_codex_home: machine.codex_home.clone(),
+            cwd,
+            sessions,
+        })
+        .collect())
 }
 
 fn rewrite_session_file(path: &Path, target_cwd: &str, rewrite_id: bool) -> Result<()> {
@@ -4817,6 +5294,12 @@ fn rewrite_session_file(path: &Path, target_cwd: &str, rewrite_id: bool) -> Resu
     Ok(())
 }
 
+#[allow(dead_code)]
+fn rewrite_session_file_content_local(path: &Path, out: &str) -> Result<()> {
+    backup_file(path)?;
+    atomic_write(path, out)
+}
+
 fn repair_session_file_cwds(path: &Path, cwd_base: &Path) -> Result<bool> {
     let content =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -4830,14 +5313,14 @@ fn repair_session_file_cwds(path: &Path, cwd_base: &Path) -> Result<bool> {
     Ok(true)
 }
 
+#[allow(dead_code)]
 fn duplicate_session_file(
     sessions_root: &Path,
     source: &SessionSummary,
     target_cwd: &str,
     fork: bool,
 ) -> Result<PathBuf> {
-    let content = fs::read_to_string(&source.path)
-        .with_context(|| format!("failed to read {}", source.path.display()))?;
+    let content = read_session_content(source)?;
 
     let new_id = if fork {
         Some(Uuid::new_v4().to_string())
@@ -4873,6 +5356,45 @@ fn duplicate_session_file(
     let final_path = unique_path(target_path);
 
     atomic_write(&final_path, &out)?;
+    Ok(final_path)
+}
+
+fn duplicate_session_content(
+    source: &SessionSummary,
+    target_cwd: &str,
+    fork: bool,
+) -> Result<(String, String, bool)> {
+    let content = read_session_content(source)?;
+    let new_id = if fork {
+        Some(Uuid::new_v4().to_string())
+    } else {
+        None
+    };
+    let out = rewrite_session_content(
+        &content,
+        target_cwd,
+        new_id.as_deref(),
+        fork,
+        &source.storage_path,
+    )?;
+    Ok((out, new_id.unwrap_or_else(|| source.id.clone()), fork))
+}
+
+fn write_new_local_session(sessions_root: &Path, session_id: &str, out: &str) -> Result<PathBuf> {
+    let now = Utc::now();
+    let mut target_path = sessions_root
+        .join(now.format("%Y").to_string())
+        .join(now.format("%m").to_string())
+        .join(now.format("%d").to_string());
+    fs::create_dir_all(&target_path)
+        .with_context(|| format!("failed to create {}", target_path.display()))?;
+    target_path.push(format!(
+        "rollout-{}-{}.jsonl",
+        now.format("%Y-%m-%dT%H-%M-%S"),
+        session_id
+    ));
+    let final_path = unique_path(target_path);
+    atomic_write(&final_path, out)?;
     Ok(final_path)
 }
 
@@ -5083,6 +5605,9 @@ fn sync_threads_db_from_projects(db_path: &Path, projects: &[ProjectBucket]) -> 
 
     let mut synced = 0usize;
     for session in projects.iter().flat_map(|project| project.sessions.iter()) {
+        if session.machine_target.is_some() {
+            continue;
+        }
         if sync_thread_record_tx(&tx, &session.id, &session.path, &session.cwd, &session.path)? {
             synced += 1;
         }
@@ -5202,6 +5727,83 @@ struct RemoteExportTarget {
     remote_cwd: String,
 }
 
+const REMOTE_SCAN_SCRIPT: &str = r#"
+import json, os, sys
+from pathlib import Path
+
+def summarize(path):
+    session_id = "unknown"
+    cwd = "<unknown>"
+    started_at = "unknown"
+    event_count = 0
+    user_count = 0
+    assistant_count = 0
+    search_parts = []
+    try:
+        stat = path.stat()
+        modified_epoch = int(stat.st_mtime)
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                event_count += 1
+                try:
+                    value = json.loads(raw)
+                except Exception:
+                    continue
+                ty = value.get("type")
+                if ty == "session_meta":
+                    payload = value.get("payload") or {}
+                    session_id = payload.get("id") or session_id
+                    cwd = payload.get("cwd") or cwd
+                    started_at = payload.get("timestamp") or started_at
+                elif ty == "response_item":
+                    payload = value.get("payload") or {}
+                    if payload.get("type") == "message":
+                        role = payload.get("role")
+                        if role in ("user", "developer"):
+                            user_count += 1
+                        elif role == "assistant":
+                            assistant_count += 1
+                        for item in payload.get("content") or []:
+                            text = item.get("text") or item.get("input_text") or item.get("output_text")
+                            if text:
+                                search_parts.append(str(text).lower())
+                elif ty == "event_msg":
+                    payload = value.get("payload") or {}
+                    if payload.get("type") == "user_message" and payload.get("message"):
+                        search_parts.append(str(payload["message"]).lower())
+    except Exception:
+        return None
+    return {
+        "rollout_path": str(path),
+        "file_name": path.name,
+        "id": session_id,
+        "cwd": cwd,
+        "started_at": started_at,
+        "modified_epoch": modified_epoch,
+        "event_count": event_count,
+        "user_message_count": user_count,
+        "assistant_message_count": assistant_count,
+        "search_blob": "\n".join(search_parts),
+    }
+
+codex_home = os.path.expanduser(sys.argv[1] if len(sys.argv) > 1 else "~/.codex")
+root = Path(codex_home) / "sessions"
+if root.exists():
+    for path in root.rglob("*.jsonl"):
+        data = summarize(path)
+        if data:
+            print(json.dumps(data, ensure_ascii=False))
+"#;
+
+const REMOTE_READ_FILE_SCRIPT: &str = r#"
+import sys
+with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as fh:
+    sys.stdout.write(fh.read())
+"#;
+
 fn parse_remote_export_target(input: &str) -> Result<RemoteExportTarget> {
     let trimmed = input.trim();
     let Some(colon_idx) = trimmed.rfind(':') else {
@@ -5278,6 +5880,174 @@ fn run_ssh_status(ssh_target: &str, script: &str) -> Result<()> {
     }
 }
 
+fn run_remote_python_lines(ssh_target: &str, script: &str, args: &[String]) -> Result<Vec<String>> {
+    let mut cmd = Command::new("ssh");
+    cmd.arg(ssh_target).arg("python3").arg("-");
+    for arg in args {
+        cmd.arg(arg);
+    }
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to start ssh python for {ssh_target}"))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(script.as_bytes())
+            .with_context(|| format!("failed to send script to {ssh_target}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("failed waiting for ssh python on {ssh_target}"))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "remote command failed for {}: {}",
+            ssh_target,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect())
+}
+
+fn run_remote_python_text(ssh_target: &str, script: &str, args: &[String]) -> Result<String> {
+    Ok(run_remote_python_lines(ssh_target, script, args)?.join("\n"))
+}
+
+fn read_session_content(session: &SessionSummary) -> Result<String> {
+    if session.machine_target.is_none() {
+        fs::read_to_string(&session.storage_path)
+            .with_context(|| format!("failed to read {}", session.storage_path))
+    } else {
+        fetch_remote_session_content(session)
+    }
+}
+
+fn fetch_remote_session_content(session: &SessionSummary) -> Result<String> {
+    let ssh_target = session
+        .machine_target
+        .as_deref()
+        .ok_or_else(|| anyhow!("remote session missing ssh target"))?;
+    run_remote_python_text(
+        ssh_target,
+        REMOTE_READ_FILE_SCRIPT,
+        std::slice::from_ref(&session.storage_path),
+    )
+}
+
+fn upload_remote_file(ssh_target: &str, remote_file: &str, content: &str) -> Result<()> {
+    let remote_file_q = sh_single_quote(remote_file);
+    let mut child = Command::new("ssh")
+        .arg(ssh_target)
+        .arg(format!("cat > {remote_file_q}"))
+        .stdin(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start ssh upload for {}", ssh_target))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(content.as_bytes())
+            .with_context(|| format!("failed to stream remote file {}", remote_file))?;
+    } else {
+        return Err(anyhow!("ssh stdin unavailable for upload"));
+    }
+    let status = child
+        .wait()
+        .with_context(|| format!("failed waiting for ssh upload to {}", ssh_target))?;
+    if !status.success() {
+        return Err(anyhow!(
+            "ssh upload failed for {}:{} with status {}",
+            ssh_target,
+            remote_file,
+            status
+        ));
+    }
+    Ok(())
+}
+
+fn write_new_remote_session(
+    ssh_target: &str,
+    codex_home: &str,
+    session_id: &str,
+    out: &str,
+) -> Result<String> {
+    let now = Utc::now();
+    let remote_dir = remote_session_dir(codex_home, now);
+    run_ssh_status(
+        ssh_target,
+        &format!("mkdir -p -- {}", sh_single_quote(&remote_dir)),
+    )?;
+    let remote_file = remote_session_path(
+        codex_home,
+        now,
+        &format!(
+            "rollout-{}-{}.jsonl",
+            now.format("%Y-%m-%dT%H-%M-%S"),
+            session_id
+        ),
+    );
+    run_ssh_status(
+        ssh_target,
+        &format!("test ! -e {}", sh_single_quote(&remote_file)),
+    )
+    .with_context(|| format!("remote file already exists: {}:{}", ssh_target, remote_file))?;
+    upload_remote_file(ssh_target, &remote_file, out)?;
+    Ok(remote_file)
+}
+
+fn rewrite_remote_session_file(
+    session: &SessionSummary,
+    target_cwd: &str,
+    rewrite_id: bool,
+) -> Result<()> {
+    let ssh_target = session
+        .machine_target
+        .as_deref()
+        .ok_or_else(|| anyhow!("remote session missing ssh target"))?;
+    let content = read_session_content(session)?;
+    let new_id = if rewrite_id {
+        Some(Uuid::new_v4().to_string())
+    } else {
+        None
+    };
+    let rewritten = rewrite_session_content(
+        &content,
+        target_cwd,
+        new_id.as_deref(),
+        false,
+        &session.storage_path,
+    )?;
+    run_ssh_status(
+        ssh_target,
+        &format!(
+            "cp -- {} {}",
+            sh_single_quote(&session.storage_path),
+            sh_single_quote(&format!("{}.bak", session.storage_path))
+        ),
+    )?;
+    upload_remote_file(ssh_target, &session.storage_path, &rewritten)?;
+    let sync_session = SessionSummary {
+        id: new_id.unwrap_or_else(|| session.id.clone()),
+        cwd: target_cwd.to_string(),
+        ..session.clone()
+    };
+    sync_remote_thread_index(ssh_target, &session.storage_path, target_cwd, &sync_session)?;
+    Ok(())
+}
+
+fn delete_remote_session_file(session: &SessionSummary) -> Result<()> {
+    let ssh_target = session
+        .machine_target
+        .as_deref()
+        .ok_or_else(|| anyhow!("remote session missing ssh target"))?;
+    run_ssh_status(
+        ssh_target,
+        &format!("rm -f -- {}", sh_single_quote(&session.storage_path)),
+    )
+}
+
 fn export_session_via_ssh(session: &SessionSummary, target: &str) -> Result<()> {
     let remote = parse_remote_export_target(target)?;
     let remote_codex_home = run_ssh_output(
@@ -5300,39 +6070,15 @@ fn export_session_via_ssh(session: &SessionSummary, target: &str) -> Result<()> 
         },
     )?;
 
-    let content = fs::read_to_string(&session.path)
-        .with_context(|| format!("failed to read {}", session.path.display()))?;
+    let content = read_session_content(session)?;
     let rewritten = rewrite_session_content(
         &content,
         &remote.remote_cwd,
         None,
         false,
-        &session.path.display().to_string(),
+        &session.storage_path,
     )?;
-    let mut child = Command::new("ssh")
-        .arg(&remote.ssh_target)
-        .arg(format!("cat > {remote_file_q}"))
-        .stdin(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to start ssh upload for {}", remote.ssh_target))?;
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin
-            .write_all(rewritten.as_bytes())
-            .with_context(|| format!("failed to stream {}", session.path.display()))?;
-    } else {
-        return Err(anyhow!("ssh stdin unavailable for upload"));
-    }
-    let status = child
-        .wait()
-        .with_context(|| format!("failed waiting for ssh upload to {}", remote.ssh_target))?;
-    if !status.success() {
-        return Err(anyhow!(
-            "ssh upload failed for {}:{} with status {}",
-            remote.ssh_target,
-            remote_file,
-            status
-        ));
-    }
+    upload_remote_file(&remote.ssh_target, &remote_file, &rewritten)?;
     sync_remote_thread_index(
         &remote.ssh_target,
         &remote_file,
@@ -5552,6 +6298,81 @@ fn resolve_codex_home() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".codex"))
 }
 
+fn resolve_config_path() -> Result<PathBuf> {
+    let cwd = env::current_dir().context("failed to resolve current directory")?;
+    let local = cwd.join(".codex-session-tui.toml");
+    if local.exists() {
+        return Ok(local);
+    }
+    let home = env::var("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home)
+        .join(".config")
+        .join("codex-session-tui.toml"))
+}
+
+fn load_app_config(path: &Path) -> Result<AppConfig> {
+    if !path.exists() {
+        return Ok(AppConfig::default());
+    }
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    toml::from_str(&raw).with_context(|| format!("invalid config {}", path.display()))
+}
+
+fn save_app_config(path: &Path, config: &AppConfig) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let body = toml::to_string_pretty(config).context("failed to serialize config")?;
+    atomic_write(path, &body)
+}
+
+fn parse_config_machine_input(input: &str) -> Result<ConfigMachine> {
+    let trimmed = input.trim();
+    let Some((name, rest)) = trimmed.split_once('=') else {
+        return Err(anyhow!(
+            "remote must look like name=user@host or name=user@host:/remote/.codex"
+        ));
+    };
+    let name = name.trim();
+    let rest = rest.trim();
+    if name.is_empty() || rest.is_empty() {
+        return Err(anyhow!(
+            "remote must look like name=user@host or name=user@host:/remote/.codex"
+        ));
+    }
+    if let Some(idx) = rest.rfind(':') {
+        let ssh_target = rest[..idx].trim();
+        let codex_home = rest[idx + 1..].trim();
+        if ssh_target.is_empty() {
+            return Err(anyhow!("remote ssh target is empty"));
+        }
+        if codex_home.is_empty() || !codex_home.starts_with('/') {
+            return Err(anyhow!("remote codex home must be an absolute path"));
+        }
+        return Ok(ConfigMachine {
+            name: name.to_string(),
+            ssh_target: ssh_target.to_string(),
+            codex_home: Some(codex_home.to_string()),
+        });
+    }
+    Ok(ConfigMachine {
+        name: name.to_string(),
+        ssh_target: rest.to_string(),
+        codex_home: None,
+    })
+}
+
+fn upsert_config_machine(config: &mut AppConfig, machine: ConfigMachine) {
+    if let Some(existing) = config.machines.iter_mut().find(|m| m.name == machine.name) {
+        *existing = machine;
+    } else {
+        config.machines.push(machine);
+        config.machines.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+}
+
 fn expand_tilde(input: &str) -> PathBuf {
     if input.is_empty() {
         return PathBuf::new();
@@ -5615,6 +6436,8 @@ mod tests {
 
     fn empty_test_app() -> App {
         App {
+            config_path: PathBuf::from("/tmp/codex-session-tui.toml"),
+            config: AppConfig::default(),
             sessions_root: PathBuf::from("/tmp"),
             state_db_path: None,
             all_projects: Vec::new(),
@@ -5703,9 +6526,13 @@ mod tests {
     fn sample_session(path: &str, cwd: &str, id: &str) -> SessionSummary {
         SessionSummary {
             path: PathBuf::from(path),
+            storage_path: String::from(path),
             file_name: format!("{id}.jsonl"),
             id: String::from(id),
             cwd: String::from(cwd),
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             started_at: String::from("2026-01-01T00:00:00Z"),
             modified_epoch: 123,
             event_count: 1,
@@ -5794,10 +6621,16 @@ mod tests {
     fn project_tree_label_uses_shared_prefix() {
         let projects = vec![
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/work/src/api"),
                 sessions: Vec::new(),
             },
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/work/src/web"),
                 sessions: Vec::new(),
             },
@@ -5811,10 +6644,16 @@ mod tests {
     fn project_tree_label_keeps_missing_parent_segments() {
         let projects = vec![
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/work/src/foo"),
                 sessions: Vec::new(),
             },
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/work/src/bar/baz"),
                 sessions: Vec::new(),
             },
@@ -5828,18 +6667,30 @@ mod tests {
     fn project_tree_indent_only_uses_existing_project_ancestors() {
         let projects = vec![
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/work/src/foo"),
                 sessions: Vec::new(),
             },
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/work/src/bar"),
                 sessions: Vec::new(),
             },
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/work/src/bar/baz"),
                 sessions: Vec::new(),
             },
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/work/src/bar/baz/qux"),
                 sessions: Vec::new(),
             },
@@ -5926,6 +6777,9 @@ mod tests {
     fn toggle_current_session_selection_tracks_current_project() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/repo"),
             sessions: vec![
                 sample_session("/tmp/a.jsonl", "/repo", "a"),
@@ -5951,6 +6805,9 @@ mod tests {
     fn select_all_and_invert_sessions_work() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/repo"),
             sessions: vec![
                 sample_session("/tmp/a.jsonl", "/repo", "a"),
@@ -5975,6 +6832,9 @@ mod tests {
         app.focus = Focus::Projects;
         app.browser_cursor = BrowserCursor::Session;
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/repo"),
             sessions: vec![
                 sample_session("/tmp/a.jsonl", "/repo", "a"),
@@ -5993,6 +6853,9 @@ mod tests {
     fn browser_rows_hide_sessions_when_project_collapsed() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/repo"),
             sessions: vec![
                 sample_session("/tmp/a.jsonl", "/repo", "a"),
@@ -6009,10 +6872,16 @@ mod tests {
         let mut app = empty_test_app();
         app.projects = vec![
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo-a"),
                 sessions: vec![sample_session("/tmp/a.jsonl", "/repo-a", "a")],
             },
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo-b"),
                 sessions: vec![sample_session("/tmp/b.jsonl", "/repo-b", "b")],
             },
@@ -6020,13 +6889,16 @@ mod tests {
         app.project_idx = 1;
         app.browser_cursor = BrowserCursor::Project;
 
-        assert_eq!(app.current_browser_row_index(), 3);
+        assert_eq!(app.current_browser_row_index(), 4);
     }
 
     #[test]
     fn delete_key_starts_delete_action_for_session_row() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/repo"),
             sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
         }];
@@ -6051,6 +6923,9 @@ mod tests {
         for (code, expected) in actions {
             let mut app = empty_test_app();
             app.projects = vec![ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo"),
                 sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
             }];
@@ -6124,6 +6999,9 @@ mod tests {
     fn ctrl_c_copies_browser_selection_into_clipboard() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/repo"),
             sessions: vec![
                 sample_session("/tmp/a.jsonl", "/repo", "a"),
@@ -6162,6 +7040,10 @@ mod tests {
         app.sessions_root = sessions_root.clone();
         let source = SessionSummary {
             path: source_path.clone(),
+            storage_path: path_to_string(Path::new(&source_path.clone())),
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             file_name: String::from("source.jsonl"),
             id: String::from("abc"),
             cwd: String::from("/old"),
@@ -6173,6 +7055,9 @@ mod tests {
             search_blob: String::new(),
         };
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/new"),
             sessions: vec![],
         }];
@@ -6333,9 +7218,16 @@ mod tests {
         drop(conn);
 
         let projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/new/path"),
             sessions: vec![SessionSummary {
                 path: rollout.clone(),
+                storage_path: path_to_string(Path::new(&rollout.clone())),
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 file_name: String::from("session.jsonl"),
                 id: String::from("sess-1"),
                 cwd: String::from("/new/path"),
@@ -6385,9 +7277,16 @@ mod tests {
         app.sessions_root = dir.join("sessions");
         app.state_db_path = Some(db.clone());
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/old/path"),
             sessions: vec![SessionSummary {
                 path: session_path.clone(),
+                storage_path: path_to_string(Path::new(&session_path.clone())),
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 file_name: String::from("session.jsonl"),
                 id: String::from("sess-1"),
                 cwd: String::from("/old/path"),
@@ -6449,6 +7348,9 @@ mod tests {
     fn double_click_project_row_toggles_folder() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/repo"),
             sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
         }];
@@ -6486,6 +7388,9 @@ mod tests {
     fn browser_enter_toggles_project_and_session_enter_focuses_preview() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/repo"),
             sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
         }];
@@ -6510,6 +7415,9 @@ mod tests {
         let mut app = empty_test_app();
         app.projects = vec![
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo-a"),
                 sessions: vec![
                     sample_session("/tmp/a1.jsonl", "/repo-a", "a1"),
@@ -6517,6 +7425,9 @@ mod tests {
                 ],
             },
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo-b"),
                 sessions: vec![sample_session("/tmp/b1.jsonl", "/repo-b", "b1")],
             },
@@ -6548,6 +7459,9 @@ mod tests {
         let mut app = empty_test_app();
         app.projects = vec![
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo-a"),
                 sessions: vec![
                     sample_session("/tmp/a1.jsonl", "/repo-a", "a1"),
@@ -6555,10 +7469,16 @@ mod tests {
                 ],
             },
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo-b"),
                 sessions: vec![sample_session("/tmp/b1.jsonl", "/repo-b", "b1")],
             },
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo-c"),
                 sessions: vec![sample_session("/tmp/c1.jsonl", "/repo-c", "c1")],
             },
@@ -6580,7 +7500,8 @@ mod tests {
         assert_eq!(
             shape,
             vec![
-                "g:/".to_string(),
+                "g:local".to_string(),
+                "g:local/".to_string(),
                 "p:0".to_string(),
                 "s:0:0".to_string(),
                 "s:0:1".to_string(),
@@ -6596,6 +7517,9 @@ mod tests {
         let mut app = empty_test_app();
         app.projects = vec![
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo-a"),
                 sessions: vec![
                     sample_session("/tmp/a1.jsonl", "/repo-a", "a1"),
@@ -6603,6 +7527,9 @@ mod tests {
                 ],
             },
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo-b"),
                 sessions: vec![sample_session("/tmp/b1.jsonl", "/repo-b", "b1")],
             },
@@ -6637,13 +7564,16 @@ mod tests {
         }
         assert_eq!(app.project_idx, 0);
         assert_eq!(app.browser_cursor, BrowserCursor::Group);
-        assert_eq!(app.selected_group_path.as_deref(), Some("/"));
+        assert_eq!(app.selected_group_path.as_deref(), Some("local"));
     }
 
     #[test]
     fn right_on_project_row_enters_first_session_when_expanded() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/repo"),
             sessions: vec![
                 sample_session("/tmp/a.jsonl", "/repo", "a"),
@@ -6664,6 +7594,9 @@ mod tests {
     fn left_on_session_row_returns_to_project_row() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/repo"),
             sessions: vec![
                 sample_session("/tmp/a.jsonl", "/repo", "a"),
@@ -6685,6 +7618,9 @@ mod tests {
     fn left_and_right_toggle_project_collapse_state() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/repo"),
             sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
         }];
@@ -6705,14 +7641,23 @@ mod tests {
         let mut app = empty_test_app();
         app.projects = vec![
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo-a"),
                 sessions: vec![sample_session("/tmp/a.jsonl", "/repo-a", "a")],
             },
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo-b"),
                 sessions: vec![sample_session("/tmp/b.jsonl", "/repo-b", "b")],
             },
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo-c"),
                 sessions: vec![sample_session("/tmp/c.jsonl", "/repo-c", "c")],
             },
@@ -6737,10 +7682,16 @@ mod tests {
         let mut app = empty_test_app();
         app.projects = vec![
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo-a"),
                 sessions: vec![sample_session("/tmp/a.jsonl", "/repo-a", "a")],
             },
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo-b"),
                 sessions: vec![sample_session("/tmp/b.jsonl", "/repo-b", "b")],
             },
@@ -6762,14 +7713,23 @@ mod tests {
         let mut app = empty_test_app();
         app.projects = vec![
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo-a"),
                 sessions: vec![sample_session("/tmp/a.jsonl", "/repo-a", "a")],
             },
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo-b"),
                 sessions: vec![sample_session("/tmp/b.jsonl", "/repo-b", "b")],
             },
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo-c"),
                 sessions: vec![sample_session("/tmp/c.jsonl", "/repo-c", "c")],
             },
@@ -6804,6 +7764,9 @@ mod tests {
     fn moving_up_to_project_row_auto_expands_it() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/repo"),
             sessions: vec![
                 sample_session("/tmp/a.jsonl", "/repo", "a"),
@@ -6824,10 +7787,16 @@ mod tests {
         let mut app = empty_test_app();
         app.projects = vec![
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo-a"),
                 sessions: vec![sample_session("/tmp/a.jsonl", "/repo-a", "a")],
             },
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo-b"),
                 sessions: vec![sample_session("/tmp/b.jsonl", "/repo-b", "b")],
             },
@@ -6848,10 +7817,16 @@ mod tests {
         let mut app = empty_test_app();
         app.projects = vec![
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo-a"),
                 sessions: vec![sample_session("/tmp/a.jsonl", "/repo-a", "a")],
             },
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo-b"),
                 sessions: vec![sample_session("/tmp/b.jsonl", "/repo-b", "b")],
             },
@@ -6871,6 +7846,9 @@ mod tests {
     fn mouse_project_toggle_pins_folder_open_and_closed() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/repo"),
             sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
         }];
@@ -6912,6 +7890,9 @@ mod tests {
         app.focus = Focus::Projects;
         app.browser_cursor = BrowserCursor::Session;
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/repo"),
             sessions: vec![
                 sample_session("/tmp/a.jsonl", "/repo", "a"),
@@ -6938,6 +7919,9 @@ mod tests {
         let mut app = empty_test_app();
         app.focus = Focus::Projects;
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/repo"),
             sessions: vec![
                 sample_session("/tmp/a.jsonl", "/repo", "a"),
@@ -6951,6 +7935,8 @@ mod tests {
     #[test]
     fn preview_selected_text_uses_character_bounds() {
         let app = App {
+            config_path: PathBuf::from("/tmp/codex-session-tui.toml"),
+            config: AppConfig::default(),
             sessions_root: PathBuf::from("/tmp"),
             state_db_path: None,
             all_projects: Vec::new(),
@@ -7027,6 +8013,10 @@ mod tests {
     fn session_browser_line_uses_only_short_hash() {
         let s = SessionSummary {
             path: PathBuf::from("/tmp/a.jsonl"),
+            storage_path: path_to_string(Path::new(&PathBuf::from("/tmp/a.jsonl"))),
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             file_name: String::from("rollout-a.jsonl"),
             id: String::from("123456789abcdef"),
             cwd: String::from("/tmp"),
@@ -7045,6 +8035,10 @@ mod tests {
     fn session_browser_line_marks_user_only_sessions() {
         let s = SessionSummary {
             path: PathBuf::from("/tmp/a.jsonl"),
+            storage_path: path_to_string(Path::new(&PathBuf::from("/tmp/a.jsonl"))),
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             file_name: String::from("rollout-a.jsonl"),
             id: String::from("123456789abcdef"),
             cwd: String::from("/tmp"),
@@ -7064,6 +8058,9 @@ mod tests {
     fn preview_session_defers_follow_during_rapid_browser_navigation() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/repo"),
             sessions: vec![
                 sample_session("/tmp/a.jsonl", "/repo", "aaaaaaa"),
@@ -7087,6 +8084,9 @@ mod tests {
     fn pending_search_jump_overrides_browser_preview_debounce() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/repo"),
             sessions: vec![
                 sample_session("/tmp/a.jsonl", "/repo", "aaaaaaa"),
@@ -7112,6 +8112,9 @@ mod tests {
     fn preview_session_follows_selection_after_browser_navigation_settles() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/repo"),
             sessions: vec![
                 sample_session("/tmp/a.jsonl", "/repo", "aaaaaaa"),
@@ -7175,10 +8178,16 @@ mod tests {
     fn project_label_preserves_root_names() {
         let projects = vec![
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/root"),
                 sessions: Vec::new(),
             },
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/"),
                 sessions: Vec::new(),
             },
@@ -7252,6 +8261,10 @@ mod tests {
 
         let session = SessionSummary {
             path: path.clone(),
+            storage_path: path_to_string(Path::new(&path.clone())),
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             file_name: String::from("sample.jsonl"),
             id: String::from("abc"),
             cwd: String::from("/tmp/x"),
@@ -7292,10 +8305,14 @@ mod tests {
         .join("\n");
         fs::write(&path, data).expect("write");
         let s = SessionSummary {
-            path,
+            path: path.clone(),
+            storage_path: path_to_string(&path),
             file_name: String::from("w.jsonl"),
             id: String::from("x"),
             cwd: String::from("/tmp"),
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             started_at: String::from("2026-01-01T00:00:00Z"),
             modified_epoch: 123,
             event_count: 2,
@@ -7330,10 +8347,14 @@ mod tests {
         let path = dir.join("all.jsonl");
         fs::write(&path, content).expect("write");
         let s = SessionSummary {
-            path,
+            path: path.clone(),
+            storage_path: path_to_string(&path),
             file_name: String::from("all.jsonl"),
             id: String::from("x"),
             cwd: String::from("/tmp"),
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             started_at: String::from("2026-01-01T00:00:00Z"),
             modified_epoch: 123,
             event_count: 141,
@@ -7358,6 +8379,10 @@ mod tests {
         };
         let s = SessionSummary {
             path: PathBuf::from("/tmp/fold.jsonl"),
+            storage_path: path_to_string(Path::new(&PathBuf::from("/tmp/fold.jsonl"))),
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             file_name: String::from("fold.jsonl"),
             id: String::from("x"),
             cwd: String::from("/tmp"),
@@ -7401,6 +8426,10 @@ mod tests {
         };
         let s = SessionSummary {
             path: PathBuf::from("/tmp/c.jsonl"),
+            storage_path: path_to_string(Path::new(&PathBuf::from("/tmp/c.jsonl"))),
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             file_name: String::from("c.jsonl"),
             id: String::from("x"),
             cwd: String::from("/tmp"),
@@ -7454,6 +8483,10 @@ mod tests {
         };
         let s = SessionSummary {
             path: PathBuf::from("/tmp/sep.jsonl"),
+            storage_path: path_to_string(Path::new(&PathBuf::from("/tmp/sep.jsonl"))),
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             file_name: String::from("sep.jsonl"),
             id: String::from("x"),
             cwd: String::from("/tmp"),
@@ -7473,6 +8506,10 @@ mod tests {
     fn apply_search_filter_reduces_to_matching_sessions() {
         let s1 = SessionSummary {
             path: PathBuf::from("/tmp/a.jsonl"),
+            storage_path: path_to_string(Path::new(&PathBuf::from("/tmp/a.jsonl"))),
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             file_name: String::from("a.jsonl"),
             id: String::from("a"),
             cwd: String::from("/repo/a"),
@@ -7485,6 +8522,10 @@ mod tests {
         };
         let s2 = SessionSummary {
             path: PathBuf::from("/tmp/b.jsonl"),
+            storage_path: path_to_string(Path::new(&PathBuf::from("/tmp/b.jsonl"))),
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             file_name: String::from("b.jsonl"),
             id: String::from("b"),
             cwd: String::from("/repo/b"),
@@ -7497,14 +8538,22 @@ mod tests {
         };
 
         let mut app = App {
+            config_path: PathBuf::from("/tmp/codex-session-tui.toml"),
+            config: AppConfig::default(),
             sessions_root: PathBuf::from("/tmp"),
             state_db_path: None,
             all_projects: vec![
                 ProjectBucket {
+                    machine_name: String::from("local"),
+                    machine_target: None,
+                    machine_codex_home: None,
                     cwd: String::from("/repo/a"),
                     sessions: vec![s1],
                 },
                 ProjectBucket {
+                    machine_name: String::from("local"),
+                    machine_target: None,
+                    machine_codex_home: None,
                     cwd: String::from("/repo/b"),
                     sessions: vec![s2],
                 },
@@ -7575,6 +8624,10 @@ mod tests {
     fn apply_search_filter_orders_by_best_session_match_not_project_match_count() {
         let exact = SessionSummary {
             path: PathBuf::from("/tmp/exact.jsonl"),
+            storage_path: path_to_string(Path::new(&PathBuf::from("/tmp/exact.jsonl"))),
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             file_name: String::from("exact.jsonl"),
             id: String::from("exact"),
             cwd: String::from("/repo/exact"),
@@ -7587,6 +8640,10 @@ mod tests {
         };
         let weak1 = SessionSummary {
             path: PathBuf::from("/tmp/weak1.jsonl"),
+            storage_path: path_to_string(Path::new(&PathBuf::from("/tmp/weak1.jsonl"))),
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             file_name: String::from("weak1.jsonl"),
             id: String::from("weak1"),
             cwd: String::from("/repo/weak"),
@@ -7599,6 +8656,10 @@ mod tests {
         };
         let weak2 = SessionSummary {
             path: PathBuf::from("/tmp/weak2.jsonl"),
+            storage_path: path_to_string(Path::new(&PathBuf::from("/tmp/weak2.jsonl"))),
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             file_name: String::from("weak2.jsonl"),
             id: String::from("weak2"),
             cwd: String::from("/repo/weak"),
@@ -7613,10 +8674,16 @@ mod tests {
         let mut app = empty_test_app();
         app.all_projects = vec![
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo/weak"),
                 sessions: vec![weak1, weak2],
             },
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo/exact"),
                 sessions: vec![exact],
             },
@@ -7638,10 +8705,16 @@ mod tests {
         let mut app = empty_test_app();
         app.all_projects = vec![
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo/a"),
                 sessions: vec![sample_session("/tmp/a.jsonl", "/repo/a", "a")],
             },
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo/b"),
                 sessions: vec![sample_session("/tmp/b.jsonl", "/repo/b", "b")],
             },
@@ -7829,6 +8902,9 @@ mod tests {
         let mut app = empty_test_app();
         app.projects = vec![
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo-a"),
                 sessions: vec![
                     sample_session("/tmp/a1.jsonl", "/repo-a", "a1"),
@@ -7836,6 +8912,9 @@ mod tests {
                 ],
             },
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/repo-b"),
                 sessions: vec![sample_session("/tmp/b1.jsonl", "/repo-b", "b1")],
             },
@@ -7848,12 +8927,16 @@ mod tests {
         };
 
         let rows = app.browser_rows();
-        let target = rows[2].clone();
+        let target = rows
+            .iter()
+            .find(|row| matches!(row.kind, BrowserRowKind::Session { .. }))
+            .cloned()
+            .expect("session row");
         handle_mouse_event(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: 3,
-                row: 3,
+                row: 4,
                 modifiers: KeyModifiers::NONE,
             },
             &mut app,
@@ -7932,9 +9015,16 @@ mod tests {
 
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/tmp/x"),
             sessions: vec![SessionSummary {
                 path: path.clone(),
+                storage_path: path_to_string(Path::new(&path.clone())),
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 file_name: String::from("sample.jsonl"),
                 id: String::from("abcdef1"),
                 cwd: String::from("/tmp/x"),
@@ -8010,6 +9100,10 @@ mod tests {
 
         let session = SessionSummary {
             path: path.clone(),
+            storage_path: path_to_string(Path::new(&path.clone())),
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             file_name: String::from("sample.jsonl"),
             id: String::from("abcdef123456"),
             cwd: String::from("/tmp/x"),
@@ -8022,6 +9116,9 @@ mod tests {
         };
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/tmp/x"),
             sessions: vec![session],
         }];
@@ -8063,6 +9160,10 @@ mod tests {
 
         let session = SessionSummary {
             path: path.clone(),
+            storage_path: path_to_string(Path::new(&path.clone())),
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             file_name: String::from("sample.jsonl"),
             id: String::from("abcdef123456"),
             cwd: String::from("/tmp/x"),
@@ -8075,6 +9176,9 @@ mod tests {
         };
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/tmp/x"),
             sessions: vec![session],
         }];
@@ -8110,6 +9214,9 @@ mod tests {
     fn render_preview_shows_no_session_selected_on_project_row() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/repo"),
             sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
         }];
@@ -8152,6 +9259,8 @@ mod tests {
     #[test]
     fn preview_toggle_all_folds_collapses_and_expands() {
         let mut app = App {
+            config_path: PathBuf::from("/tmp/codex-session-tui.toml"),
+            config: AppConfig::default(),
             sessions_root: PathBuf::from("/tmp"),
             state_db_path: None,
             all_projects: Vec::new(),
@@ -8221,18 +9330,83 @@ mod tests {
     }
 
     #[test]
+    fn parse_config_machine_input_accepts_default_and_custom_codex_home() {
+        let plain = parse_config_machine_input("pi=pi@192.168.0.12").expect("plain");
+        assert_eq!(plain.name, "pi");
+        assert_eq!(plain.ssh_target, "pi@192.168.0.12");
+        assert_eq!(plain.codex_home, None);
+
+        let custom = parse_config_machine_input("lab=pi@192.168.0.13:/home/pi/custom-codex")
+            .expect("custom");
+        assert_eq!(custom.name, "lab");
+        assert_eq!(custom.ssh_target, "pi@192.168.0.13");
+        assert_eq!(custom.codex_home.as_deref(), Some("/home/pi/custom-codex"));
+    }
+
+    #[test]
+    fn collapse_all_projects_expands_first_machine_and_first_folder() {
+        let mut app = empty_test_app();
+        app.projects = vec![
+            ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
+                cwd: String::from("/repo/a"),
+                sessions: vec![sample_session("/tmp/a.jsonl", "/repo/a", "a")],
+            },
+            ProjectBucket {
+                machine_name: String::from("pi"),
+                machine_target: Some(String::from("pi@192.168.0.20")),
+                machine_codex_home: Some(String::from("/home/pi/.codex")),
+                cwd: String::from("/remote/repo"),
+                sessions: vec![sample_session("/tmp/b.jsonl", "/remote/repo", "b")],
+            },
+        ];
+
+        app.collapse_all_projects();
+
+        assert!(!app.collapsed_groups.contains("local"));
+        assert!(!app.collapsed_groups.contains("local/"));
+        assert!(app.collapsed_groups.contains("pi"));
+    }
+
+    #[test]
+    fn resolve_machine_target_supports_machine_prefixed_paths() {
+        let mut app = empty_test_app();
+        app.config.machines.push(ConfigMachine {
+            name: String::from("pi"),
+            ssh_target: String::from("pi@192.168.0.20"),
+            codex_home: Some(String::from("/home/pi/.codex")),
+        });
+
+        let target = app.resolve_machine_target("pi:/work/repo").expect("target");
+        assert_eq!(target.name, "pi");
+        assert_eq!(target.ssh_target.as_deref(), Some("pi@192.168.0.20"));
+        assert_eq!(target.cwd, "/work/repo");
+    }
+
+    #[test]
     fn browser_tree_groups_common_parent_segments() {
         let mut app = empty_test_app();
         app.projects = vec![
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/root/git/this"),
                 sessions: vec![sample_session("/tmp/this.jsonl", "/root/git/this", "this")],
             },
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/root/git/that"),
                 sessions: vec![sample_session("/tmp/that.jsonl", "/root/git/that", "that")],
             },
             ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
                 cwd: String::from("/root/misc"),
                 sessions: vec![sample_session("/tmp/misc.jsonl", "/root/misc", "misc")],
             },
@@ -8248,13 +9422,19 @@ mod tests {
             .map(|row| row.label)
             .collect::<Vec<_>>();
 
-        assert_eq!(labels, vec!["/root", "git", "that", "this", "misc"]);
+        assert_eq!(
+            labels,
+            vec!["local", "/root", "git", "that", "this", "misc"]
+        );
     }
 
     #[test]
     fn browser_tree_shows_sessions_under_project_leaf_only() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/root/git/this"),
             sessions: vec![sample_session(
                 "/tmp/this.jsonl",
@@ -8266,8 +9446,8 @@ mod tests {
         app.collapsed_groups.clear();
 
         let rows = app.browser_render_rows();
-        assert_eq!(rows[0].label, "/root");
-        assert_eq!(rows[1].label, "git/this");
+        assert_eq!(rows[0].label, "local");
+        assert_eq!(rows[1].label, "/root/git/this");
         assert_eq!(rows[2].label, "f012345");
     }
 
@@ -8360,6 +9540,10 @@ mod tests {
 
         let session = SessionSummary {
             path: path.clone(),
+            storage_path: path_to_string(Path::new(&path.clone())),
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             file_name: String::from("sample.jsonl"),
             id: String::from("abcdef1234567890"),
             cwd: String::from("/tmp/x"),
@@ -8372,6 +9556,9 @@ mod tests {
         };
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/tmp/x"),
             sessions: vec![session],
         }];
@@ -8401,6 +9588,9 @@ mod tests {
     fn codex_launch_spec_uses_current_session_id_and_cwd() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
             cwd: String::from("/tmp/work"),
             sessions: vec![sample_session("/tmp/a.jsonl", "/tmp/work", "abcdef123456")],
         }];

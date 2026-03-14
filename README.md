@@ -60,6 +60,7 @@ On launch:
 
 - the left pane shows a grouped folder tree
 - all folders start collapsed
+- the first machine root and its first folder are expanded so you land in a useful starting view
 - selecting a session opens the preview at the end of the conversation so you see the latest exchange first
 
 ## Core Navigation
@@ -67,10 +68,12 @@ On launch:
 Browser:
 
 - `Up` / `Down`: move through visible rows
+- top-level rows are machines: `local` plus any configured SSH remotes
 - grouped folders compress single-child path chains in a GitHub-style tree
 - `Right`: expand a folder or enter its sessions
 - `Left`: collapse a folder or return from a session to its folder row
 - `Enter`: expand/collapse folder or open the selected session
+- `R`: add or update a remote machine in the config
 - `F5` / `Ctrl+R`: refresh the session tree
 - `Ctrl+Up` / `Ctrl+Down`: jump between projects
 - `Ctrl+Left`: collapse all folders except the current one
@@ -128,6 +131,13 @@ On a session, you can:
 
 Project-level operations are also available for folder-wide rename/copy workflows.
 
+Cross-machine targets:
+
+- move, copy, fork, and folder-wide copy/rename accept either a plain local path or a machine-qualified target
+- local target example: `/home/me/work/repo`
+- remote target example: `pi:/home/pi/work/repo`
+- browser copy/cut/paste also works across machines when the target folder is on another configured machine
+
 User-only sessions:
 
 - sessions with user messages but no assistant reply are marked with `!` in the Browser
@@ -143,6 +153,31 @@ SSH export behavior:
 - export refuses to overwrite an existing remote rollout file with the same name
 
 These operations exist for the main recovery use case: sessions whose original project path no longer matches where your repository lives now.
+
+## Remote Machines
+
+Configured remotes are loaded from either:
+
+- `.codex-session-tui.toml` in the current working directory
+- `~/.config/codex-session-tui.toml`
+
+You can add a machine from inside the TUI with `R`.
+
+Input forms:
+
+- `name=user@host`
+- `name=user@host:/absolute/path/to/.codex`
+
+Config shape:
+
+```toml
+[[machines]]
+name = "pi"
+ssh_target = "pi@192.168.0.124"
+codex_home = "/home/pi/.codex"
+```
+
+If `codex_home` is omitted, the remote defaults to `~/.codex`.
 
 Path rewrite behavior:
 
