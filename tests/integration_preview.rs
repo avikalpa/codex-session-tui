@@ -24,6 +24,7 @@ fn integration_preview_chat_mode_contains_turn_labels() {
         machine_name: "local".to_string(),
         machine_target: None,
         machine_codex_home: None,
+        machine_exec_prefix: None,
         started_at: "2026-01-01T00:00:00Z".to_string(),
         modified_epoch: 123,
         event_count: 3,

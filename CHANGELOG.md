@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.3.0 - 2026-03-14
+
+### Added
+- Added remote machine health indicators in the Browser root rows: `[ok]`, `[cached]`, and `[offline]`.
+- Added support for nested remote execution with `exec_prefix`, so machines like `ssh root@host` followed by `lxc-attach -n dev --` can be scanned and operated on directly.
+- Added config/input support for `name=user@host|exec-prefix` and `name=user@host|exec-prefix|/absolute/path/to/.codex`.
+
+### Changed
+- Remote scans now fail fast instead of blocking on interactive SSH prompts during browser refresh.
+- Remote project scans are now cached briefly and reused across non-forced reloads for better responsiveness on multi-machine setups.
+- `F5`, `Ctrl+R`, and `g` now force a fresh remote scan instead of reusing cached remote state.
+
+### Fixed
+- Fixed the remote-connect crash path by making remote discovery resilient to unreachable or auth-blocked machines.
+- Fixed remote preview/open/rewrite flows so they honor the configured nested execution prefix instead of assuming plain `ssh host`.
+
 ## 1.2.0 - 2026-03-14
 
 ### Added
