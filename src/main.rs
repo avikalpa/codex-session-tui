@@ -806,7 +806,9 @@ fn handle_input_mode(key: KeyEvent, app: &mut App) -> Result<()> {
         }
         KeyCode::Enter => {
             app.clear_input_completion_cycle();
-            app.submit_input()?;
+            if let Err(err) = app.submit_input() {
+                app.status = format!("{err:#}");
+            }
         }
         KeyCode::Tab => {
             if app.input_focused && !key.modifiers.intersects(disallowed_mods) {
@@ -2717,7 +2719,7 @@ impl App {
                 targets.len()
             ),
             Action::AddRemote => String::from(
-                "Add remote: enter name=user@host, name=user@host:/remote/.codex, or name=user@host|exec-prefix|/remote/.codex and press Enter",
+                "Add remote: enter user@host, name=user@host, name=user@host:/remote/.codex, or name=user@host|exec-prefix|/remote/.codex and press Enter",
             ),
         };
     }
@@ -6607,26 +6609,48 @@ fn save_app_config(path: &Path, config: &AppConfig) -> Result<()> {
     atomic_write(path, &body)
 }
 
+fn infer_machine_name_from_ssh_target(target: &str) -> String {
+    let trimmed = target.trim();
+    let host_part = trimmed
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(trimmed);
+    host_part
+        .split(':')
+        .next()
+        .unwrap_or(host_part)
+        .trim()
+        .to_string()
+}
+
 fn parse_config_machine_input(input: &str) -> Result<ConfigMachine> {
     let trimmed = input.trim();
-    let Some((name, rest)) = trimmed.split_once('=') else {
-        return Err(anyhow!(
-            "remote must look like name=user@host, name=user@host:/remote/.codex, or name=user@host|exec-prefix|/remote/.codex"
-        ));
+    let (name, rest) = if let Some((name, rest)) = trimmed.split_once('=') {
+        let name = name.trim();
+        let rest = rest.trim();
+        if name.is_empty() || rest.is_empty() {
+            return Err(anyhow!(
+                "remote must look like user@host, name=user@host, name=user@host:/remote/.codex, or name=user@host|exec-prefix|/remote/.codex"
+            ));
+        }
+        (name.to_string(), rest.to_string())
+    } else {
+        if trimmed.is_empty() {
+            return Err(anyhow!(
+                "remote must look like user@host, name=user@host, name=user@host:/remote/.codex, or name=user@host|exec-prefix|/remote/.codex"
+            ));
+        }
+        (
+            infer_machine_name_from_ssh_target(trimmed),
+            trimmed.to_string(),
+        )
     };
-    let name = name.trim();
-    let rest = rest.trim();
-    if name.is_empty() || rest.is_empty() {
-        return Err(anyhow!(
-            "remote must look like name=user@host, name=user@host:/remote/.codex, or name=user@host|exec-prefix|/remote/.codex"
-        ));
-    }
 
     if rest.contains('|') {
         let parts = rest.split('|').map(str::trim).collect::<Vec<_>>();
         if !(2..=3).contains(&parts.len()) {
             return Err(anyhow!(
-                "remote with container/command prefix must look like name=user@host|exec-prefix or name=user@host|exec-prefix|/remote/.codex"
+                "remote with container/command prefix must look like user@host|exec-prefix, name=user@host|exec-prefix, or name=user@host|exec-prefix|/remote/.codex"
             ));
         }
         let ssh_target = parts[0];
@@ -6644,7 +6668,7 @@ fn parse_config_machine_input(input: &str) -> Result<ConfigMachine> {
             return Err(anyhow!("remote codex home must be an absolute path"));
         }
         return Ok(ConfigMachine {
-            name: name.to_string(),
+            name,
             ssh_target: ssh_target.to_string(),
             exec_prefix: Some(exec_prefix.to_string()),
             codex_home: codex_home.map(str::to_string),
@@ -6656,14 +6680,14 @@ fn parse_config_machine_input(input: &str) -> Result<ConfigMachine> {
     {
         let codex_home = format!("/{}", codex_home);
         return Ok(ConfigMachine {
-            name: name.to_string(),
+            name,
             ssh_target: ssh_target.trim().to_string(),
             exec_prefix: None,
             codex_home: Some(codex_home),
         });
     }
     Ok(ConfigMachine {
-        name: name.to_string(),
+        name,
         ssh_target: rest.to_string(),
         codex_home: None,
         exec_prefix: None,
@@ -9726,6 +9750,12 @@ mod tests {
 
     #[test]
     fn parse_config_machine_input_accepts_default_and_custom_codex_home() {
+        let bare = parse_config_machine_input("pi@192.168.0.12").expect("bare");
+        assert_eq!(bare.name, "192.168.0.12");
+        assert_eq!(bare.ssh_target, "pi@192.168.0.12");
+        assert_eq!(bare.codex_home, None);
+        assert_eq!(bare.exec_prefix, None);
+
         let plain = parse_config_machine_input("pi=pi@192.168.0.12").expect("plain");
         assert_eq!(plain.name, "pi");
         assert_eq!(plain.ssh_target, "pi@192.168.0.12");
@@ -9756,6 +9786,19 @@ mod tests {
         let wrapped = wrap_remote_exec(Some("lxc-attach -n dev --"), "python3 - /root/.codex");
         assert!(wrapped.contains("lxc-attach -n dev -- sh -lc"));
         assert!(wrapped.contains("python3 - /root/.codex"));
+    }
+
+    #[test]
+    fn handle_input_mode_enter_keeps_tui_alive_on_invalid_remote_input() {
+        let mut app = empty_test_app();
+        app.start_action(Action::AddRemote);
+        app.input = String::from("bad=|");
+
+        handle_input_mode(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app)
+            .expect("input handling");
+
+        assert_eq!(app.mode, Mode::Input);
+        assert!(app.status.contains("remote"));
     }
 
     #[test]

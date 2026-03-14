@@ -166,10 +166,14 @@ You can add a machine from inside the TUI with `R`.
 
 Input forms:
 
+- `user@host`
 - `name=user@host`
 - `name=user@host:/absolute/path/to/.codex`
 - `name=user@host|exec-prefix`
 - `name=user@host|exec-prefix|/absolute/path/to/.codex`
+
+If you omit `name=`, the machine name is derived from the SSH host part.
+Example: `pi@192.168.0.124` becomes machine name `192.168.0.124`.
 
 Config shape:
 
