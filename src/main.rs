@@ -1465,9 +1465,18 @@ impl App {
         self.browser_render_rows()
     }
 
+    fn browser_machine_roots(&self) -> Vec<String> {
+        let mut roots = vec![String::from("local")];
+        roots.extend(self.config.machines.iter().map(|m| m.name.clone()));
+        roots.sort();
+        roots.dedup();
+        roots
+    }
+
     fn browser_render_rows(&self) -> Vec<BrowserRow> {
         build_browser_rows(
             &self.projects,
+            &self.browser_machine_roots(),
             &self.collapsed_groups,
             &self.collapsed_projects,
             &self.selected_sessions,
@@ -1677,8 +1686,13 @@ impl App {
         self.collapsed_groups = default_collapsed_group_paths(&self.projects);
         self.expand_initial_browser_groups();
         self.pinned_open_projects.clear();
-        self.browser_cursor = BrowserCursor::Project;
-        self.selected_group_path = None;
+        if let Some(first_root) = self.browser_machine_roots().first().cloned() {
+            self.browser_cursor = BrowserCursor::Group;
+            self.selected_group_path = Some(first_root);
+        } else {
+            self.browser_cursor = BrowserCursor::Project;
+            self.selected_group_path = None;
+        }
         self.project_scroll = 0;
         self.session_scroll = 0;
         self.preview_scroll = 0;
@@ -4555,11 +4569,12 @@ struct BrowserTreeNode {
 
 fn build_browser_rows(
     projects: &[ProjectBucket],
+    machine_roots: &[String],
     collapsed_groups: &HashSet<String>,
     collapsed_projects: &HashSet<String>,
     _selected_sessions: &HashSet<PathBuf>,
 ) -> Vec<BrowserRow> {
-    let tree = build_browser_tree(projects);
+    let tree = build_browser_tree(projects, machine_roots);
     let mut rows = Vec::new();
     for node in tree.values() {
         append_browser_rows(
@@ -4574,8 +4589,18 @@ fn build_browser_rows(
     rows
 }
 
-fn build_browser_tree(projects: &[ProjectBucket]) -> BTreeMap<String, BrowserTreeNode> {
+fn build_browser_tree(
+    projects: &[ProjectBucket],
+    machine_roots: &[String],
+) -> BTreeMap<String, BrowserTreeNode> {
     let mut roots = BTreeMap::<String, BrowserTreeNode>::new();
+    for root_name in machine_roots {
+        roots.entry(root_name.clone()).or_insert_with(|| BrowserTreeNode {
+            name: root_name.clone(),
+            full_path: root_name.clone(),
+            ..BrowserTreeNode::default()
+        });
+    }
     for (project_idx, project) in projects.iter().enumerate() {
         let segments = browser_tree_segments_for_project(project);
         let Some((root_name, rest)) = segments.split_first() else {
@@ -4702,6 +4727,15 @@ fn append_browser_rows(
 }
 
 fn browser_tree_segments(cwd: &str) -> Vec<String> {
+    let normalized = if cwd == "/" {
+        String::from("/")
+    } else if cwd.starts_with('/') {
+        format!("/{}", cwd.trim_start_matches('/'))
+    } else {
+        cwd.to_string()
+    };
+    let cwd = normalized.as_str();
+
     if cwd == "/" {
         return vec![String::from("/")];
     }
@@ -4731,7 +4765,11 @@ fn browser_tree_segments_for_project(project: &ProjectBucket) -> Vec<String> {
 
 fn default_collapsed_group_paths(projects: &[ProjectBucket]) -> HashSet<String> {
     let mut collapsed = HashSet::new();
-    for node in build_browser_tree(projects).values() {
+    let mut machine_roots = vec![String::from("local")];
+    machine_roots.extend(projects.iter().map(|p| p.machine_name.clone()));
+    machine_roots.sort();
+    machine_roots.dedup();
+    for node in build_browser_tree(projects, &machine_roots).values() {
         collect_group_paths(node, &mut collapsed);
     }
     collapsed
@@ -6696,6 +6734,12 @@ fn parse_config_machine_input(input: &str) -> Result<ConfigMachine> {
 
 fn upsert_config_machine(config: &mut AppConfig, machine: ConfigMachine) {
     if let Some(existing) = config.machines.iter_mut().find(|m| m.name == machine.name) {
+        *existing = machine;
+    } else if let Some(existing) = config.machines.iter_mut().find(|m| {
+        m.ssh_target == machine.ssh_target
+            && m.exec_prefix == machine.exec_prefix
+            && m.codex_home == machine.codex_home
+    }) {
         *existing = machine;
     } else {
         config.machines.push(machine);
@@ -9132,7 +9176,8 @@ mod tests {
 
         app.apply_search_filter();
 
-        assert_eq!(app.browser_cursor, BrowserCursor::Project);
+        assert_eq!(app.browser_cursor, BrowserCursor::Group);
+        assert_eq!(app.selected_group_path.as_deref(), Some("local"));
         assert!(app.collapsed_projects.contains("/repo/a"));
         assert!(app.collapsed_projects.contains("/repo/b"));
         assert!(app.pinned_open_projects.is_empty());
@@ -9789,6 +9834,30 @@ mod tests {
     }
 
     #[test]
+    fn upsert_config_machine_renames_existing_endpoint() {
+        let mut config = AppConfig {
+            machines: vec![ConfigMachine {
+                name: String::from("old"),
+                ssh_target: String::from("root@example-host"),
+                exec_prefix: Some(String::from("lxc-attach -n dev --")),
+                codex_home: Some(String::from("/root/.codex")),
+            }],
+        };
+        upsert_config_machine(
+            &mut config,
+            ConfigMachine {
+                name: String::from("dev"),
+                ssh_target: String::from("root@example-host"),
+                exec_prefix: Some(String::from("lxc-attach -n dev --")),
+                codex_home: Some(String::from("/root/.codex")),
+            },
+        );
+
+        assert_eq!(config.machines.len(), 1);
+        assert_eq!(config.machines[0].name, "dev");
+    }
+
+    #[test]
     fn handle_input_mode_enter_keeps_tui_alive_on_invalid_remote_input() {
         let mut app = empty_test_app();
         app.start_action(Action::AddRemote);
@@ -9835,8 +9904,40 @@ mod tests {
     }
 
     #[test]
+    fn browser_rows_include_configured_remote_without_projects() {
+        let mut app = empty_test_app();
+        app.config.machines.push(ConfigMachine {
+            name: String::from("dev"),
+            ssh_target: String::from("root@example-host"),
+            exec_prefix: Some(String::from("lxc-attach -n dev --")),
+            codex_home: Some(String::from("/root/.codex")),
+        });
+
+        let labels = app
+            .browser_render_rows()
+            .into_iter()
+            .map(|row| row.label)
+            .collect::<Vec<_>>();
+        assert!(labels.contains(&String::from("dev")));
+    }
+
+    #[test]
+    fn browser_tree_segments_normalize_double_leading_slash() {
+        assert_eq!(
+            browser_tree_segments("//home/pi"),
+            vec![String::from("/"), String::from("home"), String::from("pi")]
+        );
+    }
+
+    #[test]
     fn collapse_all_projects_expands_first_machine_and_first_folder() {
         let mut app = empty_test_app();
+        app.config.machines.push(ConfigMachine {
+            name: String::from("pi"),
+            ssh_target: String::from("pi@192.168.0.20"),
+            exec_prefix: None,
+            codex_home: Some(String::from("/home/pi/.codex")),
+        });
         app.projects = vec![
             ProjectBucket {
                 machine_name: String::from("local"),
@@ -9858,6 +9959,8 @@ mod tests {
 
         app.collapse_all_projects();
 
+        assert_eq!(app.browser_cursor, BrowserCursor::Group);
+        assert_eq!(app.selected_group_path.as_deref(), Some("local"));
         assert!(!app.collapsed_groups.contains("local"));
         assert!(!app.collapsed_groups.contains("local/"));
         assert!(app.collapsed_groups.contains("pi"));

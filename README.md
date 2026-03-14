@@ -175,6 +175,21 @@ Input forms:
 If you omit `name=`, the machine name is derived from the SSH host part.
 Example: `pi@192.168.0.124` becomes machine name `192.168.0.124`.
 
+Concrete examples:
+
+```text
+pi@192.168.0.124
+192.168.0.124=pi@192.168.0.124
+pi=pi@192.168.0.124:/home/pi/.codex
+root@example-host|lxc-attach -n dev --|/root/.codex
+dev=root@example-host|lxc-attach -n dev --|/root/.codex
+```
+
+Renaming a machine:
+
+- use `R` again with the same SSH target / `exec_prefix` / `codex_home` but a new `name=...`
+- the existing machine entry is updated in place instead of creating a duplicate
+
 Config shape:
 
 ```toml

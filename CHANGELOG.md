@@ -6,6 +6,12 @@
 - Fixed the `Connect Remote` input flow so bare `user@host` entries no longer terminate the TUI.
 - Added shorthand remote parsing for `user@host`, deriving the machine name from the SSH host when `name=` is omitted.
 - Kept invalid remote input inside the prompt and surfaced the validation error in the status bar instead of exiting the app.
+- Fixed configured remote machines not appearing in the Browser until they already had discovered session projects.
+- Fixed startup browser selection so the first machine root stays in view instead of starting one row below it.
+- Fixed browser path rendering to normalize accidental double-leading-slash paths such as `//home/pi`.
+
+### Changed
+- Reusing `R` with the same remote endpoint but a different `name=` now renames the existing machine entry instead of creating a duplicate.
 
 ## 1.3.0 - 2026-03-14
 
