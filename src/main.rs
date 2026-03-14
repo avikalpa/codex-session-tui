@@ -541,6 +541,10 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
                 app.paste_browser_clipboard()?;
                 return Ok(false);
             }
+            KeyCode::Char('r') => {
+                app.reload()?;
+                return Ok(false);
+            }
             _ => {}
         }
     }
@@ -637,7 +641,7 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
                 }
             }
         }
-        KeyCode::Char('g') => app.reload()?,
+        KeyCode::Char('g') | KeyCode::F(5) => app.reload()?,
         KeyCode::Char('m') => {
             if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Project {
                 app.start_action(Action::ProjectRename);
@@ -954,6 +958,8 @@ impl App {
     fn load() -> Result<Self> {
         let codex_home = resolve_codex_home()?;
         let sessions_root = codex_home.join("sessions");
+        let cwd_base = env::current_dir().context("failed to resolve current directory")?;
+        let repaired_count = repair_session_cwds(&sessions_root, &cwd_base)?;
 
         let mut app = Self {
             sessions_root,
@@ -1004,6 +1010,13 @@ impl App {
         };
 
         app.reload()?;
+        if repaired_count > 0 {
+            app.status = format!(
+                "Loaded {} projects and repaired {} session file(s)",
+                app.projects.len(),
+                repaired_count
+            );
+        }
         Ok(app)
     }
 
@@ -1365,6 +1378,7 @@ impl App {
 
         let query = self.search_query.to_lowercase();
         let mut filtered = Vec::new();
+        let mut total_matches = 0usize;
 
         for project in &self.all_projects {
             let mut scored: Vec<(i64, SessionSummary)> = Vec::new();
@@ -1381,24 +1395,24 @@ impl App {
             }
 
             if !scored.is_empty() {
+                total_matches += scored.len();
                 scored.sort_by(|a, b| {
                     b.0.cmp(&a.0)
                         .then_with(|| b.1.started_at.cmp(&a.1.started_at))
                 });
-                filtered.push(ProjectBucket {
-                    cwd: project.cwd.clone(),
-                    sessions: scored.into_iter().map(|(_, s)| s).collect(),
-                });
+                let best_score = scored.first().map(|(score, _)| *score).unwrap_or(i64::MIN);
+                filtered.push((
+                    best_score,
+                    ProjectBucket {
+                        cwd: project.cwd.clone(),
+                        sessions: scored.into_iter().map(|(_, s)| s).collect(),
+                    },
+                ));
             }
         }
 
-        filtered.sort_by(|a, b| {
-            b.sessions
-                .len()
-                .cmp(&a.sessions.len())
-                .then_with(|| a.cwd.cmp(&b.cwd))
-        });
-        self.projects = filtered;
+        filtered.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cwd.cmp(&b.1.cwd)));
+        self.projects = filtered.into_iter().map(|(_, project)| project).collect();
         self.project_idx = 0;
         self.session_idx = 0;
         self.browser_cursor = BrowserCursor::Project;
@@ -1420,8 +1434,9 @@ impl App {
         self.note_browser_navigation();
         self.ensure_selection_visible();
         self.status = format!(
-            "Search '{}' matched {} projects",
+            "Search '{}' matched {} session(s) in {} project(s)",
             self.search_query,
+            total_matches,
             self.projects.len()
         );
         self.search_dirty = false;
@@ -2120,19 +2135,19 @@ impl App {
             self.status = String::from("No applicable sessions for this action");
             return Ok(());
         }
-        let target_str = if action == Action::Delete {
-            if !delete_confirmation_valid(&self.input) {
-                self.status = String::from("Delete cancelled: type DELETE to confirm");
-                return Ok(());
+        let target_str = match action {
+            Action::Delete => {
+                if !delete_confirmation_valid(&self.input) {
+                    self.status = String::from("Delete cancelled: type DELETE to confirm");
+                    return Ok(());
+                }
+                String::new()
             }
-            String::new()
-        } else {
-            let target = expand_tilde(self.input.trim());
-            if target.as_os_str().is_empty() {
-                self.status = String::from("Target path is empty");
-                return Ok(());
-            }
-            target.to_string_lossy().to_string()
+            Action::Export => self.input.trim().to_string(),
+            _ => normalize_local_target_cwd(
+                &self.input,
+                &env::current_dir().context("failed to resolve current directory")?,
+            )?,
         };
         let mut ok = 0usize;
         let mut skipped = 0usize;
@@ -2846,7 +2861,7 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
     } else if app.search_focused {
         Line::from(vec![
             Span::styled("type", Style::default().fg(Color::Cyan)),
-            Span::raw(" filter  "),
+            Span::raw(" text/path/hash  "),
             Span::styled("enter", Style::default().fg(Color::Green)),
             Span::raw(" keep results  "),
             Span::styled("esc", Style::default().fg(Color::Red)),
@@ -2902,6 +2917,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" copy folder sessions  "),
             Span::styled("/", Style::default().fg(Color::Cyan)),
             Span::raw(" search  "),
+            Span::styled("f5/ctrl+r", Style::default().fg(Color::Yellow)),
+            Span::raw(" refresh  "),
             Span::styled("q", Style::default().fg(Color::Red)),
             Span::raw(" quit"),
         ])
@@ -2937,7 +2954,9 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::styled("e", Style::default().fg(Color::Green)),
             Span::raw(" export ssh  "),
             Span::styled("/", Style::default().fg(Color::Cyan)),
-            Span::raw(" search"),
+            Span::raw(" search  "),
+            Span::styled("f5/ctrl+r", Style::default().fg(Color::Yellow)),
+            Span::raw(" refresh"),
         ])
     } else {
         Line::from(vec![
@@ -2959,18 +2978,24 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" move/copy/fork/delete  "),
             Span::styled("e", Style::default().fg(Color::Green)),
             Span::raw(" export ssh  "),
-            Span::styled("g", Style::default().fg(Color::Yellow)),
+            Span::styled("g/f5/ctrl+r", Style::default().fg(Color::Yellow)),
             Span::raw(" refresh  "),
             Span::styled("q", Style::default().fg(Color::Red)),
             Span::raw(" quit"),
         ])
     };
+    let matched_sessions = app
+        .projects
+        .iter()
+        .map(|project| project.sessions.len())
+        .sum::<usize>();
     let search_meta = if app.search_query.trim().is_empty() {
         String::from("search: <none>")
     } else {
         format!(
-            "search: '{}' ({} projects, {} focus)",
+            "search: '{}' ({} sessions, {} projects, {} focus)",
             app.search_query,
+            matched_sessions,
             app.projects.len(),
             if app.search_focused { "active" } else { "kept" }
         )
@@ -3460,11 +3485,46 @@ fn render_markdown_lines(text: &str, width: usize) -> Vec<String> {
 }
 
 fn search_tokens(query: &str) -> Vec<String> {
-    query
-        .split_whitespace()
-        .map(|s| s.trim().to_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect()
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+
+    for ch in query.chars() {
+        match ch {
+            '"' => {
+                if in_quotes {
+                    let token = current.trim().to_lowercase();
+                    if !token.is_empty() {
+                        tokens.push(token);
+                    }
+                    current.clear();
+                    in_quotes = false;
+                } else {
+                    let token = current.trim().to_lowercase();
+                    if !token.is_empty() {
+                        tokens.push(token);
+                    }
+                    current.clear();
+                    in_quotes = true;
+                }
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                let token = current.trim().to_lowercase();
+                if !token.is_empty() {
+                    tokens.push(token);
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    let token = current.trim().to_lowercase();
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+
+    tokens
 }
 
 fn search_score(
@@ -3479,38 +3539,59 @@ fn search_score(
         return Some(0);
     }
 
+    let mut total = 0i64;
+    let search_blob_l = search_blob.to_lowercase();
+    let cwd_l = cwd.to_lowercase();
+    let file_name_l = file_name.to_lowercase();
+    let session_id_l = session_id.to_lowercase();
     let haystacks = [
-        search_blob.to_lowercase(),
-        cwd.to_lowercase(),
-        file_name.to_lowercase(),
-        session_id.to_lowercase(),
+        (search_blob_l.as_str(), 120i64),
+        (cwd_l.as_str(), 90i64),
+        (session_id_l.as_str(), 80i64),
+        (file_name_l.as_str(), 70i64),
     ];
 
-    let mut total = 0i64;
     for token in &tokens {
-        let mut best = i64::MIN;
-        for hay in &haystacks {
-            if let Some(score) = fuzzy_score(token, hay) {
-                let mut adjusted = score;
-                if hay.contains(token) {
-                    adjusted += 24;
-                }
-                if hay.starts_with(token) {
-                    adjusted += 10;
-                }
-                best = best.max(adjusted);
+        let mut best = None;
+        for (hay, weight) in &haystacks {
+            if let Some(score) = literal_search_score(token, hay, *weight) {
+                best = Some(best.unwrap_or(i64::MIN).max(score));
             }
         }
-        if best == i64::MIN {
+        let Some(best) = best else {
             return None;
-        }
+        };
         total += best;
     }
 
-    if tokens.len() > 1 && search_blob.to_lowercase().contains(&query.to_lowercase()) {
-        total += 20;
+    let query_l = query.to_lowercase();
+    if search_blob_l.contains(&query_l) {
+        total += 40;
+    } else if cwd_l.contains(&query_l) {
+        total += 30;
+    } else if session_id_l.contains(&query_l) || file_name_l.contains(&query_l) {
+        total += 25;
     }
     Some(total)
+}
+
+fn literal_search_score(token: &str, haystack: &str, weight: i64) -> Option<i64> {
+    let pos = haystack.find(token)? as i64;
+    let mut score = weight;
+    score += (40 - pos.min(40)).max(0);
+    if pos == 0 {
+        score += 25;
+    }
+    if haystack == token {
+        score += 30;
+    }
+    if haystack
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|part| part == token)
+    {
+        score += 20;
+    }
+    Some(score)
 }
 
 fn highlight_spans(text: &str, query: &str) -> Vec<Span<'static>> {
@@ -3943,6 +4024,7 @@ fn extract_chat_turns(content: &str) -> Vec<ChatTurn> {
     turns
 }
 
+#[cfg(test)]
 fn fuzzy_score(query: &str, haystack: &str) -> Option<i64> {
     if query.is_empty() {
         return Some(0);
@@ -4164,6 +4246,19 @@ fn rewrite_session_file(path: &Path, target_cwd: &str, rewrite_id: bool) -> Resu
     Ok(())
 }
 
+fn repair_session_file_cwds(path: &Path, cwd_base: &Path) -> Result<bool> {
+    let content =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let repaired = rewrite_session_content_with_normalized_cwds(&content, cwd_base)?;
+    if repaired == content {
+        return Ok(false);
+    }
+
+    backup_file(path)?;
+    atomic_write(path, &repaired)?;
+    Ok(true)
+}
+
 fn duplicate_session_file(
     sessions_root: &Path,
     source: &SessionSummary,
@@ -4240,6 +4335,121 @@ fn rewrite_cwd_fields(value: &mut Value, target_cwd: &str) {
         }
         _ => {}
     }
+}
+
+fn rewrite_cwd_fields_normalized(value: &mut Value, cwd_base: &Path) {
+    match value {
+        Value::Object(obj) => {
+            for (key, val) in obj.iter_mut() {
+                if key == "cwd" {
+                    if let Some(cwd) = val.as_str()
+                        && let Some(normalized) = normalize_local_cwd(cwd, cwd_base)
+                        && normalized != cwd
+                    {
+                        *val = Value::String(normalized);
+                    }
+                } else {
+                    rewrite_cwd_fields_normalized(val, cwd_base);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                rewrite_cwd_fields_normalized(item, cwd_base);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_session_content_with_normalized_cwds(content: &str, cwd_base: &Path) -> Result<String> {
+    let mut out = String::with_capacity(content.len() + 64);
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            out.push('\n');
+            continue;
+        }
+
+        let mut value: Value =
+            serde_json::from_str(line).context("invalid JSON line while repairing cwd")?;
+        rewrite_cwd_fields_normalized(&mut value, cwd_base);
+        out.push_str(&serde_json::to_string(&value)?);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn normalize_local_target_cwd(input: &str, cwd_base: &Path) -> Result<String> {
+    let expanded = expand_tilde(input.trim());
+    if expanded.as_os_str().is_empty() {
+        return Err(anyhow!("Target path is empty"));
+    }
+    normalize_local_cwd_path(&expanded, cwd_base)
+        .map(|path| path_to_string(&path))
+        .ok_or_else(|| anyhow!("Target path is empty"))
+}
+
+fn normalize_local_cwd(input: &str, cwd_base: &Path) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let expanded = expand_tilde(trimmed);
+    normalize_local_cwd_path(&expanded, cwd_base).map(|path| path_to_string(&path))
+}
+
+fn normalize_local_cwd_path(path: &Path, cwd_base: &Path) -> Option<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd_base.join(path)
+    };
+
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        use std::path::Component;
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(Path::new("/"));
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        return Some(PathBuf::from("/"));
+    }
+    Some(normalized)
+}
+
+fn path_to_string(path: &Path) -> String {
+    let s = path.to_string_lossy().to_string();
+    if s.len() > 1 {
+        s.trim_end_matches('/').to_string()
+    } else {
+        s
+    }
+}
+
+fn repair_session_cwds(root: &Path, cwd_base: &Path) -> Result<usize> {
+    if !root.exists() {
+        return Ok(0);
+    }
+
+    let mut files = Vec::new();
+    collect_jsonl_files(root, &mut files)?;
+    let mut repaired = 0usize;
+    for path in files {
+        if repair_session_file_cwds(&path, cwd_base)? {
+            repaired += 1;
+        }
+    }
+    Ok(repaired)
 }
 
 fn rewrite_session_id(value: &mut Value, new_id: &str) {
@@ -4589,6 +4799,12 @@ mod tests {
     }
 
     #[test]
+    fn search_requires_literal_token_presence_not_fuzzy_character_walk() {
+        let score = search_score("abc", "a_b_c", "/repo/demo", "demo.jsonl", "sess-1");
+        assert!(score.is_none());
+    }
+
+    #[test]
     fn search_tokens_match_across_multiple_words() {
         let score = search_score(
             "deploy alpha",
@@ -4610,6 +4826,35 @@ mod tests {
             "sess-1",
         );
         assert!(score.is_none());
+    }
+
+    #[test]
+    fn search_tokens_preserve_quoted_phrases() {
+        assert_eq!(
+            search_tokens(r#""openrouter error" auth"#),
+            vec![String::from("openrouter error"), String::from("auth")]
+        );
+    }
+
+    #[test]
+    fn search_score_matches_quoted_phrase_literal() {
+        let score = search_score(
+            r#""openrouter error" auth"#,
+            "investigate openrouter error during auth refresh",
+            "/repo/demo",
+            "demo.jsonl",
+            "sess-1",
+        );
+        assert!(score.is_some());
+
+        let miss = search_score(
+            r#""openrouter error""#,
+            "openrouter timeout and auth refresh",
+            "/repo/demo",
+            "demo.jsonl",
+            "sess-1",
+        );
+        assert!(miss.is_none());
     }
 
     #[test]
@@ -4996,6 +5241,70 @@ mod tests {
             .expect("pasted file");
         let content = fs::read_to_string(pasted).expect("read pasted");
         assert!(content.contains("\"cwd\":\"/new\""));
+    }
+
+    #[test]
+    fn normalize_local_target_cwd_makes_path_absolute_and_trims_slash() {
+        let base = PathBuf::from("/root/gh/codex-session-tui");
+        assert_eq!(
+            normalize_local_target_cwd("./demo/", &base).expect("normalize"),
+            "/root/gh/codex-session-tui/demo"
+        );
+        assert_eq!(
+            normalize_local_target_cwd("/tmp/example//", &base).expect("normalize"),
+            "/tmp/example"
+        );
+    }
+
+    #[test]
+    fn repair_session_file_cwds_normalizes_existing_bad_cwds() {
+        let dir = std::env::temp_dir().join(format!("cse-repair-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("broken.jsonl");
+        fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"abc","timestamp":"2026-01-01T00:00:00Z","cwd":"./repo/"}}"#,
+                r#"{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","cwd":"./repo/","content":[{"type":"input_text","text":"hello"}]}}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("write");
+
+        let changed = repair_session_file_cwds(&path, Path::new("/root/work")).expect("repair");
+        assert!(changed);
+
+        let repaired = fs::read_to_string(&path).expect("read repaired");
+        assert!(repaired.contains("\"cwd\":\"/root/work/repo\""));
+        assert!(!repaired.contains("\"cwd\":\"./repo/\""));
+        assert!(
+            path.parent()
+                .expect("parent")
+                .read_dir()
+                .expect("read dir")
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().contains(".jsonl.bak."))
+        );
+    }
+
+    #[test]
+    fn repair_session_cwds_updates_existing_pre_moved_sessions() {
+        let root = std::env::temp_dir().join(format!("cse-repair-root-{}", Uuid::new_v4()));
+        let nested = root.join("2026/03/14");
+        fs::create_dir_all(&nested).expect("mkdir");
+        let path = nested.join("session.jsonl");
+        fs::write(
+            &path,
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"abc","timestamp":"2026-01-01T00:00:00Z","cwd":"../repo/"}}"#,
+        )
+        .expect("write");
+
+        let repaired = repair_session_cwds(&root, Path::new("/root/gh/codex-session-tui"))
+            .expect("repair tree");
+        assert_eq!(repaired, 1);
+
+        let content = fs::read_to_string(&path).expect("read");
+        assert!(content.contains("\"cwd\":\"/root/gh/repo\""));
     }
 
     #[test]
@@ -6079,6 +6388,63 @@ mod tests {
             app.pending_preview_search_jump,
             Some((PathBuf::from("/tmp/a.jsonl"), String::from("alpha")))
         );
+        assert!(app.status.contains("1 session"));
+    }
+
+    #[test]
+    fn apply_search_filter_orders_by_best_session_match_not_project_match_count() {
+        let exact = SessionSummary {
+            path: PathBuf::from("/tmp/exact.jsonl"),
+            file_name: String::from("exact.jsonl"),
+            id: String::from("exact"),
+            cwd: String::from("/repo/exact"),
+            started_at: String::from("2026-01-01T00:00:00Z"),
+            modified_epoch: 200,
+            event_count: 1,
+            search_blob: String::from("johyperr exact hit"),
+        };
+        let weak1 = SessionSummary {
+            path: PathBuf::from("/tmp/weak1.jsonl"),
+            file_name: String::from("weak1.jsonl"),
+            id: String::from("weak1"),
+            cwd: String::from("/repo/weak"),
+            started_at: String::from("2026-01-01T00:00:00Z"),
+            modified_epoch: 100,
+            event_count: 1,
+            search_blob: String::from("johyperr appears once"),
+        };
+        let weak2 = SessionSummary {
+            path: PathBuf::from("/tmp/weak2.jsonl"),
+            file_name: String::from("weak2.jsonl"),
+            id: String::from("weak2"),
+            cwd: String::from("/repo/weak"),
+            started_at: String::from("2026-01-01T00:00:01Z"),
+            modified_epoch: 99,
+            event_count: 1,
+            search_blob: String::from("another johyperr match"),
+        };
+
+        let mut app = empty_test_app();
+        app.all_projects = vec![
+            ProjectBucket {
+                cwd: String::from("/repo/weak"),
+                sessions: vec![weak1, weak2],
+            },
+            ProjectBucket {
+                cwd: String::from("/repo/exact"),
+                sessions: vec![exact],
+            },
+        ];
+        app.search_query = String::from("johyperr");
+
+        app.apply_search_filter();
+
+        assert_eq!(app.projects[0].cwd, "/repo/exact");
+        assert_eq!(app.browser_cursor, BrowserCursor::Session);
+        assert_eq!(
+            app.pending_preview_search_jump,
+            Some((PathBuf::from("/tmp/exact.jsonl"), String::from("johyperr")))
+        );
     }
 
     #[test]
@@ -6178,6 +6544,70 @@ mod tests {
         assert!(buffer_contains(backend, "expand all"));
         assert!(buffer_contains(backend, "ctrl+↑/↓"));
         assert!(buffer_contains(backend, "project jump"));
+    }
+
+    #[test]
+    fn render_status_shows_refresh_shortcuts() {
+        let app = empty_test_app();
+
+        let backend = TestBackend::new(180, 4);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_status(
+                    frame,
+                    ratatui::layout::Rect {
+                        x: 0,
+                        y: 0,
+                        width: 180,
+                        height: 4,
+                    },
+                    &app,
+                );
+            })
+            .expect("draw");
+
+        let backend = terminal.backend();
+        assert!(buffer_contains(backend, "f5"));
+        assert!(buffer_contains(backend, "ctrl+r"));
+        assert!(buffer_contains(backend, "refresh"));
+    }
+
+    #[test]
+    fn f5_reloads_sessions() {
+        let dir = std::env::temp_dir().join(format!("cse-refresh-f5-{}", Uuid::new_v4()));
+        let sessions_root = dir.join("sessions");
+        let source_path = sessions_root.join("2026/03/14/source.jsonl");
+        write_test_session(&source_path, &sample_chat_jsonl());
+
+        let mut app = empty_test_app();
+        app.sessions_root = sessions_root;
+
+        let quit = handle_normal_mode(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE), &mut app)
+            .expect("handle");
+        assert!(!quit);
+        assert_eq!(app.projects.len(), 1);
+        assert_eq!(app.projects[0].cwd, "/tmp/x");
+    }
+
+    #[test]
+    fn ctrl_r_reloads_sessions() {
+        let dir = std::env::temp_dir().join(format!("cse-refresh-ctrlr-{}", Uuid::new_v4()));
+        let sessions_root = dir.join("sessions");
+        let source_path = sessions_root.join("2026/03/14/source.jsonl");
+        write_test_session(&source_path, &sample_chat_jsonl());
+
+        let mut app = empty_test_app();
+        app.sessions_root = sessions_root;
+
+        let quit = handle_normal_mode(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .expect("handle");
+        assert!(!quit);
+        assert_eq!(app.projects.len(), 1);
+        assert_eq!(app.projects[0].cwd, "/tmp/x");
     }
 
     #[test]

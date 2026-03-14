@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.10 - 2026-03-14
+
+### Fixed
+- Normalized local target paths before rewriting session `cwd` values for move, copy, fork, and folder-wide rewrite actions.
+- Added startup repair for previously rewritten session files whose local `cwd` values were left in a non-canonical form.
+- Tightened search behavior with quoted phrase support such as `"openrouter error" auth`.
+- Updated the README manual for refresh shortcuts, search syntax, and path-repair behavior.
+
 ## 1.0.9 - 2026-03-13
 
 ### Fixed
