@@ -135,6 +135,7 @@ Path rewrite behavior:
 - relative paths are converted to absolute paths
 - trailing slashes and `.` / `..` path segments are cleaned up
 - on startup, the app repairs previously rewritten session files that still contain non-canonical local `cwd` values
+- on startup, the app also reconciles Codex's local `threads` state database so `codex resume` sees repaired sessions again
 
 ## Typical Recovery Workflow
 
