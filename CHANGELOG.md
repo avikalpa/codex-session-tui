@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.2.0 - 2026-03-14
+
+### Added
+- Added persistent machine configuration via `.codex-session-tui.toml` or `~/.config/codex-session-tui.toml`.
+- Added `R` to connect or update SSH-backed remote machines from inside the TUI.
+- Added a unified multi-machine browser that shows `local` and configured remote machines in one tree.
+
+### Changed
+- Startup now expands the first machine root and its first folder automatically.
+- Preview headers now show which machine the selected session belongs to.
+- Move/copy/fork/project-copy/project-rename target input now accepts `machine:/path` in addition to plain local paths.
+- Browser paste operations now work across machines using the selected folder as the destination machine/path.
+
+### Fixed
+- Made cross-machine session operations route through the same rewrite/copy flow instead of requiring a separate export-only workflow.
+
 ## 1.1.0 - 2026-03-14
 
 ### Added
