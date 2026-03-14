@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.1 - 2026-03-14
+
+### Fixed
+- Fixed the `Connect Remote` input flow so bare `user@host` entries no longer terminate the TUI.
+- Added shorthand remote parsing for `user@host`, deriving the machine name from the SSH host when `name=` is omitted.
+- Kept invalid remote input inside the prompt and surfaced the validation error in the status bar instead of exiting the app.
+
 ## 1.3.0 - 2026-03-14
 
 ### Added
