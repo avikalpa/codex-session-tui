@@ -69,6 +69,7 @@ Browser:
 
 - `Up` / `Down`: move through visible rows
 - top-level rows are machines: `local` plus any configured SSH remotes
+- machine rows show health state: `[ok]`, `[cached]`, or `[offline]`
 - grouped folders compress single-child path chains in a GitHub-style tree
 - `Right`: expand a folder or enter its sessions
 - `Left`: collapse a folder or return from a session to its folder row
@@ -167,6 +168,8 @@ Input forms:
 
 - `name=user@host`
 - `name=user@host:/absolute/path/to/.codex`
+- `name=user@host|exec-prefix`
+- `name=user@host|exec-prefix|/absolute/path/to/.codex`
 
 Config shape:
 
@@ -178,6 +181,36 @@ codex_home = "/home/pi/.codex"
 ```
 
 If `codex_home` is omitted, the remote defaults to `~/.codex`.
+
+Container / nested-shell example:
+
+```toml
+[[machines]]
+name = "dev"
+ssh_target = "root@example-host"
+exec_prefix = "lxc-attach -n dev --"
+codex_home = "/root/.codex"
+```
+
+This lets the TUI:
+
+- SSH to `root@example-host`
+- enter the `dev` container with `lxc-attach`
+- scan sessions, preview chats, rewrite sessions, and launch `codex resume` inside that container
+
+Remote health and caching:
+
+- remote machine roots are marked `[ok]`, `[cached]`, or `[offline]`
+- when a remote scan fails, the TUI keeps the last successful project snapshot instead of dropping the machine from the browser
+- explicit refresh with `g`, `F5`, or `Ctrl+R` forces a fresh remote scan
+- normal internal reloads may reuse a recent cached remote scan for responsiveness
+
+SSH authentication:
+
+- passwordless SSH with keys or an agent is the recommended setup
+- browser startup and remote scans use non-interactive SSH behavior so the TUI does not hang waiting for a password prompt
+- password-based SSH can still work for explicit operations if your environment already handles the prompt outside the app, but it is less reliable and less secure than key-based auth
+- if you need more complex SSH behavior, prefer an `~/.ssh/config` host alias and reference that alias in `ssh_target`
 
 Path rewrite behavior:
 

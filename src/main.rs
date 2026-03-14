@@ -377,7 +377,7 @@ fn trigger_status_button(button: StatusButton, app: &mut App) {
         StatusButton::ProjectCopy => app.start_action(Action::ProjectCopy),
         StatusButton::AddRemote => app.start_action(Action::AddRemote),
         StatusButton::Refresh => {
-            let _ = app.reload();
+            let _ = app.reload(true);
         }
         StatusButton::Quit => app.status = String::from("Use q to quit"),
     }
@@ -506,16 +506,16 @@ fn copy_to_clipboard_osc52(text: &str) -> Result<()> {
 
 fn launch_codex_resume(spec: &CodexLaunchSpec) -> Result<()> {
     let status = if let Some(ssh_target) = &spec.ssh_target {
-        let remote_cmd = format!(
+        let inner = format!(
             "cd {} && codex resume {}",
             sh_single_quote(&path_to_string(&spec.cwd)),
             sh_single_quote(&spec.session_id)
         );
-        Command::new("ssh")
-            .arg("-t")
+        let remote_cmd = wrap_remote_exec(spec.exec_prefix.as_deref(), &inner);
+        let mut cmd = Command::new("ssh");
+        add_ssh_options(&mut cmd, false);
+        cmd.arg("-t")
             .arg(ssh_target)
-            .arg("sh")
-            .arg("-lc")
             .arg(remote_cmd)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
@@ -604,7 +604,7 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
                 return Ok(false);
             }
             KeyCode::Char('r') => {
-                app.reload()?;
+                app.reload(true)?;
                 return Ok(false);
             }
             _ => {}
@@ -724,7 +724,7 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
                 }
             }
         }
-        KeyCode::Char('g') | KeyCode::F(5) => app.reload()?,
+        KeyCode::Char('g') | KeyCode::F(5) => app.reload(true)?,
         KeyCode::Char('m') => {
             if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Project {
                 app.start_action(Action::ProjectRename);
@@ -992,11 +992,11 @@ struct SessionSummary {
     file_name: String,
     id: String,
     cwd: String,
-    #[allow(dead_code)]
     machine_name: String,
     machine_target: Option<String>,
     #[allow(dead_code)]
     machine_codex_home: Option<String>,
+    machine_exec_prefix: Option<String>,
     started_at: String,
     modified_epoch: i64,
     #[allow(dead_code)]
@@ -1011,6 +1011,7 @@ struct ProjectBucket {
     machine_name: String,
     machine_target: Option<String>,
     machine_codex_home: Option<String>,
+    machine_exec_prefix: Option<String>,
     cwd: String,
     sessions: Vec<SessionSummary>,
 }
@@ -1019,6 +1020,9 @@ struct ProjectBucket {
 struct ConfigMachine {
     name: String,
     ssh_target: String,
+    #[serde(default)]
+    exec_prefix: Option<String>,
+    #[serde(default)]
     codex_home: Option<String>,
 }
 
@@ -1035,6 +1039,8 @@ struct PaneLayout {
     preview: ratatui::layout::Rect,
     status: ratatui::layout::Rect,
 }
+
+const REMOTE_SCAN_CACHE_TTL: Duration = Duration::from_secs(15);
 
 struct App {
     config_path: PathBuf,
@@ -1090,6 +1096,7 @@ struct App {
     browser_clipboard: Option<BrowserClipboard>,
     last_browser_click: Option<(BrowserRow, Instant)>,
     launch_codex_after_exit: Option<CodexLaunchSpec>,
+    remote_states: BTreeMap<String, RemoteMachineState>,
 }
 
 #[derive(Clone)]
@@ -1120,6 +1127,7 @@ struct CodexLaunchSpec {
     cwd: PathBuf,
     session_id: String,
     ssh_target: Option<String>,
+    exec_prefix: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1128,6 +1136,24 @@ struct MachineTargetSpec {
     ssh_target: Option<String>,
     codex_home: String,
     cwd: String,
+    exec_prefix: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct RemoteMachineState {
+    status: RemoteMachineStatus,
+    last_error: Option<String>,
+    cached_projects: Vec<ProjectBucket>,
+    last_scan_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RemoteMachineStatus {
+    #[default]
+    Unknown,
+    Healthy,
+    Cached,
+    Error,
 }
 
 impl App {
@@ -1194,9 +1220,10 @@ impl App {
             browser_clipboard: None,
             last_browser_click: None,
             launch_codex_after_exit: None,
+            remote_states: BTreeMap::new(),
         };
 
-        app.reload()?;
+        app.reload(true)?;
         let synced_threads = app.sync_state_index()?;
         if repaired_count > 0 || synced_threads > 0 {
             app.status = format!(
@@ -1209,8 +1236,8 @@ impl App {
         Ok(app)
     }
 
-    fn reload(&mut self) -> Result<()> {
-        self.all_projects = scan_sessions(&self.sessions_root, &self.config)?;
+    fn reload(&mut self, force_remote_scan: bool) -> Result<()> {
+        self.all_projects = self.scan_all_projects(force_remote_scan)?;
         self.prune_selected_sessions();
         self.apply_search_filter();
 
@@ -1234,8 +1261,98 @@ impl App {
         }
 
         self.status = format!("Loaded {} projects", self.projects.len());
+        if let Some(summary) = self.remote_health_summary() {
+            self.status.push_str(&format!("  {summary}"));
+        }
         self.ensure_selection_visible();
         Ok(())
+    }
+
+    fn scan_all_projects(&mut self, force_remote_scan: bool) -> Result<Vec<ProjectBucket>> {
+        let mut all_projects = scan_local_sessions(&self.sessions_root)?;
+        let mut states = BTreeMap::new();
+        for machine in &self.config.machines {
+            let previous = self
+                .remote_states
+                .get(&machine.name)
+                .cloned()
+                .unwrap_or_default();
+            let next = self.scan_remote_machine(machine, &previous, force_remote_scan);
+            all_projects.extend(next.cached_projects.iter().cloned());
+            states.insert(machine.name.clone(), next);
+        }
+        self.remote_states = states;
+        all_projects.sort_by(|a, b| {
+            a.machine_name
+                .cmp(&b.machine_name)
+                .then_with(|| a.cwd.cmp(&b.cwd))
+        });
+        Ok(all_projects)
+    }
+
+    fn scan_remote_machine(
+        &self,
+        machine: &ConfigMachine,
+        previous: &RemoteMachineState,
+        force_remote_scan: bool,
+    ) -> RemoteMachineState {
+        let now = Instant::now();
+        if !force_remote_scan
+            && previous
+                .last_scan_at
+                .is_some_and(|last| now.duration_since(last) < REMOTE_SCAN_CACHE_TTL)
+        {
+            return previous.clone();
+        }
+        match scan_remote_sessions(machine) {
+            Ok(projects) => RemoteMachineState {
+                status: RemoteMachineStatus::Healthy,
+                last_error: None,
+                cached_projects: projects,
+                last_scan_at: Some(now),
+            },
+            Err(err) if !previous.cached_projects.is_empty() => RemoteMachineState {
+                status: RemoteMachineStatus::Cached,
+                last_error: Some(err.to_string()),
+                cached_projects: previous.cached_projects.clone(),
+                last_scan_at: previous.last_scan_at.or(Some(now)),
+            },
+            Err(err) => RemoteMachineState {
+                status: RemoteMachineStatus::Error,
+                last_error: Some(err.to_string()),
+                cached_projects: Vec::new(),
+                last_scan_at: Some(now),
+            },
+        }
+    }
+
+    fn remote_status_for_machine(&self, machine_name: &str) -> RemoteMachineStatus {
+        if machine_name == "local" {
+            return RemoteMachineStatus::Healthy;
+        }
+        self.remote_states
+            .get(machine_name)
+            .map(|state| state.status)
+            .unwrap_or(RemoteMachineStatus::Unknown)
+    }
+
+    fn remote_health_summary(&self) -> Option<String> {
+        let mut healthy = 0usize;
+        let mut cached = 0usize;
+        let mut down = 0usize;
+        for state in self.remote_states.values() {
+            match state.status {
+                RemoteMachineStatus::Healthy => healthy += 1,
+                RemoteMachineStatus::Cached => cached += 1,
+                RemoteMachineStatus::Error => down += 1,
+                RemoteMachineStatus::Unknown => {}
+            }
+        }
+        if healthy == 0 && cached == 0 && down == 0 {
+            None
+        } else {
+            Some(format!("remotes ok={healthy} cached={cached} down={down}"))
+        }
     }
 
     fn prune_selected_sessions(&mut self) {
@@ -1395,6 +1512,20 @@ impl App {
                 self.selected_group_path = Some(path.clone());
                 self.project_idx = first_project_index_for_group(&self.projects, &path)
                     .unwrap_or(self.project_idx.min(self.projects.len().saturating_sub(1)));
+                if let Some(state) = self.remote_states.get(&path) {
+                    match state.status {
+                        RemoteMachineStatus::Cached | RemoteMachineStatus::Error => {
+                            let detail = state.last_error.as_deref().unwrap_or("unreachable");
+                            self.status = format!(
+                                "{} {} {}",
+                                path,
+                                machine_status_suffix(state.status),
+                                detail
+                            );
+                        }
+                        RemoteMachineStatus::Healthy | RemoteMachineStatus::Unknown => {}
+                    }
+                }
             }
             BrowserRowKind::Project { project_idx } => {
                 self.project_idx = project_idx;
@@ -1707,6 +1838,7 @@ impl App {
                         machine_name: project.machine_name.clone(),
                         machine_target: project.machine_target.clone(),
                         machine_codex_home: project.machine_codex_home.clone(),
+                        machine_exec_prefix: project.machine_exec_prefix.clone(),
                         cwd: project.cwd.clone(),
                         sessions: scored.into_iter().map(|(_, s)| s).collect(),
                     },
@@ -2148,6 +2280,7 @@ impl App {
             cwd: PathBuf::from(&session.cwd),
             session_id: session.id.clone(),
             ssh_target: session.machine_target.clone(),
+            exec_prefix: session.machine_exec_prefix.clone(),
         };
         self.launch_codex_after_exit = Some(launch.clone());
         Some(launch)
@@ -2221,7 +2354,7 @@ impl App {
         self.selected_sessions_in_current_project().len()
     }
 
-    fn machine_specs(&self) -> Vec<(String, Option<String>, String)> {
+    fn machine_specs(&self) -> Vec<(String, Option<String>, String, Option<String>)> {
         let mut out = vec![(
             String::from("local"),
             None,
@@ -2230,6 +2363,7 @@ impl App {
                     .parent()
                     .unwrap_or_else(|| Path::new("/")),
             ),
+            None,
         )];
         for machine in &self.config.machines {
             out.push((
@@ -2239,6 +2373,7 @@ impl App {
                     .codex_home
                     .clone()
                     .unwrap_or_else(|| String::from("~/.codex")),
+                machine.exec_prefix.clone(),
             ));
         }
         out
@@ -2254,10 +2389,10 @@ impl App {
             let prefix = trimmed[..colon_idx].trim();
             let rest = trimmed[colon_idx + 1..].trim();
             if !prefix.is_empty() {
-                if let Some((name, ssh_target, codex_home)) = self
+                if let Some((name, ssh_target, codex_home, exec_prefix)) = self
                     .machine_specs()
                     .into_iter()
-                    .find(|(name, _, _)| name == prefix)
+                    .find(|(name, _, _, _)| name == prefix)
                 {
                     let cwd = if ssh_target.is_none() {
                         normalize_local_target_cwd(
@@ -2272,6 +2407,7 @@ impl App {
                         ssh_target,
                         codex_home,
                         cwd,
+                        exec_prefix,
                     });
                 }
             }
@@ -2289,6 +2425,7 @@ impl App {
                 trimmed,
                 &env::current_dir().context("failed to resolve current directory")?,
             )?,
+            exec_prefix: None,
         })
     }
 
@@ -2453,6 +2590,7 @@ impl App {
                             .unwrap_or_else(|| Path::new("/")),
                     )
                 }),
+            exec_prefix: target_project.machine_exec_prefix.clone(),
             cwd: target_project.cwd.clone(),
         };
         let mut ok = 0usize;
@@ -2480,7 +2618,7 @@ impl App {
         }
 
         if ok > 0 || skipped > 0 {
-            self.reload()?;
+            self.reload(false)?;
         }
         self.selected_sessions.clear();
         self.session_select_anchor = None;
@@ -2579,7 +2717,7 @@ impl App {
                 targets.len()
             ),
             Action::AddRemote => String::from(
-                "Add remote: enter name=user@host or name=user@host:/remote/.codex and press Enter",
+                "Add remote: enter name=user@host, name=user@host:/remote/.codex, or name=user@host|exec-prefix|/remote/.codex and press Enter",
             ),
         };
     }
@@ -2627,7 +2765,7 @@ impl App {
                 upsert_config_machine(&mut self.config, machine);
                 save_app_config(&self.config_path, &self.config)?;
                 ok = 1;
-                self.reload()?;
+                self.reload(true)?;
             }
             _ => {
                 let target_machine = if matches!(
@@ -2678,7 +2816,7 @@ impl App {
         self.clear_input_completion_cycle();
 
         if !matches!(action, Action::Export | Action::AddRemote) && (ok > 0 || skipped > 0) {
-            self.reload()?;
+            self.reload(false)?;
         }
         self.selected_sessions.clear();
         self.session_select_anchor = None;
@@ -2851,6 +2989,7 @@ impl App {
                 if let Some(ssh_target) = &target.ssh_target {
                     let remote_path = write_new_remote_session(
                         ssh_target,
+                        target.exec_prefix.as_deref(),
                         &target.codex_home,
                         &session_id,
                         &out,
@@ -2859,9 +2998,16 @@ impl App {
                         id: session_id,
                         cwd: target.cwd.clone(),
                         storage_path: remote_path.clone(),
+                        machine_exec_prefix: target.exec_prefix.clone(),
                         ..session.clone()
                     };
-                    sync_remote_thread_index(ssh_target, &remote_path, &target.cwd, &sync_session)?;
+                    sync_remote_thread_index(
+                        ssh_target,
+                        target.exec_prefix.as_deref(),
+                        &remote_path,
+                        &target.cwd,
+                        &sync_session,
+                    )?;
                 } else {
                     let new_path = write_new_local_session(&self.sessions_root, &session_id, &out)?;
                     let _ = self.sync_state_thread(
@@ -2873,6 +3019,7 @@ impl App {
                             machine_name: String::from("local"),
                             machine_target: None,
                             machine_codex_home: None,
+                            machine_exec_prefix: None,
                             ..session.clone()
                         },
                         &target.cwd,
@@ -2949,11 +3096,20 @@ fn render_browser(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
                 BrowserRowKind::Group { path } => {
                     let collapsed = app.collapsed_groups.contains(path);
                     let icon = if row.depth == 0 { "🖥" } else { "📁" };
+                    let group_label = if row.depth == 0 {
+                        format!(
+                            "{} {}",
+                            row.label,
+                            machine_status_suffix(app.remote_status_for_machine(&row.label))
+                        )
+                    } else {
+                        row.label.clone()
+                    };
                     let label = format!(
                         "{indent}{} {} {}",
                         if collapsed { "▶" } else { "▼" },
                         icon,
-                        row.label
+                        group_label
                     );
                     ListItem::new(Line::from(prepend_style(
                         highlight_spans(&label, &app.search_query),
@@ -3020,6 +3176,15 @@ fn render_browser(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
 
 fn browser_highlight_style() -> Style {
     Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+}
+
+fn machine_status_suffix(status: RemoteMachineStatus) -> &'static str {
+    match status {
+        RemoteMachineStatus::Healthy => "[ok]",
+        RemoteMachineStatus::Cached => "[cached]",
+        RemoteMachineStatus::Error => "[offline]",
+        RemoteMachineStatus::Unknown => "[unknown]",
+    }
 }
 
 fn format_session_browser_line(session: &SessionSummary) -> String {
@@ -4987,6 +5152,7 @@ fn fuzzy_score(query: &str, haystack: &str) -> Option<i64> {
     }
 }
 
+#[allow(dead_code)]
 fn scan_sessions(root: &Path, config: &AppConfig) -> Result<Vec<ProjectBucket>> {
     let mut all_projects = scan_local_sessions(root)?;
     for machine in &config.machines {
@@ -5039,6 +5205,7 @@ fn scan_local_sessions(root: &Path) -> Result<Vec<ProjectBucket>> {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd,
             sessions,
         })
@@ -5161,6 +5328,7 @@ fn parse_local_session_summary(path: &Path) -> Result<SessionSummary> {
         machine_name: String::from("local"),
         machine_target: None,
         machine_codex_home: None,
+        machine_exec_prefix: None,
         started_at,
         modified_epoch: modified_dt.timestamp(),
         event_count,
@@ -5221,6 +5389,7 @@ fn parse_remote_session_summary_line(
         machine_name: machine.name.clone(),
         machine_target: Some(machine.ssh_target.clone()),
         machine_codex_home: machine.codex_home.clone(),
+        machine_exec_prefix: machine.exec_prefix.clone(),
         started_at: started_at.to_string(),
         modified_epoch,
         event_count,
@@ -5233,11 +5402,13 @@ fn parse_remote_session_summary_line(
 fn scan_remote_sessions(machine: &ConfigMachine) -> Result<Vec<ProjectBucket>> {
     let lines = run_remote_python_lines(
         &machine.ssh_target,
+        machine.exec_prefix.as_deref(),
         REMOTE_SCAN_SCRIPT,
         &[machine
             .codex_home
             .clone()
             .unwrap_or_else(|| String::from("~/.codex"))],
+        true,
     )?;
 
     let mut projects: HashMap<String, Vec<SessionSummary>> = HashMap::new();
@@ -5265,6 +5436,7 @@ fn scan_remote_sessions(machine: &ConfigMachine) -> Result<Vec<ProjectBucket>> {
             machine_name: machine.name.clone(),
             machine_target: Some(machine.ssh_target.clone()),
             machine_codex_home: machine.codex_home.clone(),
+            machine_exec_prefix: machine.exec_prefix.clone(),
             cwd,
             sessions,
         })
@@ -5850,10 +6022,35 @@ fn remote_session_path(codex_home: &str, now: DateTime<Utc>, file_name: &str) ->
     remote_join_path(&remote_session_dir(codex_home, now), file_name)
 }
 
-fn run_ssh_output(ssh_target: &str, script: &str) -> Result<String> {
-    let output = Command::new("ssh")
+fn add_ssh_options(cmd: &mut Command, batch_mode: bool) {
+    cmd.arg("-o").arg("ConnectTimeout=5");
+    if batch_mode {
+        cmd.arg("-o").arg("BatchMode=yes");
+    }
+}
+
+fn wrap_remote_exec(exec_prefix: Option<&str>, command: &str) -> String {
+    match exec_prefix
+        .map(str::trim)
+        .filter(|prefix| !prefix.is_empty())
+    {
+        Some(prefix) => format!("{prefix} sh -lc {}", sh_single_quote(command)),
+        None => command.to_string(),
+    }
+}
+
+fn run_ssh_output(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    script: &str,
+    batch_mode: bool,
+) -> Result<String> {
+    let remote = wrap_remote_exec(exec_prefix, script);
+    let mut cmd = Command::new("ssh");
+    add_ssh_options(&mut cmd, batch_mode);
+    let output = cmd
         .arg(ssh_target)
-        .arg(script)
+        .arg(remote)
         .output()
         .with_context(|| format!("failed to start ssh for {ssh_target}"))?;
     if !output.status.success() {
@@ -5865,10 +6062,18 @@ fn run_ssh_output(ssh_target: &str, script: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn run_ssh_status(ssh_target: &str, script: &str) -> Result<()> {
-    let status = Command::new("ssh")
+fn run_ssh_status(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    script: &str,
+    batch_mode: bool,
+) -> Result<()> {
+    let remote = wrap_remote_exec(exec_prefix, script);
+    let mut cmd = Command::new("ssh");
+    add_ssh_options(&mut cmd, batch_mode);
+    let status = cmd
         .arg(ssh_target)
-        .arg(script)
+        .arg(remote)
         .status()
         .with_context(|| format!("failed to start ssh for {ssh_target}"))?;
     if status.success() {
@@ -5880,11 +6085,33 @@ fn run_ssh_status(ssh_target: &str, script: &str) -> Result<()> {
     }
 }
 
-fn run_remote_python_lines(ssh_target: &str, script: &str, args: &[String]) -> Result<Vec<String>> {
+fn run_remote_python_lines(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    script: &str,
+    args: &[String],
+    batch_mode: bool,
+) -> Result<Vec<String>> {
     let mut cmd = Command::new("ssh");
-    cmd.arg(ssh_target).arg("python3").arg("-");
-    for arg in args {
-        cmd.arg(arg);
+    add_ssh_options(&mut cmd, batch_mode);
+    cmd.arg(ssh_target);
+    if let Some(prefix) = exec_prefix
+        .map(str::trim)
+        .filter(|prefix| !prefix.is_empty())
+    {
+        let mut inner = String::from("python3 -");
+        for arg in args {
+            inner.push(' ');
+            inner.push_str(&sh_single_quote(arg));
+        }
+        cmd.arg("sh")
+            .arg("-lc")
+            .arg(format!("{prefix} sh -lc {}", sh_single_quote(&inner)));
+    } else {
+        cmd.arg("python3").arg("-");
+        for arg in args {
+            cmd.arg(arg);
+        }
     }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -5913,8 +6140,14 @@ fn run_remote_python_lines(ssh_target: &str, script: &str, args: &[String]) -> R
         .collect())
 }
 
-fn run_remote_python_text(ssh_target: &str, script: &str, args: &[String]) -> Result<String> {
-    Ok(run_remote_python_lines(ssh_target, script, args)?.join("\n"))
+fn run_remote_python_text(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    script: &str,
+    args: &[String],
+    batch_mode: bool,
+) -> Result<String> {
+    Ok(run_remote_python_lines(ssh_target, exec_prefix, script, args, batch_mode)?.join("\n"))
 }
 
 fn read_session_content(session: &SessionSummary) -> Result<String> {
@@ -5933,16 +6166,26 @@ fn fetch_remote_session_content(session: &SessionSummary) -> Result<String> {
         .ok_or_else(|| anyhow!("remote session missing ssh target"))?;
     run_remote_python_text(
         ssh_target,
+        session.machine_exec_prefix.as_deref(),
         REMOTE_READ_FILE_SCRIPT,
         std::slice::from_ref(&session.storage_path),
+        true,
     )
 }
 
-fn upload_remote_file(ssh_target: &str, remote_file: &str, content: &str) -> Result<()> {
+fn upload_remote_file(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    remote_file: &str,
+    content: &str,
+) -> Result<()> {
     let remote_file_q = sh_single_quote(remote_file);
-    let mut child = Command::new("ssh")
+    let remote_cmd = wrap_remote_exec(exec_prefix, &format!("cat > {remote_file_q}"));
+    let mut cmd = Command::new("ssh");
+    add_ssh_options(&mut cmd, false);
+    let mut child = cmd
         .arg(ssh_target)
-        .arg(format!("cat > {remote_file_q}"))
+        .arg(remote_cmd)
         .stdin(Stdio::piped())
         .spawn()
         .with_context(|| format!("failed to start ssh upload for {}", ssh_target))?;
@@ -5969,6 +6212,7 @@ fn upload_remote_file(ssh_target: &str, remote_file: &str, content: &str) -> Res
 
 fn write_new_remote_session(
     ssh_target: &str,
+    exec_prefix: Option<&str>,
     codex_home: &str,
     session_id: &str,
     out: &str,
@@ -5977,7 +6221,9 @@ fn write_new_remote_session(
     let remote_dir = remote_session_dir(codex_home, now);
     run_ssh_status(
         ssh_target,
+        exec_prefix,
         &format!("mkdir -p -- {}", sh_single_quote(&remote_dir)),
+        false,
     )?;
     let remote_file = remote_session_path(
         codex_home,
@@ -5990,10 +6236,12 @@ fn write_new_remote_session(
     );
     run_ssh_status(
         ssh_target,
+        exec_prefix,
         &format!("test ! -e {}", sh_single_quote(&remote_file)),
+        false,
     )
     .with_context(|| format!("remote file already exists: {}:{}", ssh_target, remote_file))?;
-    upload_remote_file(ssh_target, &remote_file, out)?;
+    upload_remote_file(ssh_target, exec_prefix, &remote_file, out)?;
     Ok(remote_file)
 }
 
@@ -6021,19 +6269,32 @@ fn rewrite_remote_session_file(
     )?;
     run_ssh_status(
         ssh_target,
+        session.machine_exec_prefix.as_deref(),
         &format!(
             "cp -- {} {}",
             sh_single_quote(&session.storage_path),
             sh_single_quote(&format!("{}.bak", session.storage_path))
         ),
+        false,
     )?;
-    upload_remote_file(ssh_target, &session.storage_path, &rewritten)?;
+    upload_remote_file(
+        ssh_target,
+        session.machine_exec_prefix.as_deref(),
+        &session.storage_path,
+        &rewritten,
+    )?;
     let sync_session = SessionSummary {
         id: new_id.unwrap_or_else(|| session.id.clone()),
         cwd: target_cwd.to_string(),
         ..session.clone()
     };
-    sync_remote_thread_index(ssh_target, &session.storage_path, target_cwd, &sync_session)?;
+    sync_remote_thread_index(
+        ssh_target,
+        session.machine_exec_prefix.as_deref(),
+        &session.storage_path,
+        target_cwd,
+        &sync_session,
+    )?;
     Ok(())
 }
 
@@ -6044,7 +6305,9 @@ fn delete_remote_session_file(session: &SessionSummary) -> Result<()> {
         .ok_or_else(|| anyhow!("remote session missing ssh target"))?;
     run_ssh_status(
         ssh_target,
+        session.machine_exec_prefix.as_deref(),
         &format!("rm -f -- {}", sh_single_quote(&session.storage_path)),
+        false,
     )
 }
 
@@ -6052,23 +6315,34 @@ fn export_session_via_ssh(session: &SessionSummary, target: &str) -> Result<()> 
     let remote = parse_remote_export_target(target)?;
     let remote_codex_home = run_ssh_output(
         &remote.ssh_target,
+        None,
         "python3 -c 'import os; print(os.environ.get(\"CODEX_HOME\") or os.path.expanduser(\"~/.codex\"))'",
+        false,
     )?;
     let now = Utc::now();
     let remote_dir = remote_session_dir(&remote_codex_home, now);
     let remote_dir_q = sh_single_quote(&remote_dir);
-    run_ssh_status(&remote.ssh_target, &format!("mkdir -p -- {remote_dir_q}"))?;
+    run_ssh_status(
+        &remote.ssh_target,
+        None,
+        &format!("mkdir -p -- {remote_dir_q}"),
+        false,
+    )?;
 
     let remote_file = remote_session_path(&remote_codex_home, now, &session.file_name);
     let remote_file_q = sh_single_quote(&remote_file);
-    run_ssh_status(&remote.ssh_target, &format!("test ! -e {remote_file_q}")).with_context(
-        || {
-            format!(
-                "remote file already exists: {}:{}",
-                remote.ssh_target, remote_file
-            )
-        },
-    )?;
+    run_ssh_status(
+        &remote.ssh_target,
+        None,
+        &format!("test ! -e {remote_file_q}"),
+        false,
+    )
+    .with_context(|| {
+        format!(
+            "remote file already exists: {}:{}",
+            remote.ssh_target, remote_file
+        )
+    })?;
 
     let content = read_session_content(session)?;
     let rewritten = rewrite_session_content(
@@ -6078,9 +6352,10 @@ fn export_session_via_ssh(session: &SessionSummary, target: &str) -> Result<()> 
         false,
         &session.storage_path,
     )?;
-    upload_remote_file(&remote.ssh_target, &remote_file, &rewritten)?;
+    upload_remote_file(&remote.ssh_target, None, &remote_file, &rewritten)?;
     sync_remote_thread_index(
         &remote.ssh_target,
+        None,
         &remote_file,
         &remote.remote_cwd,
         session,
@@ -6090,13 +6365,17 @@ fn export_session_via_ssh(session: &SessionSummary, target: &str) -> Result<()> 
 
 fn sync_remote_thread_index(
     ssh_target: &str,
+    exec_prefix: Option<&str>,
     remote_rollout_path: &str,
     remote_cwd: &str,
     session: &SessionSummary,
 ) -> Result<()> {
-    let mut child = Command::new("ssh")
+    let mut cmd = Command::new("ssh");
+    add_ssh_options(&mut cmd, false);
+    let remote_cmd = wrap_remote_exec(exec_prefix, "python3 -");
+    let mut child = cmd
         .arg(ssh_target)
-        .arg("python3 -")
+        .arg(remote_cmd)
         .stdin(Stdio::piped())
         .spawn()
         .with_context(|| format!("failed to start remote index sync for {ssh_target}"))?;
@@ -6332,35 +6611,62 @@ fn parse_config_machine_input(input: &str) -> Result<ConfigMachine> {
     let trimmed = input.trim();
     let Some((name, rest)) = trimmed.split_once('=') else {
         return Err(anyhow!(
-            "remote must look like name=user@host or name=user@host:/remote/.codex"
+            "remote must look like name=user@host, name=user@host:/remote/.codex, or name=user@host|exec-prefix|/remote/.codex"
         ));
     };
     let name = name.trim();
     let rest = rest.trim();
     if name.is_empty() || rest.is_empty() {
         return Err(anyhow!(
-            "remote must look like name=user@host or name=user@host:/remote/.codex"
+            "remote must look like name=user@host, name=user@host:/remote/.codex, or name=user@host|exec-prefix|/remote/.codex"
         ));
     }
-    if let Some(idx) = rest.rfind(':') {
-        let ssh_target = rest[..idx].trim();
-        let codex_home = rest[idx + 1..].trim();
+
+    if rest.contains('|') {
+        let parts = rest.split('|').map(str::trim).collect::<Vec<_>>();
+        if !(2..=3).contains(&parts.len()) {
+            return Err(anyhow!(
+                "remote with container/command prefix must look like name=user@host|exec-prefix or name=user@host|exec-prefix|/remote/.codex"
+            ));
+        }
+        let ssh_target = parts[0];
+        let exec_prefix = parts[1];
+        let codex_home = parts.get(2).copied();
         if ssh_target.is_empty() {
             return Err(anyhow!("remote ssh target is empty"));
         }
-        if codex_home.is_empty() || !codex_home.starts_with('/') {
+        if exec_prefix.is_empty() {
+            return Err(anyhow!("remote exec prefix is empty"));
+        }
+        if let Some(codex_home) = codex_home
+            && (codex_home.is_empty() || !codex_home.starts_with('/'))
+        {
             return Err(anyhow!("remote codex home must be an absolute path"));
         }
         return Ok(ConfigMachine {
             name: name.to_string(),
             ssh_target: ssh_target.to_string(),
-            codex_home: Some(codex_home.to_string()),
+            exec_prefix: Some(exec_prefix.to_string()),
+            codex_home: codex_home.map(str::to_string),
+        });
+    }
+
+    if let Some((ssh_target, codex_home)) = rest.rsplit_once(":/")
+        && !ssh_target.is_empty()
+    {
+        let codex_home = format!("/{}", codex_home);
+        return Ok(ConfigMachine {
+            name: name.to_string(),
+            ssh_target: ssh_target.trim().to_string(),
+            exec_prefix: None,
+            codex_home: Some(codex_home),
         });
     }
     Ok(ConfigMachine {
         name: name.to_string(),
         ssh_target: rest.to_string(),
         codex_home: None,
+        exec_prefix: None,
     })
 }
 
@@ -6489,6 +6795,7 @@ mod tests {
             browser_clipboard: None,
             last_browser_click: None,
             launch_codex_after_exit: None,
+            remote_states: BTreeMap::new(),
         }
     }
 
@@ -6533,6 +6840,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             started_at: String::from("2026-01-01T00:00:00Z"),
             modified_epoch: 123,
             event_count: 1,
@@ -6624,6 +6932,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/work/src/api"),
                 sessions: Vec::new(),
             },
@@ -6631,6 +6940,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/work/src/web"),
                 sessions: Vec::new(),
             },
@@ -6647,6 +6957,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/work/src/foo"),
                 sessions: Vec::new(),
             },
@@ -6654,6 +6965,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/work/src/bar/baz"),
                 sessions: Vec::new(),
             },
@@ -6670,6 +6982,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/work/src/foo"),
                 sessions: Vec::new(),
             },
@@ -6677,6 +6990,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/work/src/bar"),
                 sessions: Vec::new(),
             },
@@ -6684,6 +6998,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/work/src/bar/baz"),
                 sessions: Vec::new(),
             },
@@ -6691,6 +7006,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/work/src/bar/baz/qux"),
                 sessions: Vec::new(),
             },
@@ -6780,6 +7096,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/repo"),
             sessions: vec![
                 sample_session("/tmp/a.jsonl", "/repo", "a"),
@@ -6808,6 +7125,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/repo"),
             sessions: vec![
                 sample_session("/tmp/a.jsonl", "/repo", "a"),
@@ -6835,6 +7153,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/repo"),
             sessions: vec![
                 sample_session("/tmp/a.jsonl", "/repo", "a"),
@@ -6856,6 +7175,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/repo"),
             sessions: vec![
                 sample_session("/tmp/a.jsonl", "/repo", "a"),
@@ -6875,6 +7195,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo-a"),
                 sessions: vec![sample_session("/tmp/a.jsonl", "/repo-a", "a")],
             },
@@ -6882,6 +7203,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo-b"),
                 sessions: vec![sample_session("/tmp/b.jsonl", "/repo-b", "b")],
             },
@@ -6899,6 +7221,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/repo"),
             sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
         }];
@@ -6926,6 +7249,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo"),
                 sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
             }];
@@ -7002,6 +7326,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/repo"),
             sessions: vec![
                 sample_session("/tmp/a.jsonl", "/repo", "a"),
@@ -7044,6 +7369,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             file_name: String::from("source.jsonl"),
             id: String::from("abc"),
             cwd: String::from("/old"),
@@ -7058,6 +7384,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/new"),
             sessions: vec![],
         }];
@@ -7221,6 +7548,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/new/path"),
             sessions: vec![SessionSummary {
                 path: rollout.clone(),
@@ -7228,6 +7556,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 file_name: String::from("session.jsonl"),
                 id: String::from("sess-1"),
                 cwd: String::from("/new/path"),
@@ -7280,6 +7609,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/old/path"),
             sessions: vec![SessionSummary {
                 path: session_path.clone(),
@@ -7287,6 +7617,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 file_name: String::from("session.jsonl"),
                 id: String::from("sess-1"),
                 cwd: String::from("/old/path"),
@@ -7351,6 +7682,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/repo"),
             sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
         }];
@@ -7391,6 +7723,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/repo"),
             sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
         }];
@@ -7418,6 +7751,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo-a"),
                 sessions: vec![
                     sample_session("/tmp/a1.jsonl", "/repo-a", "a1"),
@@ -7428,6 +7762,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo-b"),
                 sessions: vec![sample_session("/tmp/b1.jsonl", "/repo-b", "b1")],
             },
@@ -7462,6 +7797,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo-a"),
                 sessions: vec![
                     sample_session("/tmp/a1.jsonl", "/repo-a", "a1"),
@@ -7472,6 +7808,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo-b"),
                 sessions: vec![sample_session("/tmp/b1.jsonl", "/repo-b", "b1")],
             },
@@ -7479,6 +7816,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo-c"),
                 sessions: vec![sample_session("/tmp/c1.jsonl", "/repo-c", "c1")],
             },
@@ -7520,6 +7858,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo-a"),
                 sessions: vec![
                     sample_session("/tmp/a1.jsonl", "/repo-a", "a1"),
@@ -7530,6 +7869,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo-b"),
                 sessions: vec![sample_session("/tmp/b1.jsonl", "/repo-b", "b1")],
             },
@@ -7574,6 +7914,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/repo"),
             sessions: vec![
                 sample_session("/tmp/a.jsonl", "/repo", "a"),
@@ -7597,6 +7938,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/repo"),
             sessions: vec![
                 sample_session("/tmp/a.jsonl", "/repo", "a"),
@@ -7621,6 +7963,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/repo"),
             sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
         }];
@@ -7644,6 +7987,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo-a"),
                 sessions: vec![sample_session("/tmp/a.jsonl", "/repo-a", "a")],
             },
@@ -7651,6 +7995,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo-b"),
                 sessions: vec![sample_session("/tmp/b.jsonl", "/repo-b", "b")],
             },
@@ -7658,6 +8003,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo-c"),
                 sessions: vec![sample_session("/tmp/c.jsonl", "/repo-c", "c")],
             },
@@ -7685,6 +8031,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo-a"),
                 sessions: vec![sample_session("/tmp/a.jsonl", "/repo-a", "a")],
             },
@@ -7692,6 +8039,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo-b"),
                 sessions: vec![sample_session("/tmp/b.jsonl", "/repo-b", "b")],
             },
@@ -7716,6 +8064,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo-a"),
                 sessions: vec![sample_session("/tmp/a.jsonl", "/repo-a", "a")],
             },
@@ -7723,6 +8072,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo-b"),
                 sessions: vec![sample_session("/tmp/b.jsonl", "/repo-b", "b")],
             },
@@ -7730,6 +8080,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo-c"),
                 sessions: vec![sample_session("/tmp/c.jsonl", "/repo-c", "c")],
             },
@@ -7767,6 +8118,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/repo"),
             sessions: vec![
                 sample_session("/tmp/a.jsonl", "/repo", "a"),
@@ -7790,6 +8142,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo-a"),
                 sessions: vec![sample_session("/tmp/a.jsonl", "/repo-a", "a")],
             },
@@ -7797,6 +8150,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo-b"),
                 sessions: vec![sample_session("/tmp/b.jsonl", "/repo-b", "b")],
             },
@@ -7820,6 +8174,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo-a"),
                 sessions: vec![sample_session("/tmp/a.jsonl", "/repo-a", "a")],
             },
@@ -7827,6 +8182,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo-b"),
                 sessions: vec![sample_session("/tmp/b.jsonl", "/repo-b", "b")],
             },
@@ -7849,6 +8205,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/repo"),
             sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
         }];
@@ -7893,6 +8250,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/repo"),
             sessions: vec![
                 sample_session("/tmp/a.jsonl", "/repo", "a"),
@@ -7922,6 +8280,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/repo"),
             sessions: vec![
                 sample_session("/tmp/a.jsonl", "/repo", "a"),
@@ -7988,6 +8347,7 @@ mod tests {
             browser_clipboard: None,
             last_browser_click: None,
             launch_codex_after_exit: None,
+            remote_states: BTreeMap::new(),
         };
         let text = app
             .preview_selected_text((0, 1), (1, 2))
@@ -8017,6 +8377,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             file_name: String::from("rollout-a.jsonl"),
             id: String::from("123456789abcdef"),
             cwd: String::from("/tmp"),
@@ -8039,6 +8400,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             file_name: String::from("rollout-a.jsonl"),
             id: String::from("123456789abcdef"),
             cwd: String::from("/tmp"),
@@ -8061,6 +8423,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/repo"),
             sessions: vec![
                 sample_session("/tmp/a.jsonl", "/repo", "aaaaaaa"),
@@ -8087,6 +8450,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/repo"),
             sessions: vec![
                 sample_session("/tmp/a.jsonl", "/repo", "aaaaaaa"),
@@ -8115,6 +8479,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/repo"),
             sessions: vec![
                 sample_session("/tmp/a.jsonl", "/repo", "aaaaaaa"),
@@ -8181,6 +8546,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/root"),
                 sessions: Vec::new(),
             },
@@ -8188,6 +8554,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/"),
                 sessions: Vec::new(),
             },
@@ -8265,6 +8632,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             file_name: String::from("sample.jsonl"),
             id: String::from("abc"),
             cwd: String::from("/tmp/x"),
@@ -8313,6 +8681,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             started_at: String::from("2026-01-01T00:00:00Z"),
             modified_epoch: 123,
             event_count: 2,
@@ -8355,6 +8724,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             started_at: String::from("2026-01-01T00:00:00Z"),
             modified_epoch: 123,
             event_count: 141,
@@ -8383,6 +8753,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             file_name: String::from("fold.jsonl"),
             id: String::from("x"),
             cwd: String::from("/tmp"),
@@ -8430,6 +8801,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             file_name: String::from("c.jsonl"),
             id: String::from("x"),
             cwd: String::from("/tmp"),
@@ -8487,6 +8859,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             file_name: String::from("sep.jsonl"),
             id: String::from("x"),
             cwd: String::from("/tmp"),
@@ -8510,6 +8883,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             file_name: String::from("a.jsonl"),
             id: String::from("a"),
             cwd: String::from("/repo/a"),
@@ -8526,6 +8900,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             file_name: String::from("b.jsonl"),
             id: String::from("b"),
             cwd: String::from("/repo/b"),
@@ -8547,6 +8922,7 @@ mod tests {
                     machine_name: String::from("local"),
                     machine_target: None,
                     machine_codex_home: None,
+                    machine_exec_prefix: None,
                     cwd: String::from("/repo/a"),
                     sessions: vec![s1],
                 },
@@ -8554,6 +8930,7 @@ mod tests {
                     machine_name: String::from("local"),
                     machine_target: None,
                     machine_codex_home: None,
+                    machine_exec_prefix: None,
                     cwd: String::from("/repo/b"),
                     sessions: vec![s2],
                 },
@@ -8606,6 +8983,7 @@ mod tests {
             browser_clipboard: None,
             last_browser_click: None,
             launch_codex_after_exit: None,
+            remote_states: BTreeMap::new(),
         };
 
         app.apply_search_filter();
@@ -8628,6 +9006,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             file_name: String::from("exact.jsonl"),
             id: String::from("exact"),
             cwd: String::from("/repo/exact"),
@@ -8644,6 +9023,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             file_name: String::from("weak1.jsonl"),
             id: String::from("weak1"),
             cwd: String::from("/repo/weak"),
@@ -8660,6 +9040,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             file_name: String::from("weak2.jsonl"),
             id: String::from("weak2"),
             cwd: String::from("/repo/weak"),
@@ -8677,6 +9058,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo/weak"),
                 sessions: vec![weak1, weak2],
             },
@@ -8684,6 +9066,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo/exact"),
                 sessions: vec![exact],
             },
@@ -8708,6 +9091,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo/a"),
                 sessions: vec![sample_session("/tmp/a.jsonl", "/repo/a", "a")],
             },
@@ -8715,6 +9099,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo/b"),
                 sessions: vec![sample_session("/tmp/b.jsonl", "/repo/b", "b")],
             },
@@ -8905,6 +9290,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo-a"),
                 sessions: vec![
                     sample_session("/tmp/a1.jsonl", "/repo-a", "a1"),
@@ -8915,6 +9301,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo-b"),
                 sessions: vec![sample_session("/tmp/b1.jsonl", "/repo-b", "b1")],
             },
@@ -9018,6 +9405,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/tmp/x"),
             sessions: vec![SessionSummary {
                 path: path.clone(),
@@ -9025,6 +9413,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 file_name: String::from("sample.jsonl"),
                 id: String::from("abcdef1"),
                 cwd: String::from("/tmp/x"),
@@ -9104,6 +9493,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             file_name: String::from("sample.jsonl"),
             id: String::from("abcdef123456"),
             cwd: String::from("/tmp/x"),
@@ -9119,6 +9509,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/tmp/x"),
             sessions: vec![session],
         }];
@@ -9164,6 +9555,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             file_name: String::from("sample.jsonl"),
             id: String::from("abcdef123456"),
             cwd: String::from("/tmp/x"),
@@ -9179,6 +9571,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/tmp/x"),
             sessions: vec![session],
         }];
@@ -9217,6 +9610,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/repo"),
             sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
         }];
@@ -9312,6 +9706,7 @@ mod tests {
             browser_clipboard: None,
             last_browser_click: None,
             launch_codex_after_exit: None,
+            remote_states: BTreeMap::new(),
         };
 
         app.toggle_fold_all_preview_turns();
@@ -9335,12 +9730,65 @@ mod tests {
         assert_eq!(plain.name, "pi");
         assert_eq!(plain.ssh_target, "pi@192.168.0.12");
         assert_eq!(plain.codex_home, None);
+        assert_eq!(plain.exec_prefix, None);
 
         let custom = parse_config_machine_input("lab=pi@192.168.0.13:/home/pi/custom-codex")
             .expect("custom");
         assert_eq!(custom.name, "lab");
         assert_eq!(custom.ssh_target, "pi@192.168.0.13");
         assert_eq!(custom.codex_home.as_deref(), Some("/home/pi/custom-codex"));
+        assert_eq!(custom.exec_prefix, None);
+    }
+
+    #[test]
+    fn parse_config_machine_input_accepts_exec_prefix() {
+        let machine =
+            parse_config_machine_input("dev=root@example-host|lxc-attach -n dev --|/root/.codex")
+                .expect("machine");
+        assert_eq!(machine.name, "dev");
+        assert_eq!(machine.ssh_target, "root@example-host");
+        assert_eq!(machine.exec_prefix.as_deref(), Some("lxc-attach -n dev --"));
+        assert_eq!(machine.codex_home.as_deref(), Some("/root/.codex"));
+    }
+
+    #[test]
+    fn wrap_remote_exec_supports_container_prefix() {
+        let wrapped = wrap_remote_exec(Some("lxc-attach -n dev --"), "python3 - /root/.codex");
+        assert!(wrapped.contains("lxc-attach -n dev -- sh -lc"));
+        assert!(wrapped.contains("python3 - /root/.codex"));
+    }
+
+    #[test]
+    fn scan_remote_machine_reuses_recent_cache() {
+        let app = empty_test_app();
+        let machine = ConfigMachine {
+            name: String::from("pi"),
+            ssh_target: String::from("pi@192.168.0.20"),
+            exec_prefix: None,
+            codex_home: Some(String::from("/home/pi/.codex")),
+        };
+        let previous = RemoteMachineState {
+            status: RemoteMachineStatus::Cached,
+            last_error: Some(String::from("timed out")),
+            cached_projects: vec![ProjectBucket {
+                machine_name: String::from("pi"),
+                machine_target: Some(String::from("pi@192.168.0.20")),
+                machine_codex_home: Some(String::from("/home/pi/.codex")),
+                machine_exec_prefix: None,
+                cwd: String::from("/remote/repo"),
+                sessions: vec![sample_session(
+                    "/tmp/remote.jsonl",
+                    "/remote/repo",
+                    "abc1234",
+                )],
+            }],
+            last_scan_at: Some(Instant::now()),
+        };
+
+        let next = app.scan_remote_machine(&machine, &previous, false);
+        assert_eq!(next.status, RemoteMachineStatus::Cached);
+        assert_eq!(next.cached_projects.len(), 1);
+        assert_eq!(next.cached_projects[0].cwd, "/remote/repo");
     }
 
     #[test]
@@ -9351,6 +9799,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/repo/a"),
                 sessions: vec![sample_session("/tmp/a.jsonl", "/repo/a", "a")],
             },
@@ -9358,6 +9807,7 @@ mod tests {
                 machine_name: String::from("pi"),
                 machine_target: Some(String::from("pi@192.168.0.20")),
                 machine_codex_home: Some(String::from("/home/pi/.codex")),
+                machine_exec_prefix: None,
                 cwd: String::from("/remote/repo"),
                 sessions: vec![sample_session("/tmp/b.jsonl", "/remote/repo", "b")],
             },
@@ -9377,6 +9827,7 @@ mod tests {
             name: String::from("pi"),
             ssh_target: String::from("pi@192.168.0.20"),
             codex_home: Some(String::from("/home/pi/.codex")),
+            exec_prefix: None,
         });
 
         let target = app.resolve_machine_target("pi:/work/repo").expect("target");
@@ -9393,6 +9844,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/root/git/this"),
                 sessions: vec![sample_session("/tmp/this.jsonl", "/root/git/this", "this")],
             },
@@ -9400,6 +9852,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/root/git/that"),
                 sessions: vec![sample_session("/tmp/that.jsonl", "/root/git/that", "that")],
             },
@@ -9407,6 +9860,7 @@ mod tests {
                 machine_name: String::from("local"),
                 machine_target: None,
                 machine_codex_home: None,
+                machine_exec_prefix: None,
                 cwd: String::from("/root/misc"),
                 sessions: vec![sample_session("/tmp/misc.jsonl", "/root/misc", "misc")],
             },
@@ -9429,12 +9883,72 @@ mod tests {
     }
 
     #[test]
+    fn machine_status_suffixes_render_for_browser_roots() {
+        assert_eq!(machine_status_suffix(RemoteMachineStatus::Healthy), "[ok]");
+        assert_eq!(
+            machine_status_suffix(RemoteMachineStatus::Cached),
+            "[cached]"
+        );
+        assert_eq!(
+            machine_status_suffix(RemoteMachineStatus::Error),
+            "[offline]"
+        );
+    }
+
+    #[test]
+    fn render_browser_shows_machine_health_suffix() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            machine_name: String::from("pi"),
+            machine_target: Some(String::from("pi@192.168.0.20")),
+            machine_codex_home: Some(String::from("/home/pi/.codex")),
+            machine_exec_prefix: None,
+            cwd: String::from("/remote/repo"),
+            sessions: vec![sample_session(
+                "/tmp/remote.jsonl",
+                "/remote/repo",
+                "abc1234",
+            )],
+        }];
+        app.collapsed_groups.clear();
+        app.collapsed_projects.clear();
+        app.remote_states.insert(
+            String::from("pi"),
+            RemoteMachineState {
+                status: RemoteMachineStatus::Error,
+                last_error: Some(String::from("timed out")),
+                cached_projects: Vec::new(),
+                last_scan_at: Some(Instant::now()),
+            },
+        );
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_browser(
+                    frame,
+                    ratatui::layout::Rect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 12,
+                    },
+                    &app,
+                );
+            })
+            .expect("draw");
+        assert!(buffer_contains(terminal.backend(), "[offline]"));
+    }
+
+    #[test]
     fn browser_tree_shows_sessions_under_project_leaf_only() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/root/git/this"),
             sessions: vec![sample_session(
                 "/tmp/this.jsonl",
@@ -9544,6 +10058,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             file_name: String::from("sample.jsonl"),
             id: String::from("abcdef1234567890"),
             cwd: String::from("/tmp/x"),
@@ -9559,6 +10074,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/tmp/x"),
             sessions: vec![session],
         }];
@@ -9591,6 +10107,7 @@ mod tests {
             machine_name: String::from("local"),
             machine_target: None,
             machine_codex_home: None,
+            machine_exec_prefix: None,
             cwd: String::from("/tmp/work"),
             sessions: vec![sample_session("/tmp/a.jsonl", "/tmp/work", "abcdef123456")],
         }];
