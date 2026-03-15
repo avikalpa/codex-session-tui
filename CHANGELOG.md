@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.12 - 2026-03-15
+
+### Fixed
+- Recut the search-fix release from the correct `main` commit so npm and GitHub assets pick up the actual `Esc`-clears-search behavior and the updated README manual.
+
 ## 1.3.11 - 2026-03-15
 
 ### Fixed
