@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.22 - 2026-03-15
+
+- Fixed remote copy/move/fork writes so remote `codex_home` is resolved on the target machine before writing, instead of storing a quoted literal like `~/.codex/...` in the remote thread index.
+- This fixes copied remote sessions that previously produced a SQLite row but no real rollout file, which made them invisible to both `codex resume` and the TUI Browser.
+
 ## 1.3.21 - 2026-03-15
 
 - Fixed remote Browser tree path compression so absolute remote folders like `/home/pi/data/cases` no longer render under a bogus `//home/pi` node.

@@ -3992,10 +3992,15 @@ impl App {
         let (out, session_id, _) =
             duplicate_session_content(session, &target.cwd, rewrite_id, rewrite_start_timestamp)?;
         if let Some(ssh_target) = &target.ssh_target {
-            let remote_path = write_new_remote_session(
+            let remote_codex_home = resolve_remote_codex_home(
                 ssh_target,
                 target.exec_prefix.as_deref(),
                 &target.codex_home,
+            )?;
+            let remote_path = write_new_remote_session(
+                ssh_target,
+                target.exec_prefix.as_deref(),
+                &remote_codex_home,
                 &session_id,
                 &out,
             )?;
@@ -7458,6 +7463,36 @@ fn run_remote_python_text(
     batch_mode: bool,
 ) -> Result<String> {
     Ok(run_remote_python_lines(ssh_target, exec_prefix, script, args, batch_mode)?.join("\n"))
+}
+
+fn resolve_remote_codex_home(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    configured: &str,
+) -> Result<String> {
+    let requested = configured.trim();
+    let requested = if requested.is_empty() {
+        "~/.codex"
+    } else {
+        requested
+    };
+    let resolved = run_remote_python_text(
+        ssh_target,
+        exec_prefix,
+        "import os, sys\nprint(os.path.expanduser(sys.argv[1]))\n",
+        &[requested.to_string()],
+        false,
+    )?;
+    let resolved = resolved.trim();
+    if resolved.is_empty() {
+        Err(anyhow!(
+            "remote CODEX_HOME resolved empty for {} from {}",
+            ssh_target,
+            requested
+        ))
+    } else {
+        Ok(resolved.to_string())
+    }
 }
 
 fn read_session_content(session: &SessionSummary) -> Result<String> {
