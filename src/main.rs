@@ -372,7 +372,13 @@ fn trigger_status_button(button: StatusButton, app: &mut App) {
         StatusButton::Copy => app.start_action(Action::Copy),
         StatusButton::Fork => app.start_action(Action::Fork),
         StatusButton::Export => app.start_action(Action::Export),
-        StatusButton::Delete => app.start_action(Action::Delete),
+        StatusButton::Delete => {
+            if app.selected_remote_machine().is_some() {
+                app.start_action(Action::DeleteRemote);
+            } else {
+                app.start_action(Action::Delete);
+            }
+        }
         StatusButton::ProjectRename => app.start_action(Action::ProjectRename),
         StatusButton::ProjectCopy => app.start_action(Action::ProjectCopy),
         StatusButton::AddRemote => app.start_action(Action::AddRemote),
@@ -768,7 +774,9 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
             }
         }
         KeyCode::Char('d') | KeyCode::Delete => {
-            if app.current_session().is_some() {
+            if app.selected_remote_machine().is_some() {
+                app.start_action(Action::DeleteRemote);
+            } else if app.current_session().is_some() {
                 app.start_action(Action::Delete);
             }
         }
@@ -946,6 +954,7 @@ enum Action {
     Fork,
     Export,
     Delete,
+    DeleteRemote,
     ProjectRename,
     ProjectCopy,
     AddRemote,
@@ -1378,7 +1387,7 @@ impl App {
     }
 
     fn move_up(&mut self) {
-        if self.projects.is_empty() {
+        if self.browser_rows().is_empty() {
             return;
         }
 
@@ -1393,7 +1402,7 @@ impl App {
     }
 
     fn move_down(&mut self) {
-        if self.projects.is_empty() {
+        if self.browser_rows().is_empty() {
             return;
         }
 
@@ -1467,9 +1476,17 @@ impl App {
 
     fn browser_machine_roots(&self) -> Vec<String> {
         let mut roots = vec![String::from("local")];
-        roots.extend(self.config.machines.iter().map(|m| m.name.clone()));
-        roots.sort();
-        roots.dedup();
+        let mut seen = HashSet::from([String::from("local")]);
+        for machine in &self.config.machines {
+            if seen.insert(machine.name.clone()) {
+                roots.push(machine.name.clone());
+            }
+        }
+        for project in &self.projects {
+            if seen.insert(project.machine_name.clone()) {
+                roots.push(project.machine_name.clone());
+            }
+        }
         roots
     }
 
@@ -1542,7 +1559,6 @@ impl App {
                 self.project_idx = project_idx;
                 self.browser_cursor = BrowserCursor::Project;
                 self.selected_group_path = None;
-                self.auto_manage_project_expansion();
             }
             BrowserRowKind::Session {
                 project_idx,
@@ -1552,7 +1568,6 @@ impl App {
                 self.browser_cursor = BrowserCursor::Session;
                 self.session_idx = session_idx;
                 self.selected_group_path = None;
-                self.auto_manage_project_expansion();
             }
         }
         self.clamp_session_idx();
@@ -1629,22 +1644,6 @@ impl App {
         self.toggle_current_project_collapsed_manual();
     }
 
-    fn auto_manage_project_expansion(&mut self) {
-        let Some(current_project) = self.current_project().cloned() else {
-            return;
-        };
-        let current_key = project_bucket_key(&current_project);
-        for project in &self.projects {
-            let key = project_bucket_key(project);
-            if key != current_key && !pinned_set_contains(&self.pinned_open_projects, project) {
-                self.collapsed_projects.insert(key);
-                self.collapsed_projects.insert(project.cwd.clone());
-            }
-        }
-        self.collapsed_projects.remove(&current_key);
-        self.collapsed_projects.remove(&current_project.cwd);
-    }
-
     fn collapse_all_projects_except_current(&mut self) {
         let current_key = self.current_project().map(project_bucket_key);
         self.collapsed_projects.clear();
@@ -1684,7 +1683,6 @@ impl App {
             .flat_map(|project| [project_bucket_key(project), project.cwd.clone()])
             .collect();
         self.collapsed_groups = default_collapsed_group_paths(&self.projects);
-        self.expand_initial_browser_groups();
         self.pinned_open_projects.clear();
         if let Some(first_root) = self.browser_machine_roots().first().cloned() {
             self.browser_cursor = BrowserCursor::Group;
@@ -1698,27 +1696,6 @@ impl App {
         self.preview_scroll = 0;
     }
 
-    fn expand_initial_browser_groups(&mut self) {
-        let Some(first_project) = self.projects.first() else {
-            return;
-        };
-        let segments = browser_tree_segments_for_project(first_project);
-        if segments.is_empty() {
-            return;
-        }
-        let mut current = String::new();
-        for (idx, segment) in segments.iter().enumerate().take(2) {
-            if idx == 0 {
-                current = segment.clone();
-            } else if current == "/" {
-                current = format!("/{segment}");
-            } else {
-                current = format!("{current}/{segment}");
-            }
-            self.collapsed_groups.remove(&current);
-        }
-    }
-
     fn jump_project(&mut self, delta: isize) {
         if self.projects.is_empty() {
             return;
@@ -1728,7 +1705,6 @@ impl App {
         self.project_idx = next as usize;
         self.browser_cursor = BrowserCursor::Project;
         self.selected_group_path = None;
-        self.auto_manage_project_expansion();
         self.session_select_anchor = None;
         self.note_browser_navigation();
         self.ensure_selection_visible();
@@ -2354,6 +2330,20 @@ impl App {
             .and_then(|project| project.sessions.get(self.session_idx))
     }
 
+    fn selected_remote_machine(&self) -> Option<&ConfigMachine> {
+        if self.browser_cursor != BrowserCursor::Group {
+            return None;
+        }
+        let name = self.selected_group_path.as_deref()?;
+        if name == "local" || name.contains('/') {
+            return None;
+        }
+        self.config
+            .machines
+            .iter()
+            .find(|machine| machine.name == name)
+    }
+
     fn selected_sessions_in_current_project(&self) -> Vec<SessionSummary> {
         let Some(project) = self.current_project() else {
             return Vec::new();
@@ -2516,7 +2506,7 @@ impl App {
                 .current_project()
                 .map(|p| p.sessions.clone())
                 .unwrap_or_default(),
-            Action::AddRemote => Vec::new(),
+            Action::AddRemote | Action::DeleteRemote => Vec::new(),
             Action::Move | Action::Copy | Action::Fork | Action::Export | Action::Delete => {
                 let selected = self.selected_sessions_in_current_project();
                 if !selected.is_empty() {
@@ -2688,10 +2678,11 @@ impl App {
 
     fn start_action(&mut self, action: Action) {
         let targets = self.action_targets(action);
-        if action != Action::AddRemote && targets.is_empty() {
+        if !matches!(action, Action::AddRemote | Action::DeleteRemote) && targets.is_empty() {
             self.status = match action {
                 Action::ProjectRename | Action::ProjectCopy => String::from("No project selected"),
                 Action::AddRemote => String::from("Enter remote connection details"),
+                Action::DeleteRemote => String::from("No remote machine selected"),
                 _ => String::from("No session selected"),
             };
             return;
@@ -2724,6 +2715,15 @@ impl App {
                 "Delete {} session(s): type DELETE and press Enter",
                 targets.len()
             ),
+            Action::DeleteRemote => self
+                .selected_remote_machine()
+                .map(|machine| {
+                    format!(
+                        "Delete remote '{}': type DELETE and press Enter",
+                        machine.name
+                    )
+                })
+                .unwrap_or_else(|| String::from("Delete remote: type DELETE and press Enter")),
             Action::ProjectRename => format!(
                 "Rename folder sessions ({}) to target path and press Enter",
                 targets.len()
@@ -2754,13 +2754,13 @@ impl App {
         };
 
         let targets = self.action_targets(action);
-        if action != Action::AddRemote && targets.is_empty() {
+        if !matches!(action, Action::AddRemote | Action::DeleteRemote) && targets.is_empty() {
             self.status = String::from("No applicable sessions for this action");
             return Ok(());
         }
         let target_display = self.input.trim().to_string();
         let target_str = match action {
-            Action::Delete => {
+            Action::Delete | Action::DeleteRemote => {
                 if !delete_confirmation_valid(&self.input) {
                     self.status = String::from("Delete cancelled: type DELETE to confirm");
                     return Ok(());
@@ -2780,6 +2780,17 @@ impl App {
                 let machine = parse_config_machine_input(&self.input)?;
                 upsert_config_machine(&mut self.config, machine);
                 save_app_config(&self.config_path, &self.config)?;
+                ok = 1;
+                self.reload(true)?;
+            }
+            Action::DeleteRemote => {
+                let Some(machine) = self.selected_remote_machine().cloned() else {
+                    self.status = String::from("No remote machine selected");
+                    return Ok(());
+                };
+                self.config.machines.retain(|m| m.name != machine.name);
+                save_app_config(&self.config_path, &self.config)?;
+                self.remote_states.remove(&machine.name);
                 ok = 1;
                 self.reload(true)?;
             }
@@ -2815,7 +2826,7 @@ impl App {
                         }
                         Action::Export => export_session_via_ssh(session, &target_str),
                         Action::Delete => self.apply_delete_action(session),
-                        Action::AddRemote => Ok(()),
+                        Action::AddRemote | Action::DeleteRemote => Ok(()),
                     };
                     match result {
                         Ok(()) => ok += 1,
@@ -2831,7 +2842,11 @@ impl App {
         self.input_focused = false;
         self.clear_input_completion_cycle();
 
-        if !matches!(action, Action::Export | Action::AddRemote) && (ok > 0 || skipped > 0) {
+        if !matches!(
+            action,
+            Action::Export | Action::AddRemote | Action::DeleteRemote
+        ) && (ok > 0 || skipped > 0)
+        {
             self.reload(false)?;
         }
         self.selected_sessions.clear();
@@ -2843,6 +2858,7 @@ impl App {
             Action::Fork => "forked",
             Action::Export => "exported",
             Action::Delete => "deleted",
+            Action::DeleteRemote => "deleted remote",
             Action::ProjectRename => "renamed",
             Action::ProjectCopy => "copied",
             Action::AddRemote => "connected",
@@ -2850,6 +2866,8 @@ impl App {
         self.status = if failures.is_empty() {
             if action == Action::Delete {
                 format!("{action_name} {ok} session(s)")
+            } else if action == Action::DeleteRemote {
+                format!("{action_name} {ok} machine(s)")
             } else if skipped > 0 {
                 format!(
                     "{action_name} {ok} session(s), skipped {skipped} unchanged -> {target_display}"
@@ -3044,7 +3062,7 @@ impl App {
                 Ok(())
             }
             Action::Delete => self.apply_delete_action(session),
-            Action::AddRemote => Ok(()),
+            Action::AddRemote | Action::DeleteRemote => Ok(()),
         }
     }
 
@@ -3231,10 +3249,6 @@ fn project_bucket_key(project: &ProjectBucket) -> String {
 
 fn project_set_contains(set: &HashSet<String>, project: &ProjectBucket) -> bool {
     set.contains(&project_bucket_key(project)) || set.contains(&project.cwd)
-}
-
-fn pinned_set_contains(set: &HashSet<String>, project: &ProjectBucket) -> bool {
-    project_set_contains(set, project)
 }
 
 fn is_user_only_session(session: &SessionSummary) -> bool {
@@ -3766,6 +3780,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" copy folder sessions  "),
             Span::styled("R", Style::default().fg(Color::Green)),
             Span::raw(" connect remote  "),
+            Span::styled("d", Style::default().fg(Color::Red)),
+            Span::raw(" delete remote  "),
             Span::styled("/", Style::default().fg(Color::Cyan)),
             Span::raw(" search  "),
             Span::styled("f5/ctrl+r", Style::default().fg(Color::Yellow)),
@@ -3905,6 +3921,7 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Some(Action::Fork) => "FORK",
             Some(Action::Export) => "EXPORT",
             Some(Action::Delete) => "DELETE",
+            Some(Action::DeleteRemote) => "DELETE REMOTE",
             Some(Action::ProjectRename) => "RENAME FOLDER",
             Some(Action::ProjectCopy) => "COPY FOLDER",
             Some(Action::AddRemote) => "CONNECT REMOTE",
@@ -4576,15 +4593,17 @@ fn build_browser_rows(
 ) -> Vec<BrowserRow> {
     let tree = build_browser_tree(projects, machine_roots);
     let mut rows = Vec::new();
-    for node in tree.values() {
-        append_browser_rows(
-            node,
-            projects,
-            collapsed_groups,
-            collapsed_projects,
-            &mut rows,
-            0,
-        );
+    for root_name in machine_roots {
+        if let Some(node) = tree.get(root_name) {
+            append_browser_rows(
+                node,
+                projects,
+                collapsed_groups,
+                collapsed_projects,
+                &mut rows,
+                0,
+            );
+        }
     }
     rows
 }
@@ -4595,11 +4614,13 @@ fn build_browser_tree(
 ) -> BTreeMap<String, BrowserTreeNode> {
     let mut roots = BTreeMap::<String, BrowserTreeNode>::new();
     for root_name in machine_roots {
-        roots.entry(root_name.clone()).or_insert_with(|| BrowserTreeNode {
-            name: root_name.clone(),
-            full_path: root_name.clone(),
-            ..BrowserTreeNode::default()
-        });
+        roots
+            .entry(root_name.clone())
+            .or_insert_with(|| BrowserTreeNode {
+                name: root_name.clone(),
+                full_path: root_name.clone(),
+                ..BrowserTreeNode::default()
+            });
     }
     for (project_idx, project) in projects.iter().enumerate() {
         let segments = browser_tree_segments_for_project(project);
@@ -6134,25 +6155,13 @@ fn run_remote_python_lines(
 ) -> Result<Vec<String>> {
     let mut cmd = Command::new("ssh");
     add_ssh_options(&mut cmd, batch_mode);
-    cmd.arg(ssh_target);
-    if let Some(prefix) = exec_prefix
-        .map(str::trim)
-        .filter(|prefix| !prefix.is_empty())
-    {
-        let mut inner = String::from("python3 -");
-        for arg in args {
-            inner.push(' ');
-            inner.push_str(&sh_single_quote(arg));
-        }
-        cmd.arg("sh")
-            .arg("-lc")
-            .arg(format!("{prefix} sh -lc {}", sh_single_quote(&inner)));
-    } else {
-        cmd.arg("python3").arg("-");
-        for arg in args {
-            cmd.arg(arg);
-        }
+    let mut inner = String::from("python3 -");
+    for arg in args {
+        inner.push(' ');
+        inner.push_str(&sh_single_quote(arg));
     }
+    let remote = wrap_remote_exec(exec_prefix, &inner);
+    cmd.arg(ssh_target).arg(remote);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -6663,7 +6672,10 @@ fn infer_machine_name_from_ssh_target(target: &str) -> String {
 
 fn parse_config_machine_input(input: &str) -> Result<ConfigMachine> {
     let trimmed = input.trim();
-    let (name, rest) = if let Some((name, rest)) = trimmed.split_once('=') {
+    let explicit_name = trimmed
+        .split_once('=')
+        .map(|(name, rest)| (name.trim().to_string(), rest.trim().to_string()));
+    let (mut name, rest) = if let Some((name, rest)) = explicit_name {
         let name = name.trim();
         let rest = rest.trim();
         if name.is_empty() || rest.is_empty() {
@@ -6678,10 +6690,7 @@ fn parse_config_machine_input(input: &str) -> Result<ConfigMachine> {
                 "remote must look like user@host, name=user@host, name=user@host:/remote/.codex, or name=user@host|exec-prefix|/remote/.codex"
             ));
         }
-        (
-            infer_machine_name_from_ssh_target(trimmed),
-            trimmed.to_string(),
-        )
+        (String::new(), trimmed.to_string())
     };
 
     if rest.contains('|') {
@@ -6696,6 +6705,9 @@ fn parse_config_machine_input(input: &str) -> Result<ConfigMachine> {
         let codex_home = parts.get(2).copied();
         if ssh_target.is_empty() {
             return Err(anyhow!("remote ssh target is empty"));
+        }
+        if name.is_empty() {
+            name = infer_machine_name_from_ssh_target(ssh_target);
         }
         if exec_prefix.is_empty() {
             return Err(anyhow!("remote exec prefix is empty"));
@@ -6716,6 +6728,9 @@ fn parse_config_machine_input(input: &str) -> Result<ConfigMachine> {
     if let Some((ssh_target, codex_home)) = rest.rsplit_once(":/")
         && !ssh_target.is_empty()
     {
+        if name.is_empty() {
+            name = infer_machine_name_from_ssh_target(ssh_target.trim());
+        }
         let codex_home = format!("/{}", codex_home);
         return Ok(ConfigMachine {
             name,
@@ -6723,6 +6738,9 @@ fn parse_config_machine_input(input: &str) -> Result<ConfigMachine> {
             exec_prefix: None,
             codex_home: Some(codex_home),
         });
+    }
+    if name.is_empty() {
+        name = infer_machine_name_from_ssh_target(&rest);
     }
     Ok(ConfigMachine {
         name,
@@ -7812,7 +7830,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_row_navigation_auto_collapses_unpinned_projects() {
+    fn browser_row_navigation_does_not_auto_expand_projects() {
         let mut app = empty_test_app();
         app.projects = vec![
             ProjectBucket {
@@ -7835,26 +7853,17 @@ mod tests {
                 sessions: vec![sample_session("/tmp/b1.jsonl", "/repo-b", "b1")],
             },
         ];
+        app.collapsed_projects.insert(String::from("/repo-a"));
+        app.collapsed_projects.insert(String::from("/repo-b"));
+        app.collapsed_groups = default_collapsed_group_paths(&app.projects);
+        app.browser_cursor = BrowserCursor::Group;
+        app.selected_group_path = Some(String::from("local"));
 
         app.move_down();
-        assert_eq!(app.browser_cursor, BrowserCursor::Session);
-        assert_eq!(app.project_idx, 0);
-        assert_eq!(app.session_idx, 0);
-
-        app.move_down();
-        assert_eq!(app.browser_cursor, BrowserCursor::Session);
-        assert_eq!(app.project_idx, 0);
-        assert_eq!(app.session_idx, 1);
-
-        app.move_down();
-        assert_eq!(app.browser_cursor, BrowserCursor::Project);
-        assert_eq!(app.project_idx, 1);
+        assert_eq!(app.browser_cursor, BrowserCursor::Group);
+        assert_eq!(app.selected_group_path.as_deref(), Some("local"));
         assert!(app.collapsed_projects.contains("/repo-a"));
-
-        app.move_up();
-        assert_eq!(app.browser_cursor, BrowserCursor::Project);
-        assert_eq!(app.project_idx, 0);
-        assert!(!app.collapsed_projects.contains("/repo-a"));
+        assert!(app.collapsed_projects.contains("/repo-b"));
     }
 
     #[test]
@@ -8180,7 +8189,7 @@ mod tests {
     }
 
     #[test]
-    fn moving_up_to_project_row_auto_expands_it() {
+    fn moving_up_to_project_row_keeps_project_expansion_state() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
             machine_name: String::from("local"),
@@ -8203,7 +8212,7 @@ mod tests {
     }
 
     #[test]
-    fn moving_onto_project_row_auto_expands_it() {
+    fn moving_onto_project_row_keeps_it_collapsed() {
         let mut app = empty_test_app();
         app.projects = vec![
             ProjectBucket {
@@ -8231,7 +8240,7 @@ mod tests {
 
         assert_eq!(app.project_idx, 1);
         assert_eq!(app.browser_cursor, BrowserCursor::Project);
-        assert!(!app.collapsed_projects.contains("/repo-b"));
+        assert!(app.collapsed_projects.contains("/repo-b"));
     }
 
     #[test]
@@ -9824,13 +9833,12 @@ mod tests {
         assert_eq!(machine.ssh_target, "root@example-host");
         assert_eq!(machine.exec_prefix.as_deref(), Some("lxc-attach -n dev --"));
         assert_eq!(machine.codex_home.as_deref(), Some("/root/.codex"));
-    }
 
-    #[test]
-    fn wrap_remote_exec_supports_container_prefix() {
-        let wrapped = wrap_remote_exec(Some("lxc-attach -n dev --"), "python3 - /root/.codex");
-        assert!(wrapped.contains("lxc-attach -n dev -- sh -lc"));
-        assert!(wrapped.contains("python3 - /root/.codex"));
+        let bare =
+            parse_config_machine_input("root@example-host|lxc-attach -n dev --|/root/.codex")
+                .expect("bare");
+        assert_eq!(bare.name, "example-host");
+        assert_eq!(bare.ssh_target, "root@example-host");
     }
 
     #[test]
@@ -9922,6 +9930,75 @@ mod tests {
     }
 
     #[test]
+    fn down_cycles_machine_roots_without_auto_expanding() {
+        let mut app = empty_test_app();
+        app.config.machines.push(ConfigMachine {
+            name: String::from("pi"),
+            ssh_target: String::from("pi@192.168.0.20"),
+            exec_prefix: None,
+            codex_home: Some(String::from("/home/pi/.codex")),
+        });
+        app.config.machines.push(ConfigMachine {
+            name: String::from("dev"),
+            ssh_target: String::from("root@example-host"),
+            exec_prefix: Some(String::from("lxc-attach -n dev --")),
+            codex_home: Some(String::from("/root/.codex")),
+        });
+        app.collapse_all_projects();
+
+        assert_eq!(app.selected_group_path.as_deref(), Some("local"));
+        app.move_down();
+        assert_eq!(app.browser_cursor, BrowserCursor::Group);
+        assert_eq!(app.selected_group_path.as_deref(), Some("pi"));
+        app.move_down();
+        assert_eq!(app.browser_cursor, BrowserCursor::Group);
+        assert_eq!(app.selected_group_path.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn delete_key_starts_delete_remote_action_for_machine_root() {
+        let mut app = empty_test_app();
+        app.config.machines.push(ConfigMachine {
+            name: String::from("dev"),
+            ssh_target: String::from("root@example-host"),
+            exec_prefix: Some(String::from("lxc-attach -n dev --")),
+            codex_home: Some(String::from("/root/.codex")),
+        });
+        app.browser_cursor = BrowserCursor::Group;
+        app.selected_group_path = Some(String::from("dev"));
+        app.focus = Focus::Projects;
+
+        let quit = handle_normal_mode(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            &mut app,
+        )
+        .expect("handle");
+        assert!(!quit);
+        assert_eq!(app.mode, Mode::Input);
+        assert_eq!(app.pending_action, Some(Action::DeleteRemote));
+    }
+
+    #[test]
+    fn submit_input_delete_remote_removes_machine_from_config() {
+        let mut app = empty_test_app();
+        app.config.machines.push(ConfigMachine {
+            name: String::from("dev"),
+            ssh_target: String::from("root@example-host"),
+            exec_prefix: Some(String::from("lxc-attach -n dev --")),
+            codex_home: Some(String::from("/root/.codex")),
+        });
+        app.browser_cursor = BrowserCursor::Group;
+        app.selected_group_path = Some(String::from("dev"));
+        app.pending_action = Some(Action::DeleteRemote);
+        app.mode = Mode::Input;
+        app.input = String::from("DELETE");
+
+        app.submit_input().expect("submit");
+        assert!(app.config.machines.is_empty());
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
     fn browser_tree_segments_normalize_double_leading_slash() {
         assert_eq!(
             browser_tree_segments("//home/pi"),
@@ -9930,7 +10007,7 @@ mod tests {
     }
 
     #[test]
-    fn collapse_all_projects_expands_first_machine_and_first_folder() {
+    fn collapse_all_projects_selects_local_machine_root_first() {
         let mut app = empty_test_app();
         app.config.machines.push(ConfigMachine {
             name: String::from("pi"),
@@ -9961,9 +10038,56 @@ mod tests {
 
         assert_eq!(app.browser_cursor, BrowserCursor::Group);
         assert_eq!(app.selected_group_path.as_deref(), Some("local"));
-        assert!(!app.collapsed_groups.contains("local"));
-        assert!(!app.collapsed_groups.contains("local/"));
+        assert!(app.collapsed_groups.contains("local"));
         assert!(app.collapsed_groups.contains("pi"));
+        assert!(app.collapsed_projects.contains("/repo/a"));
+        assert!(app.collapsed_projects.contains("/remote/repo"));
+    }
+
+    #[test]
+    fn wrap_remote_exec_supports_container_prefix() {
+        let wrapped = wrap_remote_exec(Some("lxc-attach -n dev --"), "python3 - '/root/.codex'");
+        assert!(wrapped.contains("lxc-attach -n dev -- sh -lc"));
+        assert!(wrapped.contains("python3 - "));
+        assert!(wrapped.contains("/root/.codex"));
+    }
+
+    #[test]
+    fn run_remote_python_uses_wrapped_single_remote_command_for_exec_prefix() {
+        let remote = {
+            let mut inner = String::from("python3 -");
+            inner.push(' ');
+            inner.push_str(&sh_single_quote("/root/.codex"));
+            wrap_remote_exec(Some("lxc-attach -n dev --"), &inner)
+        };
+        assert!(remote.contains("lxc-attach -n dev -- sh -lc"));
+        assert!(remote.contains("python3 - "));
+        assert!(remote.contains("/root/.codex"));
+    }
+
+    #[test]
+    fn browser_machine_roots_keep_local_first_then_config_order() {
+        let mut app = empty_test_app();
+        app.config.machines.push(ConfigMachine {
+            name: String::from("zeta"),
+            ssh_target: String::from("zeta@example"),
+            exec_prefix: None,
+            codex_home: None,
+        });
+        app.config.machines.push(ConfigMachine {
+            name: String::from("alpha"),
+            ssh_target: String::from("alpha@example"),
+            exec_prefix: None,
+            codex_home: None,
+        });
+        assert_eq!(
+            app.browser_machine_roots(),
+            vec![
+                String::from("local"),
+                String::from("zeta"),
+                String::from("alpha")
+            ]
+        );
     }
 
     #[test]
