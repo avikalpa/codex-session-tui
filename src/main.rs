@@ -67,6 +67,14 @@ fn run_app(tui: &mut Tui, app: &mut App) -> Result<()> {
             continue;
         }
 
+        if app.progress_op.is_some() {
+            if let Err(err) = app.step_browser_transfer_progress() {
+                app.progress_op = None;
+                app.status = format!("{err:#}");
+            }
+            continue;
+        }
+
         if !event::poll(Duration::from_millis(150))? {
             continue;
         }
@@ -274,8 +282,9 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
                         };
                         let target_label =
                             format!("{}:{}", target.name, browser_display_path(&target.cwd));
-                        app.queue_deferred_op(
-                            DeferredOp::BrowserDrop(source.clone(), target),
+                        app.start_browser_transfer(
+                            source.clone(),
+                            target,
                             format!(
                                 "Working... {verb} {} into {target_label}",
                                 source.source_label
@@ -661,6 +670,20 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
         return Ok(false);
     }
 
+    if key.modifiers.contains(KeyModifiers::ALT) && !key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Left | KeyCode::Up => {
+                app.prev_focus();
+                return Ok(false);
+            }
+            KeyCode::Right | KeyCode::Down => {
+                app.next_focus();
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) && app.focus == Focus::Projects {
         match key.code {
             KeyCode::Up => {
@@ -726,6 +749,13 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
         KeyCode::Tab => {
             if app.focus == Focus::Preview {
                 app.toggle_fold_focused_preview_turn();
+            } else if app.focus == Focus::Projects
+                && matches!(
+                    app.browser_cursor,
+                    BrowserCursor::Project | BrowserCursor::Group
+                )
+            {
+                app.browser_enter();
             } else {
                 app.next_focus();
             }
@@ -1244,13 +1274,22 @@ struct App {
     launch_codex_after_exit: Option<CodexLaunchSpec>,
     remote_states: BTreeMap<String, RemoteMachineState>,
     deferred_op: Option<DeferredOp>,
+    progress_op: Option<BrowserTransferProgress>,
 }
 
 #[derive(Clone)]
 enum DeferredOp {
     SubmitInput,
-    BrowserPaste(BrowserClipboard, MachineTargetSpec),
-    BrowserDrop(BrowserClipboard, MachineTargetSpec),
+}
+
+#[derive(Clone)]
+struct BrowserTransferProgress {
+    source: BrowserClipboard,
+    target: MachineTargetSpec,
+    index: usize,
+    ok: usize,
+    skipped: usize,
+    failures: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -1319,11 +1358,159 @@ impl App {
     fn run_deferred_op(&mut self, op: DeferredOp) -> Result<()> {
         match op {
             DeferredOp::SubmitInput => self.submit_input(),
-            DeferredOp::BrowserPaste(clipboard, target)
-            | DeferredOp::BrowserDrop(clipboard, target) => {
-                self.apply_browser_drop(&clipboard, &target)
-            }
         }
+    }
+
+    fn start_browser_transfer(
+        &mut self,
+        source: BrowserClipboard,
+        target: MachineTargetSpec,
+        status: String,
+    ) {
+        self.deferred_op = None;
+        self.progress_op = Some(BrowserTransferProgress {
+            source,
+            target,
+            index: 0,
+            ok: 0,
+            skipped: 0,
+            failures: Vec::new(),
+        });
+        self.status = status;
+    }
+
+    fn step_browser_transfer_progress(&mut self) -> Result<()> {
+        let Some(mut progress) = self.progress_op.take() else {
+            return Ok(());
+        };
+        let total = progress.source.targets.len();
+        if total == 0 {
+            self.status = String::from("Nothing to transfer");
+            return Ok(());
+        }
+
+        if progress.index >= total {
+            self.finish_browser_transfer(progress)?;
+            return Ok(());
+        }
+
+        let session = progress.source.targets[progress.index].clone();
+        let effective_target =
+            if let Some(source_group_cwd) = progress.source.source_group_cwd.as_deref() {
+                target_for_group_drop(&session, source_group_cwd, &progress.target)
+            } else {
+                progress.target.clone()
+            };
+
+        let result = match progress.source.mode {
+            BrowserClipboardMode::Copy => {
+                self.apply_session_action_to_target(Action::Copy, &session, &effective_target)
+            }
+            BrowserClipboardMode::Cut => {
+                if session.machine_target == effective_target.ssh_target
+                    && session.cwd == effective_target.cwd
+                {
+                    progress.skipped += 1;
+                    Ok(())
+                } else {
+                    self.apply_session_action_to_target(Action::Move, &session, &effective_target)
+                }
+            }
+        };
+
+        match result {
+            Ok(()) => {
+                if !(progress.source.mode == BrowserClipboardMode::Cut
+                    && session.machine_target == effective_target.ssh_target
+                    && session.cwd == effective_target.cwd)
+                {
+                    progress.ok += 1;
+                }
+            }
+            Err(err) => progress
+                .failures
+                .push(format!("{}: {}", session.file_name, err)),
+        }
+
+        progress.index += 1;
+        if progress.index >= total {
+            self.finish_browser_transfer(progress)?;
+        } else {
+            self.status = self.browser_transfer_progress_status(&progress);
+            self.progress_op = Some(progress);
+        }
+        Ok(())
+    }
+
+    fn browser_transfer_progress_status(&self, progress: &BrowserTransferProgress) -> String {
+        let verb = match progress.source.mode {
+            BrowserClipboardMode::Copy => "copying",
+            BrowserClipboardMode::Cut => "moving",
+        };
+        let total = progress.source.targets.len().max(1);
+        let done = progress.index.min(total);
+        format!(
+            "Working... {verb} {} into {}:{}",
+            progress.source.source_label,
+            progress.target.name,
+            browser_display_path(&progress.target.cwd)
+        ) + &format!(
+            " {} {done}/{total} ok:{} skip:{} fail:{}",
+            progress_bar(done, total, 14),
+            progress.ok,
+            progress.skipped,
+            progress.failures.len()
+        )
+    }
+
+    fn finish_browser_transfer(&mut self, progress: BrowserTransferProgress) -> Result<()> {
+        if progress.ok > 0 {
+            self.reload(false)?;
+        }
+        self.selected_sessions.clear();
+        self.session_select_anchor = None;
+
+        if progress.source.mode == BrowserClipboardMode::Cut && progress.failures.is_empty() {
+            self.browser_clipboard = None;
+        }
+
+        let verb = match progress.source.mode {
+            BrowserClipboardMode::Copy => "Copied",
+            BrowserClipboardMode::Cut => "Moved",
+        };
+        self.status = if progress.failures.is_empty() {
+            if progress.skipped > 0 {
+                format!(
+                    "{verb} {} session(s) from {} into {}:{} (skipped {})",
+                    progress.ok,
+                    progress.source.source_label,
+                    progress.target.name,
+                    browser_display_path(&progress.target.cwd),
+                    progress.skipped
+                )
+            } else {
+                format!(
+                    "{verb} {} session(s) from {} into {}:{}",
+                    progress.ok,
+                    progress.source.source_label,
+                    progress.target.name,
+                    browser_display_path(&progress.target.cwd)
+                )
+            }
+        } else {
+            let first = progress
+                .failures
+                .first()
+                .cloned()
+                .unwrap_or_else(|| String::from("unknown error"));
+            format!(
+                "{verb} {} session(s), {} failed, skipped {}. First error: {first}",
+                progress.ok,
+                progress.failures.len(),
+                progress.skipped
+            )
+        };
+        Ok(())
     }
 
     fn busy_status_for_submit(&self) -> String {
@@ -1409,6 +1596,7 @@ impl App {
             launch_codex_after_exit: None,
             remote_states: BTreeMap::new(),
             deferred_op: None,
+            progress_op: None,
         };
 
         app.reload(true)?;
@@ -2878,90 +3066,6 @@ impl App {
         };
     }
 
-    fn apply_browser_drop(
-        &mut self,
-        source: &BrowserClipboard,
-        target: &MachineTargetSpec,
-    ) -> Result<()> {
-        let mut ok = 0usize;
-        let mut skipped = 0usize;
-        let mut failures = Vec::new();
-
-        for session in &source.targets {
-            let effective_target =
-                if let Some(source_group_cwd) = source.source_group_cwd.as_deref() {
-                    target_for_group_drop(session, source_group_cwd, target)
-                } else {
-                    target.clone()
-                };
-            let result = match source.mode {
-                BrowserClipboardMode::Copy => {
-                    self.apply_session_action_to_target(Action::Copy, session, &effective_target)
-                }
-                BrowserClipboardMode::Cut => {
-                    if session.machine_target == effective_target.ssh_target
-                        && session.cwd == effective_target.cwd
-                    {
-                        skipped += 1;
-                        Ok(())
-                    } else {
-                        self.apply_session_action_to_target(
-                            Action::Move,
-                            session,
-                            &effective_target,
-                        )
-                    }
-                }
-            };
-            match result {
-                Ok(()) => ok += 1,
-                Err(err) => failures.push(format!("{}: {}", session.file_name, err)),
-            }
-        }
-
-        if ok > 0 || skipped > 0 {
-            self.reload(false)?;
-        }
-        self.selected_sessions.clear();
-        self.session_select_anchor = None;
-
-        if source.mode == BrowserClipboardMode::Cut && failures.is_empty() {
-            self.browser_clipboard = None;
-        }
-
-        let verb = match source.mode {
-            BrowserClipboardMode::Copy => "Copied",
-            BrowserClipboardMode::Cut => "Moved",
-        };
-        self.status = if failures.is_empty() {
-            if skipped > 0 {
-                format!(
-                    "{verb} {ok} session(s) from {} into {}:{} (skipped {skipped})",
-                    source.source_label,
-                    target.name,
-                    browser_display_path(&target.cwd)
-                )
-            } else {
-                format!(
-                    "{verb} {ok} session(s) from {} into {}:{}",
-                    source.source_label,
-                    target.name,
-                    browser_display_path(&target.cwd)
-                )
-            }
-        } else {
-            let first = failures
-                .first()
-                .cloned()
-                .unwrap_or_else(|| String::from("unknown error"));
-            format!(
-                "{verb} {ok} session(s), {} failed, skipped {skipped}. First error: {first}",
-                failures.len()
-            )
-        };
-        Ok(())
-    }
-
     fn copy_browser_selection(&mut self, mode: BrowserClipboardMode) {
         let targets = self.browser_copy_targets();
         if targets.is_empty() {
@@ -3032,8 +3136,9 @@ impl App {
             "moving"
         };
         let target_label = format!("{}:{}", target.name, browser_display_path(&target.cwd));
-        self.queue_deferred_op(
-            DeferredOp::BrowserPaste(clipboard.clone(), target),
+        self.start_browser_transfer(
+            clipboard.clone(),
+            target,
             format!(
                 "Working... {verb} {} into {target_label}",
                 clipboard.source_label
@@ -4193,7 +4298,9 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::styled("tab", Style::default().fg(Color::Cyan)),
             Span::raw(" next pane  "),
             Span::styled("shift+tab", Style::default().fg(Color::Cyan)),
-            Span::raw(" prev pane"),
+            Span::raw(" prev pane  "),
+            Span::styled("alt+←/→/↑/↓", Style::default().fg(Color::Cyan)),
+            Span::raw(" panes"),
         ])
     } else if app.focus == Focus::Preview && app.mode == Mode::Normal {
         Line::from(vec![
@@ -4213,6 +4320,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" toggle block  "),
             Span::styled("shift+tab", Style::default().fg(Color::Cyan)),
             Span::raw(" toggle all blocks  "),
+            Span::styled("alt+←/→/↑/↓", Style::default().fg(Color::Cyan)),
+            Span::raw(" panes  "),
             Span::styled("o", Style::default().fg(Color::Green)),
             Span::raw(" open in codex  "),
             Span::styled("drag", Style::default().fg(Color::Cyan)),
@@ -4232,8 +4341,12 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" folder nav  "),
             Span::styled("ctrl+↑/↓", Style::default().fg(Color::Cyan)),
             Span::raw(" project jump  "),
+            Span::styled("tab", Style::default().fg(Color::Cyan)),
+            Span::raw(" toggle folder  "),
             Span::styled("←/→", Style::default().fg(Color::Cyan)),
             Span::raw(" collapse/expand  "),
+            Span::styled("alt+←/→/↑/↓", Style::default().fg(Color::Cyan)),
+            Span::raw(" panes  "),
             Span::styled("ctrl+←", Style::default().fg(Color::Cyan)),
             Span::raw(" collapse others  "),
             Span::styled("ctrl+→", Style::default().fg(Color::Cyan)),
@@ -4278,10 +4391,14 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" nav  "),
             Span::styled("ctrl+↑/↓", Style::default().fg(Color::Cyan)),
             Span::raw(" project jump  "),
+            Span::styled("tab", Style::default().fg(Color::Cyan)),
+            Span::raw(" next pane  "),
             Span::styled("←", Style::default().fg(Color::Cyan)),
             Span::raw(" folder row  "),
             Span::styled("→", Style::default().fg(Color::Cyan)),
             Span::raw(" open preview  "),
+            Span::styled("alt+←/→/↑/↓", Style::default().fg(Color::Cyan)),
+            Span::raw(" panes  "),
             Span::styled("space", Style::default().fg(Color::Yellow)),
             Span::raw(" toggle-select  "),
             Span::styled("checkbox click", Style::default().fg(Color::Yellow)),
@@ -4317,6 +4434,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
         Line::from(vec![
             Span::styled("tab", Style::default().fg(Color::Cyan)),
             Span::raw(" focus  "),
+            Span::styled("alt+←/→/↑/↓", Style::default().fg(Color::Cyan)),
+            Span::raw(" panes  "),
             Span::styled("j/k", Style::default().fg(Color::Cyan)),
             Span::raw(" nav  "),
             Span::styled("/", Style::default().fg(Color::Cyan)),
@@ -4455,10 +4574,28 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
         lines.push(Line::from(Span::styled(app.status.clone(), status_style)));
     }
 
+    if let Some(progress) = &app.progress_op {
+        lines.push(Line::from(Span::styled(
+            app.browser_transfer_progress_status(progress),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
     let para = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title("Status"))
         .wrap(Wrap { trim: false });
     frame.render_widget(para, area);
+}
+
+fn progress_bar(done: usize, total: usize, width: usize) -> String {
+    let total = total.max(1);
+    let width = width.max(4);
+    let filled = done.saturating_mul(width) / total;
+    format!(
+        "[{}{}]",
+        "#".repeat(filled.min(width)),
+        ".".repeat(width.saturating_sub(filled.min(width)))
+    )
 }
 
 #[cfg(test)]
@@ -7604,6 +7741,7 @@ mod tests {
             launch_codex_after_exit: None,
             remote_states: BTreeMap::new(),
             deferred_op: None,
+            progress_op: None,
         }
     }
 
@@ -8259,9 +8397,12 @@ mod tests {
             &mut app,
         )
         .expect("handle");
-        let op = app.deferred_op.take().expect("deferred op");
+        assert!(app.deferred_op.is_none());
+        assert!(app.progress_op.is_some());
         assert!(app.status.starts_with("Working... copying"));
-        app.run_deferred_op(op).expect("run deferred");
+        while app.progress_op.is_some() {
+            app.step_browser_transfer_progress().expect("step transfer");
+        }
 
         let created = fs::read_dir(dated_dir)
             .expect("read dir")
@@ -8277,6 +8418,91 @@ mod tests {
             .expect("pasted file");
         let content = fs::read_to_string(pasted).expect("read pasted");
         assert!(content.contains("\"cwd\":\"/new\""));
+    }
+
+    #[test]
+    fn browser_tab_toggles_current_folder() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            cwd: String::from("/repo"),
+            sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
+        }];
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Project;
+
+        handle_normal_mode(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &mut app)
+            .expect("handle");
+        assert!(app.current_project_collapsed());
+
+        handle_normal_mode(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &mut app)
+            .expect("handle");
+        assert!(!app.current_project_collapsed());
+    }
+
+    #[test]
+    fn alt_right_cycles_focus_to_preview() {
+        let mut app = empty_test_app();
+        app.focus = Focus::Projects;
+
+        handle_normal_mode(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT), &mut app)
+            .expect("handle");
+
+        assert_eq!(app.focus, Focus::Preview);
+    }
+
+    #[test]
+    fn render_status_shows_transfer_progress_bar() {
+        let mut app = empty_test_app();
+        app.progress_op = Some(BrowserTransferProgress {
+            source: BrowserClipboard {
+                mode: BrowserClipboardMode::Copy,
+                targets: vec![
+                    sample_session("/tmp/a.jsonl", "/old", "a"),
+                    sample_session("/tmp/b.jsonl", "/old", "b"),
+                ],
+                source_label: String::from("/old"),
+                source_group_cwd: None,
+            },
+            target: MachineTargetSpec {
+                name: String::from("local"),
+                ssh_target: None,
+                codex_home: String::from("/tmp/.codex"),
+                cwd: String::from("/new"),
+                exec_prefix: None,
+            },
+            index: 1,
+            ok: 1,
+            skipped: 0,
+            failures: Vec::new(),
+        });
+        let progress_text = app.browser_transfer_progress_status(app.progress_op.as_ref().unwrap());
+        assert!(progress_text.contains('['));
+        assert!(progress_text.contains("1/2"));
+
+        let backend = TestBackend::new(260, 8);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_status(
+                    frame,
+                    ratatui::layout::Rect {
+                        x: 0,
+                        y: 0,
+                        width: 260,
+                        height: 8,
+                    },
+                    &app,
+                );
+            })
+            .expect("draw");
+
+        let backend = terminal.backend();
+        assert!(buffer_contains(backend, "1/2"));
+        assert!(buffer_contains(backend, "ok:1"));
     }
 
     #[test]
@@ -8511,8 +8737,11 @@ mod tests {
             },
             &mut app,
         );
-        let op = app.deferred_op.take().expect("deferred drop");
-        app.run_deferred_op(op).expect("run deferred");
+        assert!(app.deferred_op.is_none());
+        assert!(app.progress_op.is_some());
+        while app.progress_op.is_some() {
+            app.step_browser_transfer_progress().expect("step transfer");
+        }
 
         let moved = fs::read_dir(source_dir)
             .expect("read dir")
@@ -9450,6 +9679,7 @@ mod tests {
             launch_codex_after_exit: None,
             remote_states: BTreeMap::new(),
             deferred_op: None,
+            progress_op: None,
         };
         let text = app
             .preview_selected_text((0, 1), (1, 2))
@@ -10088,6 +10318,7 @@ mod tests {
             launch_codex_after_exit: None,
             remote_states: BTreeMap::new(),
             deferred_op: None,
+            progress_op: None,
         };
 
         app.apply_search_filter();
@@ -10233,6 +10464,32 @@ mod tests {
     }
 
     #[test]
+    fn render_status_shows_alt_arrow_pane_hints() {
+        let app = empty_test_app();
+
+        let backend = TestBackend::new(260, 4);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_status(
+                    frame,
+                    ratatui::layout::Rect {
+                        x: 0,
+                        y: 0,
+                        width: 260,
+                        height: 4,
+                    },
+                    &app,
+                );
+            })
+            .expect("draw");
+
+        let backend = terminal.backend();
+        assert!(buffer_contains(backend, "alt+"));
+        assert!(buffer_contains(backend, "panes"));
+    }
+
+    #[test]
     fn search_esc_clears_query_and_hides_search_bar() {
         let mut app = empty_test_app();
         app.search_focused = true;
@@ -10297,7 +10554,7 @@ mod tests {
         app.focus = Focus::Projects;
         app.browser_cursor = BrowserCursor::Project;
 
-        let backend = TestBackend::new(120, 4);
+        let backend = TestBackend::new(220, 5);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|frame| {
@@ -10306,8 +10563,8 @@ mod tests {
                     ratatui::layout::Rect {
                         x: 0,
                         y: 0,
-                        width: 120,
-                        height: 4,
+                        width: 220,
+                        height: 5,
                     },
                     &app,
                 );
@@ -10872,6 +11129,7 @@ mod tests {
             launch_codex_after_exit: None,
             remote_states: BTreeMap::new(),
             deferred_op: None,
+            progress_op: None,
         };
 
         app.toggle_fold_all_preview_turns();

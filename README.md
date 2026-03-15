@@ -152,9 +152,12 @@ On launch:
 ### Browser Navigation
 
 - `Up` / `Down`: move through visible rows
+- `Tab`: toggle the selected folder open/closed
 - `Right`: expand a folder or enter its sessions
 - `Left`: collapse a folder or return from a session to its folder row
 - `Enter`: expand/collapse folder or open the selected session
+- `Alt+Left` / `Alt+Up`: move focus to the previous pane
+- `Alt+Right` / `Alt+Down`: move focus to the next pane
 - `Ctrl+Up` / `Ctrl+Down`: jump between projects
 - `Ctrl+Left`: collapse all folders except the current one
 - `Ctrl+Right`: expand all folders
@@ -178,6 +181,8 @@ Mouse:
 - `Esc`: return focus to Browser
 - `Tab`: fold/unfold current block
 - `Shift+Tab`: fold/unfold all blocks
+- `Alt+Left` / `Alt+Up`: move focus to the previous pane
+- `Alt+Right` / `Alt+Down`: move focus to the next pane
 - `Up` / `Down`: move between preview blocks
 - `PageUp` / `PageDown`: page through large conversations
 - `Home` / `End`: jump to top or bottom
@@ -252,6 +257,8 @@ Browser actions work across connected machines as if everything were local:
 - `Ctrl+drag`: copy into the hovered folder
 - dragging a grouped folder preserves that folder as a subtree instead of flattening all sessions into one cwd
 
+The intent is file-manager style session handling: you should be able to move operational context around your estate the same way you move files in Explorer or VS Code's workspace tree, without stopping to type paths every time.
+
 This works for:
 
 - local to local
@@ -296,7 +303,13 @@ Typical use:
 
 Move, copy, paste, export, and folder-wide operations can take time, especially across SSH machines.
 
-When that happens, the status bar now shows an explicit `Working...` message before the operation starts so the UI does not appear frozen while filesystem or remote work is in progress.
+When that happens, the status bar shows:
+
+- an explicit `Working...` state immediately
+- a live progress bar
+- counts for completed, skipped, and failed session transfers
+
+That keeps long remote copies and grouped drag/drop operations understandable instead of looking like a stalled terminal UI.
 
 ## Export Over SSH
 
