@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.17 - 2026-03-15
+
+- Added a non-interactive CLI mode for `copy`, `move`, `fork`, and `export` by exact session id so session operations can be reproduced and debugged outside the TUI.
+
 ## 1.3.16 - 2026-03-15
 
 - Reduced browser navigation CPU usage by precomputing unique session id suffixes only when the loaded project set changes, instead of recomputing them on every browser row build.
