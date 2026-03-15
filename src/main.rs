@@ -1276,6 +1276,7 @@ struct App {
     preview_session_path: Option<PathBuf>,
     preview_search_matches: Vec<PreviewMatch>,
     preview_search_index: Option<usize>,
+    browser_short_ids: HashMap<PathBuf, String>,
     last_browser_nav_at: Option<Instant>,
     pending_preview_search_jump: Option<(PathBuf, String)>,
     browser_clipboard: Option<BrowserClipboard>,
@@ -1598,6 +1599,7 @@ impl App {
             preview_session_path: None,
             preview_search_matches: Vec::new(),
             preview_search_index: None,
+            browser_short_ids: HashMap::new(),
             last_browser_nav_at: None,
             pending_preview_search_jump: None,
             browser_clipboard: None,
@@ -1628,6 +1630,7 @@ impl App {
         self.prune_selected_sessions();
         if self.search_query.trim().is_empty() {
             self.projects = self.all_projects.clone();
+            self.refresh_browser_short_ids();
             self.project_idx = self.project_idx.min(self.projects.len().saturating_sub(1));
             self.clamp_session_idx();
             self.preview_search_matches.clear();
@@ -1892,8 +1895,14 @@ impl App {
     }
 
     fn browser_render_rows(&self) -> Vec<BrowserRow> {
+        let short_ids = if self.browser_short_ids.is_empty() {
+            shortest_unique_session_suffixes(&self.projects)
+        } else {
+            self.browser_short_ids.clone()
+        };
         build_browser_rows(
             &self.projects,
+            &short_ids,
             &self.config.virtual_folders,
             &self.browser_machine_roots(),
             &self.collapsed_groups,
@@ -2192,6 +2201,7 @@ impl App {
     fn apply_search_filter(&mut self) {
         if self.search_query.trim().is_empty() {
             self.projects = self.all_projects.clone();
+            self.refresh_browser_short_ids();
             self.project_idx = self.project_idx.min(self.projects.len().saturating_sub(1));
             self.clamp_session_idx();
             self.collapse_all_projects();
@@ -2243,6 +2253,7 @@ impl App {
 
         filtered.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cwd.cmp(&b.1.cwd)));
         self.projects = filtered.into_iter().map(|(_, project)| project).collect();
+        self.refresh_browser_short_ids();
         self.project_idx = 0;
         self.session_idx = 0;
         self.browser_cursor = BrowserCursor::Project;
@@ -2296,6 +2307,10 @@ impl App {
 
     fn search_visible(&self) -> bool {
         self.search_focused || !self.search_query.trim().is_empty()
+    }
+
+    fn refresh_browser_short_ids(&mut self) {
+        self.browser_short_ids = shortest_unique_session_suffixes(&self.projects);
     }
 
     fn resize_focused_pane(&mut self, delta: i16) {
@@ -5326,6 +5341,7 @@ struct BrowserTreeNode {
 
 fn build_browser_rows(
     projects: &[ProjectBucket],
+    short_ids: &HashMap<PathBuf, String>,
     virtual_folders: &[ConfigVirtualFolder],
     machine_roots: &[String],
     collapsed_groups: &HashSet<String>,
@@ -5333,7 +5349,6 @@ fn build_browser_rows(
     _selected_sessions: &HashSet<PathBuf>,
 ) -> Vec<BrowserRow> {
     let tree = build_browser_tree(projects, virtual_folders, machine_roots);
-    let short_ids = shortest_unique_session_suffixes(projects);
     let mut rows = Vec::new();
     for root_name in machine_roots {
         if let Some(node) = tree.get(root_name) {
@@ -7849,6 +7864,7 @@ mod tests {
             preview_session_path: None,
             preview_search_matches: Vec::new(),
             preview_search_index: None,
+            browser_short_ids: HashMap::new(),
             last_browser_nav_at: None,
             pending_preview_search_jump: None,
             browser_clipboard: None,
@@ -9919,6 +9935,7 @@ mod tests {
             preview_session_path: None,
             preview_search_matches: Vec::new(),
             preview_search_index: None,
+            browser_short_ids: HashMap::new(),
             last_browser_nav_at: None,
             pending_preview_search_jump: None,
             browser_clipboard: None,
@@ -10619,6 +10636,7 @@ mod tests {
             preview_session_path: None,
             preview_search_matches: Vec::new(),
             preview_search_index: None,
+            browser_short_ids: HashMap::new(),
             last_browser_nav_at: None,
             pending_preview_search_jump: None,
             browser_clipboard: None,
@@ -11430,6 +11448,7 @@ mod tests {
             preview_session_path: Some(PathBuf::from("/tmp/x.jsonl")),
             preview_search_matches: Vec::new(),
             preview_search_index: None,
+            browser_short_ids: HashMap::new(),
             last_browser_nav_at: None,
             pending_preview_search_jump: None,
             browser_clipboard: None,

@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.16 - 2026-03-15
+
+- Reduced browser navigation CPU usage by precomputing unique session id suffixes only when the loaded project set changes, instead of recomputing them on every browser row build.
+
 ## 1.3.15 - 2026-03-15
 
 - Fixed browser session id collisions by expanding the displayed suffix until it is unique across the loaded sessions.
