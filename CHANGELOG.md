@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.3.10 - 2026-03-15
+
+### Added
+- Added direct browser drag-and-drop session transfer so sessions and folder session groups can be dropped onto another local or remote folder target.
+- Added `Ctrl+drag` copy semantics in the Browser, reusing the same cross-machine clipboard path as keyboard `Ctrl+C` / `Ctrl+X` / `Ctrl+V`.
+
+### Changed
+- Updated the Browser status bar hints and README manual to document drag-to-move and `Ctrl+drag`-to-copy workflows.
+
+### Fixed
+- Fixed browser group-path target normalization so grouped tree folders resolve correctly as drop targets, including paths that render with the synthetic tree slash segments.
+- Fixed the test harness and browser mouse path to carry the new drag state consistently through move/copy operations.
+
 ## 1.3.9 - 2026-03-15
 
 ### Fixed

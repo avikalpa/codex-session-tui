@@ -82,7 +82,7 @@ Browser:
 - `Ctrl+Left`: collapse all folders except the current one
 - `Ctrl+Right`: expand all folders
 - mouse:
-  click folders and sessions, drag splitters, use scrollbars
+  click folders and sessions, drag splitters, use scrollbars, drag sessions/folders to move, `Ctrl+drag` to copy
 
 Preview:
 
@@ -140,6 +140,8 @@ Cross-machine targets:
 - local target example: `/home/me/work/repo`
 - remote target example: `pi:/home/pi/work/repo`
 - browser copy/cut/paste also works across machines when the target folder is on another configured machine
+- browser drag and drop works across machines too:
+  drag to move into the hovered folder, `Ctrl+drag` to copy instead
 
 User-only sessions:
 

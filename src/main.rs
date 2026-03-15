@@ -213,6 +213,17 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
                 app.resize_from_mouse(target, mouse.column);
                 return;
             }
+            if point_in_rect(mouse.column, mouse.row, app.panes.browser) {
+                if app.browser_drag.is_none() {
+                    let mode = if mouse.modifiers.contains(KeyModifiers::CONTROL) {
+                        BrowserClipboardMode::Copy
+                    } else {
+                        BrowserClipboardMode::Cut
+                    };
+                    app.start_browser_drag(mode);
+                }
+                return;
+            }
             if let Some(start) = app.preview_mouse_down_pos
                 && point_in_rect(mouse.column, mouse.row, app.panes.preview)
             {
@@ -229,6 +240,36 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
             if app.scroll_drag.is_some() || app.drag_target.is_some() {
                 app.scroll_drag = None;
                 app.drag_target = None;
+                return;
+            }
+            if let Some(drag) = app.browser_drag.take() {
+                if point_in_rect(mouse.column, mouse.row, app.panes.browser) {
+                    let rows = app.browser_rows();
+                    let idx = app.project_scroll + mouse_row_to_index(mouse.row, app.panes.browser);
+                    if let Some(row) = rows.get(idx).cloned()
+                        && let Some(target) = app.browser_target_for_row(&row)
+                    {
+                        let mode = if mouse.modifiers.contains(KeyModifiers::CONTROL) {
+                            BrowserClipboardMode::Copy
+                        } else {
+                            drag.source.mode
+                        };
+                        let source = BrowserClipboard {
+                            mode,
+                            targets: drag.source.targets.clone(),
+                            source_label: drag.source.source_label.clone(),
+                        };
+                        if let Err(err) = app.apply_browser_drop(&source, &target) {
+                            app.status = format!("Drop failed: {err}");
+                        }
+                    } else {
+                        app.status = String::from("Drop on a folder to move/copy");
+                    }
+                } else {
+                    app.status = String::from("Drag canceled");
+                }
+                app.preview_selecting = false;
+                app.scroll_drag = None;
                 return;
             }
             if let Some(start) = app.preview_mouse_down_pos.take() {
@@ -934,8 +975,12 @@ impl Tui {
             .backend_mut()
             .flush()
             .context("failed to flush mouse reporting disable")?;
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste)
-            .context("failed to leave alternate screen")?;
+        execute!(
+            self.terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableBracketedPaste
+        )
+        .context("failed to leave alternate screen")?;
         Ok(())
     }
 }
@@ -999,6 +1044,11 @@ struct BrowserClipboard {
     mode: BrowserClipboardMode,
     targets: Vec<SessionSummary>,
     source_label: String,
+}
+
+#[derive(Clone)]
+struct BrowserDragState {
+    source: BrowserClipboard,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1133,6 +1183,7 @@ struct App {
     last_browser_nav_at: Option<Instant>,
     pending_preview_search_jump: Option<(PathBuf, String)>,
     browser_clipboard: Option<BrowserClipboard>,
+    browser_drag: Option<BrowserDragState>,
     last_browser_click: Option<(BrowserRow, Instant)>,
     launch_codex_after_exit: Option<CodexLaunchSpec>,
     remote_states: BTreeMap<String, RemoteMachineState>,
@@ -1257,6 +1308,7 @@ impl App {
             last_browser_nav_at: None,
             pending_preview_search_jump: None,
             browser_clipboard: None,
+            browser_drag: None,
             last_browser_click: None,
             launch_codex_after_exit: None,
             remote_states: BTreeMap::new(),
@@ -2548,7 +2600,11 @@ impl App {
 
     fn browser_copy_targets(&self) -> Vec<SessionSummary> {
         match self.browser_cursor {
-            BrowserCursor::Group => Vec::new(),
+            BrowserCursor::Group => self
+                .selected_group_path
+                .as_deref()
+                .and_then(|path| self.group_prefix_target(path))
+                .unwrap_or_default(),
             BrowserCursor::Project => self
                 .current_project()
                 .map(|project| project.sessions.clone())
@@ -2557,11 +2613,213 @@ impl App {
         }
     }
 
+    fn current_browser_target(&self) -> Option<MachineTargetSpec> {
+        let row = self
+            .browser_rows()
+            .get(self.current_browser_row_index())
+            .cloned()?;
+        self.browser_target_for_row(&row)
+    }
+
+    fn browser_target_for_row(&self, row: &BrowserRow) -> Option<MachineTargetSpec> {
+        match &row.kind {
+            BrowserRowKind::Group { path } => self.machine_target_for_group_path(path),
+            BrowserRowKind::Project { project_idx } => {
+                let project = self.projects.get(*project_idx)?;
+                Some(MachineTargetSpec {
+                    name: project.machine_name.clone(),
+                    ssh_target: project.machine_target.clone(),
+                    codex_home: project.machine_codex_home.clone().unwrap_or_else(|| {
+                        path_to_string(
+                            self.sessions_root
+                                .parent()
+                                .unwrap_or_else(|| Path::new("/")),
+                        )
+                    }),
+                    exec_prefix: project.machine_exec_prefix.clone(),
+                    cwd: project.cwd.clone(),
+                })
+            }
+            BrowserRowKind::Session { project_idx, .. } => {
+                let project = self.projects.get(*project_idx)?;
+                Some(MachineTargetSpec {
+                    name: project.machine_name.clone(),
+                    ssh_target: project.machine_target.clone(),
+                    codex_home: project.machine_codex_home.clone().unwrap_or_else(|| {
+                        path_to_string(
+                            self.sessions_root
+                                .parent()
+                                .unwrap_or_else(|| Path::new("/")),
+                        )
+                    }),
+                    exec_prefix: project.machine_exec_prefix.clone(),
+                    cwd: project.cwd.clone(),
+                })
+            }
+        }
+    }
+
+    fn machine_target_for_group_path(&self, path: &str) -> Option<MachineTargetSpec> {
+        let (machine_name, rest) = path.split_once('/').unwrap_or((path, ""));
+        if machine_name == "local" && rest.is_empty() {
+            return None;
+        }
+        if rest.is_empty() {
+            return None;
+        }
+        let cwd = normalize_group_cwd(rest);
+        self.machine_specs()
+            .into_iter()
+            .find(|(name, _, _, _)| name == machine_name)
+            .map(
+                |(name, ssh_target, codex_home, exec_prefix)| MachineTargetSpec {
+                    name,
+                    ssh_target,
+                    codex_home,
+                    cwd,
+                    exec_prefix,
+                },
+            )
+    }
+
+    fn group_prefix_target(&self, path: &str) -> Option<Vec<SessionSummary>> {
+        let target = self.machine_target_for_group_path(path)?;
+        let prefix = if target.cwd == "/" {
+            String::from("/")
+        } else {
+            format!("{}/", target.cwd.trim_end_matches('/'))
+        };
+        let matches = self
+            .projects
+            .iter()
+            .filter(|project| {
+                project.machine_name == target.name
+                    && (project.cwd == target.cwd || project.cwd.starts_with(&prefix))
+            })
+            .flat_map(|project| project.sessions.clone())
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            None
+        } else {
+            Some(matches)
+        }
+    }
+
+    fn start_browser_drag(&mut self, mode: BrowserClipboardMode) {
+        let targets = self.browser_copy_targets();
+        if targets.is_empty() {
+            return;
+        }
+        let source_label = match self.browser_cursor {
+            BrowserCursor::Group => self
+                .selected_group_path
+                .clone()
+                .unwrap_or_else(|| String::from("<group>")),
+            BrowserCursor::Project => self
+                .current_project()
+                .map(|project| browser_display_path(&project.cwd))
+                .unwrap_or_else(|| String::from("<unknown>")),
+            BrowserCursor::Session => targets
+                .first()
+                .map(|session| browser_display_path(&session.cwd))
+                .unwrap_or_else(|| String::from("<unknown>")),
+        };
+        self.browser_drag = Some(BrowserDragState {
+            source: BrowserClipboard {
+                mode,
+                targets,
+                source_label: source_label.clone(),
+            },
+        });
+        self.status = match mode {
+            BrowserClipboardMode::Copy => {
+                format!("Dragging copy from {source_label}. Drop on a folder to copy")
+            }
+            BrowserClipboardMode::Cut => {
+                format!("Dragging move from {source_label}. Drop on a folder to move")
+            }
+        };
+    }
+
+    fn apply_browser_drop(
+        &mut self,
+        source: &BrowserClipboard,
+        target: &MachineTargetSpec,
+    ) -> Result<()> {
+        let mut ok = 0usize;
+        let mut skipped = 0usize;
+        let mut failures = Vec::new();
+
+        for session in &source.targets {
+            let result = match source.mode {
+                BrowserClipboardMode::Copy => {
+                    self.apply_session_action_to_target(Action::Copy, session, target)
+                }
+                BrowserClipboardMode::Cut => {
+                    if session.machine_target == target.ssh_target && session.cwd == target.cwd {
+                        skipped += 1;
+                        Ok(())
+                    } else {
+                        self.apply_session_action_to_target(Action::Move, session, target)
+                    }
+                }
+            };
+            match result {
+                Ok(()) => ok += 1,
+                Err(err) => failures.push(format!("{}: {}", session.file_name, err)),
+            }
+        }
+
+        if ok > 0 || skipped > 0 {
+            self.reload(false)?;
+        }
+        self.selected_sessions.clear();
+        self.session_select_anchor = None;
+
+        if source.mode == BrowserClipboardMode::Cut && failures.is_empty() {
+            self.browser_clipboard = None;
+        }
+
+        let verb = match source.mode {
+            BrowserClipboardMode::Copy => "Copied",
+            BrowserClipboardMode::Cut => "Moved",
+        };
+        self.status = if failures.is_empty() {
+            if skipped > 0 {
+                format!(
+                    "{verb} {ok} session(s) from {} into {}:{} (skipped {skipped})",
+                    source.source_label,
+                    target.name,
+                    browser_display_path(&target.cwd)
+                )
+            } else {
+                format!(
+                    "{verb} {ok} session(s) from {} into {}:{}",
+                    source.source_label,
+                    target.name,
+                    browser_display_path(&target.cwd)
+                )
+            }
+        } else {
+            let first = failures
+                .first()
+                .cloned()
+                .unwrap_or_else(|| String::from("unknown error"));
+            format!(
+                "{verb} {ok} session(s), {} failed, skipped {skipped}. First error: {first}",
+                failures.len()
+            )
+        };
+        Ok(())
+    }
+
     fn copy_browser_selection(&mut self, mode: BrowserClipboardMode) {
         let targets = self.browser_copy_targets();
         if targets.is_empty() {
             self.status = match self.browser_cursor {
-                BrowserCursor::Group => String::from("Select a project folder or session"),
+                BrowserCursor::Group => {
+                    String::from("Select a folder or project with sessions, not a machine root")
+                }
                 BrowserCursor::Project => String::from("No sessions in selected folder"),
                 BrowserCursor::Session => String::from("No session selected"),
             };
@@ -2607,89 +2865,11 @@ impl App {
             self.status = String::from("Clipboard empty");
             return Ok(());
         };
-        let Some(target_project) = self.current_project() else {
+        let Some(target) = self.current_browser_target() else {
             self.status = String::from("No target folder selected");
             return Ok(());
         };
-        let target = MachineTargetSpec {
-            name: target_project.machine_name.clone(),
-            ssh_target: target_project.machine_target.clone(),
-            codex_home: target_project
-                .machine_codex_home
-                .clone()
-                .unwrap_or_else(|| {
-                    path_to_string(
-                        self.sessions_root
-                            .parent()
-                            .unwrap_or_else(|| Path::new("/")),
-                    )
-                }),
-            exec_prefix: target_project.machine_exec_prefix.clone(),
-            cwd: target_project.cwd.clone(),
-        };
-        let mut ok = 0usize;
-        let mut skipped = 0usize;
-        let mut failures = Vec::new();
-
-        for session in &clipboard.targets {
-            let result = match clipboard.mode {
-                BrowserClipboardMode::Copy => {
-                    self.apply_session_action_to_target(Action::Copy, session, &target)
-                }
-                BrowserClipboardMode::Cut => {
-                    if session.machine_target == target.ssh_target && session.cwd == target.cwd {
-                        skipped += 1;
-                        Ok(())
-                    } else {
-                        self.apply_session_action_to_target(Action::Move, session, &target)
-                    }
-                }
-            };
-            match result {
-                Ok(()) => ok += 1,
-                Err(err) => failures.push(format!("{}: {}", session.file_name, err)),
-            }
-        }
-
-        if ok > 0 || skipped > 0 {
-            self.reload(false)?;
-        }
-        self.selected_sessions.clear();
-        self.session_select_anchor = None;
-
-        if clipboard.mode == BrowserClipboardMode::Cut && failures.is_empty() {
-            self.browser_clipboard = None;
-        }
-
-        let verb = match clipboard.mode {
-            BrowserClipboardMode::Copy => "Pasted",
-            BrowserClipboardMode::Cut => "Moved",
-        };
-        self.status = if failures.is_empty() {
-            if skipped > 0 {
-                format!(
-                    "{verb} {ok} session(s) from {} into {} (skipped {skipped})",
-                    clipboard.source_label,
-                    format!("{}:{}", target.name, browser_display_path(&target.cwd))
-                )
-            } else {
-                format!(
-                    "{verb} {ok} session(s) from {} into {}",
-                    clipboard.source_label,
-                    format!("{}:{}", target.name, browser_display_path(&target.cwd))
-                )
-            }
-        } else {
-            let first = failures
-                .first()
-                .cloned()
-                .unwrap_or_else(|| String::from("unknown error"));
-            format!(
-                "{verb} {ok} session(s), {} failed, skipped {skipped}. First error: {first}",
-                failures.len()
-            )
-        };
-        Ok(())
+        self.apply_browser_drop(&clipboard, &target)
     }
 
     fn register_browser_click(&mut self, row: BrowserRow, now: Instant) -> bool {
@@ -3861,6 +4041,10 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" cut folder  "),
             Span::styled("ctrl+v", Style::default().fg(Color::Green)),
             Span::raw(" paste into folder  "),
+            Span::styled("drag", Style::default().fg(Color::Cyan)),
+            Span::raw(" move into folder  "),
+            Span::styled("ctrl+drag", Style::default().fg(Color::Cyan)),
+            Span::raw(" copy into folder  "),
             Span::styled("dblclick", Style::default().fg(Color::Cyan)),
             Span::raw(" toggle folder  "),
             Span::styled("m or r", Style::default().fg(Color::Green)),
@@ -3901,6 +4085,10 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" invert  "),
             Span::styled("ctrl+c/x/v", Style::default().fg(Color::Green)),
             Span::raw(" copy/cut/paste  "),
+            Span::styled("drag", Style::default().fg(Color::Cyan)),
+            Span::raw(" move  "),
+            Span::styled("ctrl+drag", Style::default().fg(Color::Cyan)),
+            Span::raw(" copy  "),
             Span::styled("del", Style::default().fg(Color::Red)),
             Span::raw(" delete  "),
             Span::styled("dblclick", Style::default().fg(Color::Cyan)),
@@ -5862,6 +6050,14 @@ fn normalize_local_cwd_path(path: &Path, cwd_base: &Path) -> Option<PathBuf> {
     Some(normalized)
 }
 
+fn normalize_group_cwd(rest: &str) -> String {
+    let trimmed = rest.trim_matches('/');
+    if trimmed.is_empty() {
+        return String::from("/");
+    }
+    format!("/{}", trimmed)
+}
+
 fn path_to_string(path: &Path) -> String {
     let s = path.to_string_lossy().to_string();
     if s.len() > 1 {
@@ -6999,6 +7195,7 @@ mod tests {
             last_browser_nav_at: None,
             pending_preview_search_jump: None,
             browser_clipboard: None,
+            browser_drag: None,
             last_browser_click: None,
             launch_codex_after_exit: None,
             remote_states: BTreeMap::new(),
@@ -7622,6 +7819,159 @@ mod tests {
             .expect("pasted file");
         let content = fs::read_to_string(pasted).expect("read pasted");
         assert!(content.contains("\"cwd\":\"/new\""));
+    }
+
+    #[test]
+    fn normalize_group_cwd_handles_tree_style_paths() {
+        assert_eq!(normalize_group_cwd(""), "/");
+        assert_eq!(normalize_group_cwd("/"), "/");
+        assert_eq!(normalize_group_cwd("//home/pi"), "/home/pi");
+        assert_eq!(normalize_group_cwd("home/pi/"), "/home/pi");
+    }
+
+    #[test]
+    fn group_prefix_target_collects_descendant_project_sessions() {
+        let mut app = empty_test_app();
+        app.config.machines.push(ConfigMachine {
+            name: String::from("pi"),
+            ssh_target: String::from("pi@192.168.0.124"),
+            exec_prefix: None,
+            codex_home: Some(String::from("/home/pi/.codex")),
+        });
+        app.projects = vec![
+            ProjectBucket {
+                machine_name: String::from("pi"),
+                machine_target: Some(String::from("pi@192.168.0.124")),
+                machine_codex_home: Some(String::from("/home/pi/.codex")),
+                machine_exec_prefix: None,
+                cwd: String::from("/home/pi/work/app"),
+                sessions: vec![sample_session("/tmp/a.jsonl", "/home/pi/work/app", "a")],
+            },
+            ProjectBucket {
+                machine_name: String::from("pi"),
+                machine_target: Some(String::from("pi@192.168.0.124")),
+                machine_codex_home: Some(String::from("/home/pi/.codex")),
+                machine_exec_prefix: None,
+                cwd: String::from("/home/pi/work/app/sub"),
+                sessions: vec![sample_session("/tmp/b.jsonl", "/home/pi/work/app/sub", "b")],
+            },
+        ];
+
+        let targets = app
+            .group_prefix_target("pi//home/pi/work/app")
+            .expect("targets");
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].id, "a");
+        assert_eq!(targets[1].id, "b");
+    }
+
+    #[test]
+    fn mouse_drag_drop_moves_session_into_target_folder() {
+        let dir = std::env::temp_dir().join(format!("cse-dragdrop-{}", Uuid::new_v4()));
+        let sessions_root = dir.join("sessions");
+        let source_dir = sessions_root.join("2026/03/15");
+        let source_path = source_dir.join("source.jsonl");
+        write_test_session(&source_path, &sample_chat_jsonl());
+
+        let mut app = empty_test_app();
+        app.sessions_root = sessions_root.clone();
+        app.projects = vec![
+            ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
+                machine_exec_prefix: None,
+                cwd: String::from("/old"),
+                sessions: vec![SessionSummary {
+                    path: source_path.clone(),
+                    storage_path: path_to_string(&source_path),
+                    file_name: String::from("source.jsonl"),
+                    id: String::from("abc"),
+                    cwd: String::from("/old"),
+                    machine_name: String::from("local"),
+                    machine_target: None,
+                    machine_codex_home: None,
+                    machine_exec_prefix: None,
+                    started_at: String::from("2026-01-01T00:00:00Z"),
+                    modified_epoch: 123,
+                    event_count: 4,
+                    user_message_count: 2,
+                    assistant_message_count: 1,
+                    search_blob: String::new(),
+                }],
+            },
+            ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
+                machine_exec_prefix: None,
+                cwd: String::from("/new"),
+                sessions: vec![],
+            },
+        ];
+        app.panes.browser = ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 50,
+            height: 10,
+        };
+
+        let rows = app.browser_rows();
+        let source_idx = rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row.kind,
+                    BrowserRowKind::Session {
+                        project_idx: 0,
+                        session_idx: 0
+                    }
+                )
+            })
+            .expect("source row");
+        let target_idx = rows
+            .iter()
+            .position(|row| matches!(row.kind, BrowserRowKind::Project { project_idx: 1 }))
+            .expect("target row");
+
+        handle_mouse_event(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 4,
+                row: app.panes.browser.y + 1 + source_idx as u16,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut app,
+        );
+        handle_mouse_event(
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 4,
+                row: app.panes.browser.y + 1 + target_idx as u16,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut app,
+        );
+        handle_mouse_event(
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 4,
+                row: app.panes.browser.y + 1 + target_idx as u16,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut app,
+        );
+
+        let moved = fs::read_dir(source_dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+            .collect::<Vec<_>>();
+        assert_eq!(moved.len(), 1);
+        let content = fs::read_to_string(&moved[0]).expect("read moved");
+        assert!(content.contains("\"cwd\":\"/new\""));
+        assert!(app.status.contains("Moved 1 session"));
     }
 
     #[test]
@@ -8542,6 +8892,7 @@ mod tests {
             last_browser_nav_at: None,
             pending_preview_search_jump: None,
             browser_clipboard: None,
+            browser_drag: None,
             last_browser_click: None,
             launch_codex_after_exit: None,
             remote_states: BTreeMap::new(),
@@ -9178,6 +9529,7 @@ mod tests {
             last_browser_nav_at: None,
             pending_preview_search_jump: None,
             browser_clipboard: None,
+            browser_drag: None,
             last_browser_click: None,
             launch_codex_after_exit: None,
             remote_states: BTreeMap::new(),
@@ -9392,7 +9744,7 @@ mod tests {
     fn render_status_shows_refresh_shortcuts() {
         let app = empty_test_app();
 
-        let backend = TestBackend::new(180, 4);
+        let backend = TestBackend::new(260, 4);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|frame| {
@@ -9401,7 +9753,7 @@ mod tests {
                     ratatui::layout::Rect {
                         x: 0,
                         y: 0,
-                        width: 180,
+                        width: 260,
                         height: 4,
                     },
                     &app,
@@ -9458,7 +9810,7 @@ mod tests {
         app.focus = Focus::Projects;
         app.browser_cursor = BrowserCursor::Session;
 
-        let backend = TestBackend::new(140, 4);
+        let backend = TestBackend::new(220, 4);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|frame| {
@@ -9467,7 +9819,7 @@ mod tests {
                     ratatui::layout::Rect {
                         x: 0,
                         y: 0,
-                        width: 140,
+                        width: 220,
                         height: 4,
                     },
                     &app,
@@ -9478,6 +9830,36 @@ mod tests {
         let backend = terminal.backend();
         assert!(buffer_contains(backend, "export ssh"));
         assert!(buffer_contains(backend, "e"));
+    }
+
+    #[test]
+    fn render_status_shows_drag_drop_shortcuts_for_browser() {
+        let mut app = empty_test_app();
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Session;
+
+        let backend = TestBackend::new(160, 4);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_status(
+                    frame,
+                    ratatui::layout::Rect {
+                        x: 0,
+                        y: 0,
+                        width: 160,
+                        height: 4,
+                    },
+                    &app,
+                );
+            })
+            .expect("draw");
+
+        let backend = terminal.backend();
+        assert!(buffer_contains(backend, "ctrl+drag"));
+        assert!(buffer_contains(backend, "copy"));
+        assert!(buffer_contains(backend, "drag"));
+        assert!(buffer_contains(backend, "move"));
     }
 
     #[test]
@@ -9902,6 +10284,7 @@ mod tests {
             last_browser_nav_at: None,
             pending_preview_search_jump: None,
             browser_clipboard: None,
+            browser_drag: None,
             last_browser_click: None,
             launch_codex_after_exit: None,
             remote_states: BTreeMap::new(),
