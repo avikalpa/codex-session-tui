@@ -6095,7 +6095,7 @@ fn wrap_remote_exec(exec_prefix: Option<&str>, command: &str) -> String {
         .map(str::trim)
         .filter(|prefix| !prefix.is_empty())
     {
-        Some(prefix) => format!("{prefix} sh -lc {}", sh_single_quote(command)),
+        Some(prefix) => format!("{prefix} sh -c {}", sh_single_quote(command)),
         None => command.to_string(),
     }
 }
@@ -10047,7 +10047,8 @@ mod tests {
     #[test]
     fn wrap_remote_exec_supports_container_prefix() {
         let wrapped = wrap_remote_exec(Some("lxc-attach -n dev --"), "python3 - '/root/.codex'");
-        assert!(wrapped.contains("lxc-attach -n dev -- sh -lc"));
+        assert!(wrapped.contains("lxc-attach -n dev -- sh -c"));
+        assert!(!wrapped.contains("sh -lc"));
         assert!(wrapped.contains("python3 - "));
         assert!(wrapped.contains("/root/.codex"));
     }
@@ -10060,7 +10061,7 @@ mod tests {
             inner.push_str(&sh_single_quote("/root/.codex"));
             wrap_remote_exec(Some("lxc-attach -n dev --"), &inner)
         };
-        assert!(remote.contains("lxc-attach -n dev -- sh -lc"));
+        assert!(remote.contains("lxc-attach -n dev -- sh -c"));
         assert!(remote.contains("python3 - "));
         assert!(remote.contains("/root/.codex"));
     }

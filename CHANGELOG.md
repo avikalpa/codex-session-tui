@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.5 - 2026-03-15
+
+### Fixed
+- Fixed `exec_prefix` remote execution for container-backed machines by switching the nested shell wrapper from `sh -lc` to `sh -c`, matching the failure reported in `ssh-bug.md`.
+- Added regression coverage so `lxc-attach -n <name> --` remote wrappers no longer emit the brittle combined `-lc` form.
+
 ## 1.3.4 - 2026-03-15
 
 ### Fixed
