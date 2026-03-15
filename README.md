@@ -36,6 +36,9 @@ codex-session-tui copy <session-id> user@remote:/home/user/data/cases
 codex-session-tui move <session-id> /home/user/work/repo
 codex-session-tui fork <session-id> dev:/srv/project
 codex-session-tui export <session-id> user@host:/remote/project/path
+codex-session-tui tree
+codex-session-tui ls user@remote
+codex-session-tui ls user@remote:/home/user/data/cases
 ```
 
 ## Demo
@@ -278,6 +281,8 @@ Supported commands:
 - `codex-session-tui move <session-id> <target>`
 - `codex-session-tui fork <session-id> <target>`
 - `codex-session-tui export <session-id> <target>`
+- `codex-session-tui tree`
+- `codex-session-tui ls [machine|machine:/path]`
 
 Examples:
 
@@ -287,6 +292,8 @@ codex-session-tui move 019aee85-21cf-78a2-9a65-5286d2f341b6 /home/user/data/case
 ```
 
 CLI mode loads the local Codex store directly and does not wait for remote browser scans before running the requested session action. That makes it suitable for recovery work and for isolating transfer bugs without going through the interactive UI.
+
+`tree` and `ls` use the Browser's grouped tree model instead of dumping raw files. They are useful for checking exactly what the TUI thinks exists on each machine and folder when debugging remote visibility problems.
 
 This works for:
 
