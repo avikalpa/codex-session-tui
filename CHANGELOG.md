@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.23 - 2026-03-15
+
+- Added `repair-index` CLI maintenance command to back up Codex state DBs and remove stale thread rows whose rollout paths no longer exist, locally or on a selected remote machine.
+- Added Preview `Ctrl+Arrow` navigation: `Ctrl+Up/Down` jump to top/bottom and `Ctrl+Left/Right` move between blocks.
+- Changed session delete to run stepwise with visible status/progress feedback instead of blocking the UI without explanation.
+
 ## 1.3.22 - 2026-03-15
 
 - Fixed remote copy/move/fork writes so remote `codex_home` is resolved on the target machine before writing, instead of storing a quoted literal like `~/.codex/...` in the remote thread index.

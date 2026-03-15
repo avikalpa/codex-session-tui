@@ -39,6 +39,8 @@ codex-session-tui export <session-id> user@host:/remote/project/path
 codex-session-tui tree
 codex-session-tui ls pi@openclaw
 codex-session-tui ls pi@openclaw:/home/pi/data/cases
+codex-session-tui repair-index
+codex-session-tui repair-index pi@openclaw
 ```
 
 ## Demo
@@ -198,6 +200,8 @@ Mouse:
 - `Up` / `Down`: move between preview blocks
 - `PageUp` / `PageDown`: page through large conversations
 - `Home` / `End`: jump to top or bottom
+- `Ctrl+Up` / `Ctrl+Down`: jump to top or bottom like a spreadsheet
+- `Ctrl+Left` / `Ctrl+Right`: move to previous or next folded block
 - `n` / `N`: jump to next/previous match in the current chat
 - `o`: leave the TUI and open the selected session in `codex resume`
 
@@ -242,6 +246,7 @@ On a session:
 - `c`: copy into another project context
 - `f`: fork into another project context
 - `d`: delete
+- delete now runs with live status/progress feedback instead of freezing the UI during long removals
 - `e`: export over SSH
 - `o`: open in Codex
 
@@ -294,6 +299,8 @@ codex-session-tui move 019aee85-21cf-78a2-9a65-5286d2f341b6 /home/pi/data/cases-
 CLI mode loads the local Codex store directly and does not wait for remote browser scans before running the requested session action. That makes it suitable for recovery work and for isolating transfer bugs without going through the interactive UI.
 
 `tree` and `ls` use the Browser's grouped tree model instead of dumping raw files. They are useful for checking exactly what the TUI thinks exists on each machine and folder when debugging remote visibility problems.
+
+`repair-index` backs up the Codex thread database and removes stale rows whose rollout path no longer exists. Use it after older buggy copies, manual filesystem cleanup, or interrupted migrations. You can run it for `local`, for one remote machine name, or across all configured machines.
 
 This works for:
 

@@ -61,6 +61,14 @@ enum CliCommand {
     Export { session_id: String, target: String },
     Tree,
     Ls { target: Option<String> },
+    RepairIndex { target: Option<String> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RepairIndexSummary {
+    checked: usize,
+    removed: usize,
+    backup_path: Option<String>,
 }
 
 fn parse_cli_command<I>(args: I) -> Result<Option<CliCommand>>
@@ -72,7 +80,7 @@ where
     if args.len() <= 1 {
         return Ok(None);
     }
-    let usage = "usage: codex-session-tui [copy|move|fork|export] <session-id> <target>\n       codex-session-tui tree\n       codex-session-tui ls [machine|machine:/path]";
+    let usage = "usage: codex-session-tui [copy|move|fork|export] <session-id> <target>\n       codex-session-tui tree\n       codex-session-tui ls [machine|machine:/path]\n       codex-session-tui repair-index [machine]";
     match args[1].as_str() {
         "-h" | "--help" | "help" => {
             println!("{usage}");
@@ -82,6 +90,7 @@ where
             println!("  codex-session-tui export <session-id> user@host:/remote/project/path");
             println!("  codex-session-tui tree");
             println!("  codex-session-tui ls pi@openclaw:/home/pi/data/cases");
+            println!("  codex-session-tui repair-index pi@openclaw");
             std::process::exit(0);
         }
         "copy" | "move" | "fork" | "export" => {
@@ -110,6 +119,14 @@ where
                 return Err(anyhow!(usage));
             }
             Ok(Some(CliCommand::Ls {
+                target: args.get(2).cloned(),
+            }))
+        }
+        "repair-index" => {
+            if args.len() > 3 {
+                return Err(anyhow!(usage));
+            }
+            Ok(Some(CliCommand::RepairIndex {
                 target: args.get(2).cloned(),
             }))
         }
@@ -161,6 +178,12 @@ fn run_cli_command(cmd: CliCommand) -> Result<()> {
                 println!("{line}");
             }
         }
+        CliCommand::RepairIndex { target } => {
+            let app = App::load_for_cli()?;
+            for line in app.run_noninteractive_repair_index(target.as_deref())? {
+                println!("{line}");
+            }
+        }
     }
     Ok(())
 }
@@ -198,6 +221,14 @@ fn run_app(tui: &mut Tui, app: &mut App) -> Result<()> {
         if app.progress_op.is_some() {
             if let Err(err) = app.step_browser_transfer_progress() {
                 app.progress_op = None;
+                app.status = format!("{err:#}");
+            }
+            continue;
+        }
+
+        if app.delete_progress_op.is_some() {
+            if let Err(err) = app.step_delete_progress() {
+                app.delete_progress_op = None;
                 app.status = format!("{err:#}");
             }
             continue;
@@ -812,6 +843,30 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
         }
     }
 
+    if key.modifiers.contains(KeyModifiers::CONTROL) && app.focus == Focus::Preview {
+        match key.code {
+            KeyCode::Up => {
+                app.focus_preview_edge(true);
+                app.jump_preview_to_edge(true);
+                return Ok(false);
+            }
+            KeyCode::Down => {
+                app.focus_preview_edge(false);
+                app.jump_preview_to_edge(false);
+                return Ok(false);
+            }
+            KeyCode::Left => {
+                app.focus_prev_preview_turn();
+                return Ok(false);
+            }
+            KeyCode::Right => {
+                app.focus_next_preview_turn();
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) && app.focus == Focus::Projects {
         match key.code {
             KeyCode::Up => {
@@ -1414,6 +1469,7 @@ struct App {
     remote_states: BTreeMap<String, RemoteMachineState>,
     deferred_op: Option<DeferredOp>,
     progress_op: Option<BrowserTransferProgress>,
+    delete_progress_op: Option<DeleteProgress>,
 }
 
 #[derive(Clone)]
@@ -1428,6 +1484,14 @@ struct BrowserTransferProgress {
     index: usize,
     ok: usize,
     skipped: usize,
+    failures: Vec<String>,
+}
+
+#[derive(Clone)]
+struct DeleteProgress {
+    targets: Vec<SessionSummary>,
+    index: usize,
+    ok: usize,
     failures: Vec<String>,
 }
 
@@ -1489,6 +1553,67 @@ enum RemoteMachineStatus {
 }
 
 impl App {
+    fn run_noninteractive_repair_index(&self, target: Option<&str>) -> Result<Vec<String>> {
+        let specs = self.cli_repair_targets(target)?;
+        let mut lines = Vec::new();
+        for spec in specs {
+            let summary = if let Some(ssh_target) = &spec.ssh_target {
+                repair_remote_thread_index(
+                    ssh_target,
+                    spec.exec_prefix.as_deref(),
+                    &spec.codex_home,
+                )?
+            } else {
+                let Some(db_path) = self.state_db_path.as_deref() else {
+                    lines.push(String::from("local: no state db found"));
+                    continue;
+                };
+                repair_local_thread_index(db_path)?
+            };
+            let backup = summary
+                .backup_path
+                .as_deref()
+                .map(|path| format!(" backup={path}"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "{}: checked={} removed={}{}",
+                spec.name, summary.checked, summary.removed, backup
+            ));
+        }
+        Ok(lines)
+    }
+
+    fn cli_repair_targets(&self, target: Option<&str>) -> Result<Vec<MachineTargetSpec>> {
+        let specs = self.machine_specs();
+        let Some(raw) = target.map(str::trim).filter(|raw| !raw.is_empty()) else {
+            return Ok(specs
+                .into_iter()
+                .map(
+                    |(name, ssh_target, codex_home, exec_prefix)| MachineTargetSpec {
+                        name,
+                        ssh_target,
+                        codex_home,
+                        cwd: String::from("/"),
+                        exec_prefix,
+                    },
+                )
+                .collect());
+        };
+        if let Some((name, ssh_target, codex_home, exec_prefix)) = specs
+            .into_iter()
+            .find(|(name, ssh_target, _, _)| name == raw || ssh_target.as_deref() == Some(raw))
+        {
+            return Ok(vec![MachineTargetSpec {
+                name,
+                ssh_target,
+                codex_home,
+                cwd: String::from("/"),
+                exec_prefix,
+            }]);
+        }
+        Err(anyhow!("unknown machine: {raw}"))
+    }
+
     fn queue_deferred_op(&mut self, op: DeferredOp, status: impl Into<String>) {
         self.deferred_op = Some(op);
         self.status = status.into();
@@ -1652,6 +1777,81 @@ impl App {
         Ok(())
     }
 
+    fn start_delete_progress(&mut self, targets: Vec<SessionSummary>) {
+        self.deferred_op = None;
+        self.delete_progress_op = Some(DeleteProgress {
+            targets,
+            index: 0,
+            ok: 0,
+            failures: Vec::new(),
+        });
+        self.status = String::from("Working... deleting session(s)");
+    }
+
+    fn step_delete_progress(&mut self) -> Result<()> {
+        let Some(mut progress) = self.delete_progress_op.take() else {
+            return Ok(());
+        };
+        if progress.targets.is_empty() {
+            self.status = String::from("Nothing to delete");
+            return Ok(());
+        }
+        if progress.index >= progress.targets.len() {
+            self.finish_delete_progress(progress)?;
+            return Ok(());
+        }
+
+        let session = progress.targets[progress.index].clone();
+        match self.apply_delete_action(&session) {
+            Ok(()) => progress.ok += 1,
+            Err(err) => progress
+                .failures
+                .push(format!("{}: {}", session.file_name, err)),
+        }
+        progress.index += 1;
+        if progress.index >= progress.targets.len() {
+            self.finish_delete_progress(progress)?;
+        } else {
+            self.status = self.delete_progress_status(&progress);
+            self.delete_progress_op = Some(progress);
+        }
+        Ok(())
+    }
+
+    fn delete_progress_status(&self, progress: &DeleteProgress) -> String {
+        let total = progress.targets.len().max(1);
+        let done = progress.index.min(total);
+        format!(
+            "Working... deleting session(s) {} {done}/{total} ok:{} fail:{}",
+            progress_bar(done, total, 14),
+            progress.ok,
+            progress.failures.len()
+        )
+    }
+
+    fn finish_delete_progress(&mut self, progress: DeleteProgress) -> Result<()> {
+        if progress.ok > 0 {
+            self.reload(false)?;
+        }
+        self.selected_sessions.clear();
+        self.session_select_anchor = None;
+        self.status = if progress.failures.is_empty() {
+            format!("Deleted {} session(s)", progress.ok)
+        } else {
+            let first = progress
+                .failures
+                .first()
+                .cloned()
+                .unwrap_or_else(|| String::from("unknown error"));
+            format!(
+                "Deleted {} session(s), {} failed. First error: {first}",
+                progress.ok,
+                progress.failures.len()
+            )
+        };
+        Ok(())
+    }
+
     fn busy_status_for_submit(&self) -> String {
         match self.pending_action {
             Some(Action::Move) => String::from("Working... moving session(s)"),
@@ -1745,6 +1945,7 @@ impl App {
             remote_states: BTreeMap::new(),
             deferred_op: None,
             progress_op: None,
+            delete_progress_op: None,
         };
 
         app.reload_mode(true, include_remote_scan)?;
@@ -2818,6 +3019,19 @@ impl App {
         self.preview_focus_turn = turn_ids.first().copied();
     }
 
+    fn focus_preview_edge(&mut self, to_top: bool) {
+        self.ensure_preview_focus_valid();
+        let turn = if to_top {
+            self.preview_header_rows.first().map(|(_, turn)| *turn)
+        } else {
+            self.preview_header_rows.last().map(|(_, turn)| *turn)
+        };
+        if let Some(turn) = turn {
+            self.preview_focus_turn = Some(turn);
+            self.scroll_preview_focus_into_view();
+        }
+    }
+
     fn focus_next_preview_turn(&mut self) {
         self.ensure_preview_focus_valid();
         let Some(current) = self.preview_focus_turn else {
@@ -3697,6 +3911,16 @@ impl App {
         let mut ok = 0usize;
         let mut skipped = 0usize;
         let mut failures = Vec::new();
+
+        if action == Action::Delete {
+            self.mode = Mode::Normal;
+            self.pending_action = None;
+            self.input.clear();
+            self.input_focused = false;
+            self.clear_input_completion_cycle();
+            self.start_delete_progress(targets);
+            return Ok(());
+        }
 
         match action {
             Action::AddRemote => {
@@ -4767,6 +4991,10 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" browser  "),
             Span::styled("↑/↓", Style::default().fg(Color::Cyan)),
             Span::raw(" block prev/next  "),
+            Span::styled("ctrl+↑/↓", Style::default().fg(Color::Cyan)),
+            Span::raw(" top/bottom  "),
+            Span::styled("ctrl+←/→", Style::default().fg(Color::Cyan)),
+            Span::raw(" prev/next block  "),
             Span::styled("pgup/pgdn", Style::default().fg(Color::Cyan)),
             Span::raw(" page  "),
             Span::styled("home/end", Style::default().fg(Color::Cyan)),
@@ -5038,6 +5266,12 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
     if let Some(progress) = &app.progress_op {
         lines.push(Line::from(Span::styled(
             app.browser_transfer_progress_status(progress),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    if let Some(progress) = &app.delete_progress_op {
+        lines.push(Line::from(Span::styled(
+            app.delete_progress_status(progress),
             Style::default().fg(Color::Yellow),
         )));
     }
@@ -7187,6 +7421,74 @@ fn sync_thread_record_tx(
     Ok(true)
 }
 
+fn repair_local_thread_index(db_path: &Path) -> Result<RepairIndexSummary> {
+    if !db_path.exists() {
+        return Ok(RepairIndexSummary {
+            checked: 0,
+            removed: 0,
+            backup_path: None,
+        });
+    }
+
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("failed opening {}", db_path.display()))?;
+    let mut stmt = conn.prepare("SELECT id, rollout_path FROM threads")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    let stale_ids = rows
+        .iter()
+        .filter_map(|(id, rollout_path)| {
+            let expanded = expand_tilde(rollout_path);
+            if expanded.exists() {
+                None
+            } else {
+                Some(id.clone())
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if stale_ids.is_empty() {
+        return Ok(RepairIndexSummary {
+            checked: rows.len(),
+            removed: 0,
+            backup_path: None,
+        });
+    }
+
+    let backup = db_path.with_extension(format!(
+        "{}.bak.{}",
+        db_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("sqlite"),
+        Utc::now().timestamp()
+    ));
+    fs::copy(db_path, &backup).with_context(|| {
+        format!(
+            "failed to back up {} to {}",
+            db_path.display(),
+            backup.display()
+        )
+    })?;
+
+    let tx = conn.unchecked_transaction()?;
+    for id in &stale_ids {
+        tx.execute("DELETE FROM threads WHERE id = ?1", params![id])?;
+    }
+    tx.commit()?;
+
+    Ok(RepairIndexSummary {
+        checked: rows.len(),
+        removed: stale_ids.len(),
+        backup_path: Some(path_to_string(&backup)),
+    })
+}
+
 fn rewrite_session_id(value: &mut Value, new_id: &str) {
     if value.get("type").and_then(Value::as_str) != Some("session_meta") {
         return;
@@ -7493,6 +7795,44 @@ fn resolve_remote_codex_home(
     } else {
         Ok(resolved.to_string())
     }
+}
+
+fn repair_remote_thread_index(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    codex_home: &str,
+) -> Result<RepairIndexSummary> {
+    let resolved_codex_home = resolve_remote_codex_home(ssh_target, exec_prefix, codex_home)?;
+    let output = run_remote_python_text(
+        ssh_target,
+        exec_prefix,
+        r#"import glob, json, os, shutil, sqlite3, sys, time
+codex_home = os.path.expanduser(sys.argv[1])
+dbs = sorted(glob.glob(os.path.join(codex_home, "state_*.sqlite")))
+if not dbs:
+    print(json.dumps({"checked": 0, "removed": 0, "backup_path": None}))
+    sys.exit(0)
+db_path = dbs[-1]
+con = sqlite3.connect(db_path)
+cur = con.cursor()
+rows = cur.execute("SELECT id, rollout_path FROM threads").fetchall()
+stale = []
+for row_id, rollout_path in rows:
+    expanded = os.path.expanduser(rollout_path)
+    if not os.path.exists(expanded):
+        stale.append(row_id)
+backup_path = None
+if stale:
+    backup_path = db_path + ".bak." + str(int(time.time()))
+    shutil.copy2(db_path, backup_path)
+    cur.executemany("DELETE FROM threads WHERE id = ?", [(row_id,) for row_id in stale])
+    con.commit()
+print(json.dumps({"checked": len(rows), "removed": len(stale), "backup_path": backup_path}))
+"#,
+        &[resolved_codex_home],
+        false,
+    )?;
+    serde_json::from_str(output.trim()).context("invalid remote repair summary")
 }
 
 fn read_session_content(session: &SessionSummary) -> Result<String> {
@@ -8278,6 +8618,7 @@ mod tests {
             remote_states: BTreeMap::new(),
             deferred_op: None,
             progress_op: None,
+            delete_progress_op: None,
         }
     }
 
@@ -8356,6 +8697,20 @@ mod tests {
                 .expect("parse"),
             Some(CliCommand::Ls {
                 target: Some(String::from("pi@openclaw:/home/pi/data/cases")),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_cli_command_parses_repair_index() {
+        assert_eq!(
+            parse_cli_command(["codex-session-tui", "repair-index"]).expect("parse"),
+            Some(CliCommand::RepairIndex { target: None })
+        );
+        assert_eq!(
+            parse_cli_command(["codex-session-tui", "repair-index", "pi@openclaw"]).expect("parse"),
+            Some(CliCommand::RepairIndex {
+                target: Some(String::from("pi@openclaw")),
             })
         );
     }
@@ -9736,6 +10091,111 @@ mod tests {
     }
 
     #[test]
+    fn repair_local_thread_index_removes_rows_for_missing_rollout_files() {
+        let dir = std::env::temp_dir().join(format!("cse-repair-index-{}", Uuid::new_v4()));
+        fs::create_dir_all(dir.join("sessions/2026/03/15")).expect("mkdir");
+        let db = dir.join("state_5.sqlite");
+        init_test_state_db(&db);
+
+        let existing = dir.join("sessions/2026/03/15/existing.jsonl");
+        write_test_session(&existing, &sample_chat_jsonl());
+        let missing = dir.join("sessions/2026/03/15/missing.jsonl");
+
+        let conn = Connection::open(&db).expect("open");
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path, cwd, title, first_user_message) VALUES (?1, ?2, ?3, '', '')",
+            params!["keep", path_to_string(&existing), "/keep"],
+        )
+        .expect("insert keep");
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path, cwd, title, first_user_message) VALUES (?1, ?2, ?3, '', '')",
+            params!["drop", path_to_string(&missing), "/drop"],
+        )
+        .expect("insert drop");
+        drop(conn);
+
+        let repaired = repair_local_thread_index(&db).expect("repair");
+        assert_eq!(repaired.removed, 1);
+        assert_eq!(repaired.checked, 2);
+        assert!(repaired.backup_path.is_some());
+
+        let conn = Connection::open(&db).expect("open");
+        let ids = conn
+            .prepare("SELECT id FROM threads ORDER BY id")
+            .expect("prepare")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect");
+        assert_eq!(ids, vec![String::from("keep")]);
+    }
+
+    #[test]
+    fn ctrl_preview_arrows_jump_edges_and_blocks() {
+        let mut app = empty_test_app();
+        app.focus = Focus::Preview;
+        app.preview_header_rows = vec![(10, 0), (20, 1), (30, 2)];
+        app.preview_focus_turn = Some(1);
+        app.preview_content_len = 40;
+        app.panes.preview = ratatui::layout::Rect::new(0, 0, 80, 10);
+
+        handle_normal_mode(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL), &mut app)
+            .expect("ctrl up");
+        assert_eq!(app.preview_focus_turn, Some(0));
+        assert_eq!(app.preview_scroll, 0);
+
+        handle_normal_mode(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .expect("ctrl down");
+        assert_eq!(app.preview_focus_turn, Some(2));
+        assert_eq!(
+            app.preview_scroll,
+            app.preview_content_len.saturating_sub(8)
+        );
+
+        handle_normal_mode(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .expect("ctrl left");
+        assert_eq!(app.preview_focus_turn, Some(1));
+
+        handle_normal_mode(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .expect("ctrl right");
+        assert_eq!(app.preview_focus_turn, Some(2));
+    }
+
+    #[test]
+    fn submit_input_delete_queues_progress_instead_of_blocking() {
+        let mut app = empty_test_app();
+        let session = sample_session("/tmp/delete.jsonl", "/repo", "sess-delete");
+        app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            cwd: String::from("/repo"),
+            sessions: vec![session],
+        }];
+        app.all_projects = app.projects.clone();
+        app.browser_cursor = BrowserCursor::Session;
+        app.pending_action = Some(Action::Delete);
+        app.mode = Mode::Input;
+        app.input = String::from("DELETE");
+
+        app.submit_input().expect("submit delete");
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.delete_progress_op.is_some());
+        assert!(app.status.starts_with("Working... deleting"));
+    }
+
+    #[test]
     fn submit_input_move_updates_state_db_for_session() {
         let dir = std::env::temp_dir().join(format!("cse-move-state-{}", Uuid::new_v4()));
         fs::create_dir_all(&dir).expect("mkdir");
@@ -10539,6 +10999,7 @@ mod tests {
             remote_states: BTreeMap::new(),
             deferred_op: None,
             progress_op: None,
+            delete_progress_op: None,
         };
         let text = app
             .preview_selected_text((0, 1), (1, 2))
@@ -11240,6 +11701,7 @@ mod tests {
             remote_states: BTreeMap::new(),
             deferred_op: None,
             progress_op: None,
+            delete_progress_op: None,
         };
 
         app.apply_search_filter();
@@ -12052,6 +12514,7 @@ mod tests {
             remote_states: BTreeMap::new(),
             deferred_op: None,
             progress_op: None,
+            delete_progress_op: None,
         };
 
         app.toggle_fold_all_preview_turns();
