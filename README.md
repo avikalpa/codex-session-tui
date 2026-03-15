@@ -4,6 +4,8 @@
 
 It gives you a VS Code style workflow for `~/.codex`: a browser tree on the left, a rich preview on the right, searchable conversations, foldable blocks, multi-select, drag and drop, and cross-machine session management.
 
+It can also act as a Codex session command center: connect to SSH machines, step through container prefixes such as `lxc-attach`, inspect all those session stores in one browser, and move conversations between them without leaving the TUI.
+
 If `codex resume` stops finding conversations after a repo move, folder rename, machine migration, or container hop, this tool is built to recover that state safely.
 
 ## Install
@@ -63,6 +65,7 @@ This is not a file dumper. It is meant to feel like an editor/workspace browser:
 ## Key Features
 
 - Unified browser for `local` plus SSH-connected remotes
+- Remote session command center for multiple hosts and containers from one screen
 - Grouped project tree with compressed single-child folder chains
 - Session list ordered by recent activity
 - Rich preview with markdown rendering, foldable blocks, timestamps, and per-role grouping
@@ -73,6 +76,21 @@ This is not a file dumper. It is meant to feel like an editor/workspace browser:
 - Remote machine support including nested container entry via `exec_prefix`
 - Export to another machine as a real Codex session, not a loose JSONL dump
 - Repair of previously broken local `cwd` mappings and Codex thread-index sync
+
+## Command Center Use Cases
+
+This is where the remote model becomes useful in practice.
+
+You can use one TUI instance to:
+
+- browse your local sessions and multiple SSH machines in one tree
+- hop through container boundaries such as `lxc-attach -n dev --`
+- inspect a chat running inside a remote container without opening another terminal
+- drag a session from one machine into another machine's project folder
+- copy a conversation from a laptop to a server, or from a server into a container
+- recover chats after a mountpoint change, repo rename, or machine migration
+
+If your workflow spans local dev, remote boxes, and containers, this app is meant to be the control plane above all of them.
 
 ## Interface Overview
 
@@ -235,6 +253,12 @@ This works for:
 - remote to local
 - remote to remote
 
+Typical examples:
+
+- drag a local chat into `pi:/home/pi/work/repo`
+- `Ctrl+drag` a production debugging conversation from one remote machine into another machine's staging repo
+- cut a session from a host machine and paste it into a container-backed machine configured with `lxc-attach -n dev --`
+
 Folder and grouped-tree targets resolve automatically, so the Browser can be used like a workspace explorer instead of a path prompt.
 
 ### Folder-Level Work
@@ -262,6 +286,10 @@ Important behavior:
 
 ## Remote Machines
 
+Remote support is not an add-on. It is one of the main reasons this project exists.
+
+Once configured, remote machines appear directly in the Browser beside `local`, so the app behaves more like a distributed workspace explorer than a single-machine viewer.
+
 Configured remotes are loaded from:
 
 - `.codex-session-tui.toml` in the current working directory
@@ -288,6 +316,15 @@ pi=pi@192.168.0.124:/home/pi/.codex
 root@example-host|lxc-attach -n dev --|/root/.codex
 dev=root@example-host|lxc-attach -n dev --|/root/.codex
 ```
+
+Practical meaning of those examples:
+
+- `pi@192.168.0.124`
+  connects to a plain remote Codex home with pubkey SSH
+- `pi=pi@192.168.0.124:/home/pi/.codex`
+  pins a friendly machine name and a non-default Codex home
+- `dev=root@example-host|lxc-attach -n dev --|/root/.codex`
+  SSHes to the host, enters the `dev` container, and then treats that container as another first-class Codex machine in the Browser
 
 Reusing `R` with the same connection details but a new name updates the existing machine entry in place.
 
@@ -321,6 +358,8 @@ This lets the TUI:
 - move/copy/fork sessions
 - launch `codex resume` inside that environment
 
+That is the intended model: a container is not a second-class target. If Codex runs there, `codex-session-tui` should let you manage it as if it were just another workspace root.
+
 ### Remote Health and Caching
 
 - machine roots are marked `[ok]`, `[cached]`, or `[offline]`
@@ -341,6 +380,8 @@ Supported but less ideal:
 - password-based SSH when your environment already handles the prompt externally
 
 The app uses non-interactive remote scanning so startup does not hang waiting on password prompts.
+
+For serious use, key-based auth is the right setup. It makes the Browser feel immediate and keeps the remote command-center workflow usable. Password-based SSH can work, but it is operationally worse and should be treated as fallback.
 
 ## Recovery and Repair
 
