@@ -119,6 +119,19 @@ fn run_cli_command(cmd: CliCommand) -> Result<()> {
     Ok(())
 }
 
+fn duplicate_rewrite_flags(action: Action) -> (bool, bool) {
+    match action {
+        Action::Move | Action::ProjectRename => (false, false),
+        Action::Copy | Action::ProjectCopy | Action::Export => (true, false),
+        Action::Fork => (true, true),
+        Action::AddRemote
+        | Action::Delete
+        | Action::DeleteRemote
+        | Action::RenameRemote
+        | Action::NewFolder => (false, false),
+    }
+}
+
 fn run_app(tui: &mut Tui, app: &mut App) -> Result<()> {
     loop {
         // Debounce expensive search filtering: apply only when event queue is idle.
@@ -3785,6 +3798,57 @@ impl App {
         )
     }
 
+    fn write_duplicate_session_to_target(
+        &self,
+        action: Action,
+        session: &SessionSummary,
+        target: &MachineTargetSpec,
+    ) -> Result<()> {
+        let (rewrite_id, rewrite_start_timestamp) = duplicate_rewrite_flags(action);
+        let (out, session_id, _) =
+            duplicate_session_content(session, &target.cwd, rewrite_id, rewrite_start_timestamp)?;
+        if let Some(ssh_target) = &target.ssh_target {
+            let remote_path = write_new_remote_session(
+                ssh_target,
+                target.exec_prefix.as_deref(),
+                &target.codex_home,
+                &session_id,
+                &out,
+            )?;
+            let sync_session = SessionSummary {
+                id: session_id,
+                cwd: target.cwd.clone(),
+                storage_path: remote_path.clone(),
+                machine_exec_prefix: target.exec_prefix.clone(),
+                ..session.clone()
+            };
+            sync_remote_thread_index(
+                ssh_target,
+                target.exec_prefix.as_deref(),
+                &remote_path,
+                &target.cwd,
+                &sync_session,
+            )?;
+        } else {
+            let new_path = write_new_local_session(&self.sessions_root, &session_id, &out)?;
+            let _ = self.sync_state_thread(
+                &SessionSummary {
+                    id: session_id,
+                    cwd: target.cwd.clone(),
+                    storage_path: path_to_string(&new_path),
+                    path: new_path.clone(),
+                    machine_name: String::from("local"),
+                    machine_target: None,
+                    machine_codex_home: None,
+                    machine_exec_prefix: None,
+                    ..session.clone()
+                },
+                &target.cwd,
+            )?;
+        }
+        Ok(())
+    }
+
     fn apply_session_action_to_target(
         &self,
         action: Action,
@@ -3805,62 +3869,12 @@ impl App {
                     }
                     return Ok(());
                 }
-                self.apply_session_action_to_target(Action::Copy, session, target)?;
+                self.write_duplicate_session_to_target(action, session, target)?;
                 self.apply_delete_action(session)?;
                 Ok(())
             }
             Action::Copy | Action::ProjectCopy | Action::Fork | Action::Export => {
-                let rewrite_id = matches!(
-                    action,
-                    Action::Copy | Action::ProjectCopy | Action::Fork | Action::Export
-                );
-                let rewrite_start_timestamp = matches!(action, Action::Fork);
-                let (out, session_id, _) = duplicate_session_content(
-                    session,
-                    &target.cwd,
-                    rewrite_id,
-                    rewrite_start_timestamp,
-                )?;
-                if let Some(ssh_target) = &target.ssh_target {
-                    let remote_path = write_new_remote_session(
-                        ssh_target,
-                        target.exec_prefix.as_deref(),
-                        &target.codex_home,
-                        &session_id,
-                        &out,
-                    )?;
-                    let sync_session = SessionSummary {
-                        id: session_id,
-                        cwd: target.cwd.clone(),
-                        storage_path: remote_path.clone(),
-                        machine_exec_prefix: target.exec_prefix.clone(),
-                        ..session.clone()
-                    };
-                    sync_remote_thread_index(
-                        ssh_target,
-                        target.exec_prefix.as_deref(),
-                        &remote_path,
-                        &target.cwd,
-                        &sync_session,
-                    )?;
-                } else {
-                    let new_path = write_new_local_session(&self.sessions_root, &session_id, &out)?;
-                    let _ = self.sync_state_thread(
-                        &SessionSummary {
-                            id: session_id,
-                            cwd: target.cwd.clone(),
-                            storage_path: path_to_string(&new_path),
-                            path: new_path.clone(),
-                            machine_name: String::from("local"),
-                            machine_target: None,
-                            machine_codex_home: None,
-                            machine_exec_prefix: None,
-                            ..session.clone()
-                        },
-                        &target.cwd,
-                    )?;
-                }
-                Ok(())
+                self.write_duplicate_session_to_target(action, session, target)
             }
             Action::Delete => self.apply_delete_action(session),
             Action::AddRemote | Action::DeleteRemote | Action::RenameRemote | Action::NewFolder => {
@@ -8713,6 +8727,17 @@ mod tests {
         assert_ne!(session_id, "abc");
         assert!(out.contains(&format!("\"id\":\"{session_id}\"")));
         assert!(out.contains("\"cwd\":\"/tmp/new\""));
+    }
+
+    #[test]
+    fn duplicate_rewrite_flags_preserve_id_for_move() {
+        assert_eq!(duplicate_rewrite_flags(Action::Move), (false, false));
+        assert_eq!(
+            duplicate_rewrite_flags(Action::ProjectRename),
+            (false, false)
+        );
+        assert_eq!(duplicate_rewrite_flags(Action::Copy), (true, false));
+        assert_eq!(duplicate_rewrite_flags(Action::Fork), (true, true));
     }
 
     #[test]
