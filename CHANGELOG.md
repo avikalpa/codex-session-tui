@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.3.13 - 2026-03-15
+
+### Added
+- Added persistent virtual folders in the Browser so you can create cwd destinations that do not exist on disk yet and still use them as move/copy/paste/drop targets.
+- Added `n` on machine and folder rows to create virtual folders directly from the TUI.
+
+### Changed
+- Grouped-folder drag/drop now preserves the dragged folder as a subtree when dropped onto another machine or folder, which makes workflows like moving a local `git/...` tree into a remote `gh/...` layout practical.
+- Updated the README manual to document virtual folders, grouped-folder drag/drop, and cross-machine destination planning.
+
+### Fixed
+- New virtual folders now expand their ancestor groups immediately so the created target stays visible in the Browser.
+
 ## 1.3.12 - 2026-03-15
 
 ### Fixed
