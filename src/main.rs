@@ -379,7 +379,13 @@ fn trigger_status_button(button: StatusButton, app: &mut App) {
                 app.start_action(Action::Delete);
             }
         }
-        StatusButton::ProjectRename => app.start_action(Action::ProjectRename),
+        StatusButton::ProjectRename => {
+            if app.selected_remote_machine().is_some() {
+                app.start_action(Action::RenameRemote);
+            } else {
+                app.start_action(Action::ProjectRename);
+            }
+        }
         StatusButton::ProjectCopy => app.start_action(Action::ProjectCopy),
         StatusButton::AddRemote => app.start_action(Action::AddRemote),
         StatusButton::Refresh => {
@@ -732,7 +738,9 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
         }
         KeyCode::Char('g') | KeyCode::F(5) => app.reload(true)?,
         KeyCode::Char('m') => {
-            if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Project {
+            if app.selected_remote_machine().is_some() {
+                app.start_action(Action::RenameRemote);
+            } else if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Project {
                 app.start_action(Action::ProjectRename);
             } else if app.current_session().is_some() {
                 app.start_action(Action::Move);
@@ -781,7 +789,9 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
             }
         }
         KeyCode::Char('r') => {
-            if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Project {
+            if app.selected_remote_machine().is_some() {
+                app.start_action(Action::RenameRemote);
+            } else if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Project {
                 app.start_action(Action::ProjectRename);
             }
         }
@@ -955,6 +965,7 @@ enum Action {
     Export,
     Delete,
     DeleteRemote,
+    RenameRemote,
     ProjectRename,
     ProjectCopy,
     AddRemote,
@@ -2506,7 +2517,7 @@ impl App {
                 .current_project()
                 .map(|p| p.sessions.clone())
                 .unwrap_or_default(),
-            Action::AddRemote | Action::DeleteRemote => Vec::new(),
+            Action::AddRemote | Action::DeleteRemote | Action::RenameRemote => Vec::new(),
             Action::Move | Action::Copy | Action::Fork | Action::Export | Action::Delete => {
                 let selected = self.selected_sessions_in_current_project();
                 if !selected.is_empty() {
@@ -2678,11 +2689,16 @@ impl App {
 
     fn start_action(&mut self, action: Action) {
         let targets = self.action_targets(action);
-        if !matches!(action, Action::AddRemote | Action::DeleteRemote) && targets.is_empty() {
+        if !matches!(
+            action,
+            Action::AddRemote | Action::DeleteRemote | Action::RenameRemote
+        ) && targets.is_empty()
+        {
             self.status = match action {
                 Action::ProjectRename | Action::ProjectCopy => String::from("No project selected"),
                 Action::AddRemote => String::from("Enter remote connection details"),
                 Action::DeleteRemote => String::from("No remote machine selected"),
+                Action::RenameRemote => String::from("No remote machine selected"),
                 _ => String::from("No session selected"),
             };
             return;
@@ -2724,6 +2740,17 @@ impl App {
                     )
                 })
                 .unwrap_or_else(|| String::from("Delete remote: type DELETE and press Enter")),
+            Action::RenameRemote => self
+                .selected_remote_machine()
+                .map(|machine| {
+                    format!(
+                        "Rename remote '{}': enter new machine name and press Enter",
+                        machine.name
+                    )
+                })
+                .unwrap_or_else(|| {
+                    String::from("Rename remote: enter new machine name and press Enter")
+                }),
             Action::ProjectRename => format!(
                 "Rename folder sessions ({}) to target path and press Enter",
                 targets.len()
@@ -2754,7 +2781,11 @@ impl App {
         };
 
         let targets = self.action_targets(action);
-        if !matches!(action, Action::AddRemote | Action::DeleteRemote) && targets.is_empty() {
+        if !matches!(
+            action,
+            Action::AddRemote | Action::DeleteRemote | Action::RenameRemote
+        ) && targets.is_empty()
+        {
             self.status = String::from("No applicable sessions for this action");
             return Ok(());
         }
@@ -2769,6 +2800,7 @@ impl App {
             }
             Action::Export => self.input.trim().to_string(),
             Action::AddRemote => self.input.trim().to_string(),
+            Action::RenameRemote => self.input.trim().to_string(),
             _ => self.resolve_machine_target(&self.input)?.cwd,
         };
         let mut ok = 0usize;
@@ -2793,6 +2825,43 @@ impl App {
                 self.remote_states.remove(&machine.name);
                 ok = 1;
                 self.reload(true)?;
+            }
+            Action::RenameRemote => {
+                let Some(machine) = self.selected_remote_machine().cloned() else {
+                    self.status = String::from("No remote machine selected");
+                    return Ok(());
+                };
+                let new_name = self.input.trim().to_string();
+                if new_name.is_empty() {
+                    self.status = String::from("Remote rename cancelled: name cannot be empty");
+                    return Ok(());
+                }
+                if self
+                    .config
+                    .machines
+                    .iter()
+                    .any(|m| m.name == new_name && m.name != machine.name)
+                {
+                    self.status = format!("Remote rename cancelled: '{new_name}' already exists");
+                    return Ok(());
+                }
+                if let Some(existing) = self
+                    .config
+                    .machines
+                    .iter_mut()
+                    .find(|m| m.name == machine.name)
+                {
+                    existing.name = new_name.clone();
+                }
+                if let Some(state) = self.remote_states.remove(&machine.name) {
+                    self.remote_states.insert(new_name.clone(), state);
+                }
+                save_app_config(&self.config_path, &self.config)?;
+                ok = 1;
+                self.reload(true)?;
+                self.browser_cursor = BrowserCursor::Group;
+                self.selected_group_path = Some(new_name);
+                self.ensure_selection_visible();
             }
             _ => {
                 let target_machine = if matches!(
@@ -2826,7 +2895,7 @@ impl App {
                         }
                         Action::Export => export_session_via_ssh(session, &target_str),
                         Action::Delete => self.apply_delete_action(session),
-                        Action::AddRemote | Action::DeleteRemote => Ok(()),
+                        Action::AddRemote | Action::DeleteRemote | Action::RenameRemote => Ok(()),
                     };
                     match result {
                         Ok(()) => ok += 1,
@@ -2844,7 +2913,7 @@ impl App {
 
         if !matches!(
             action,
-            Action::Export | Action::AddRemote | Action::DeleteRemote
+            Action::Export | Action::AddRemote | Action::DeleteRemote | Action::RenameRemote
         ) && (ok > 0 || skipped > 0)
         {
             self.reload(false)?;
@@ -2859,6 +2928,7 @@ impl App {
             Action::Export => "exported",
             Action::Delete => "deleted",
             Action::DeleteRemote => "deleted remote",
+            Action::RenameRemote => "renamed remote",
             Action::ProjectRename => "renamed",
             Action::ProjectCopy => "copied",
             Action::AddRemote => "connected",
@@ -2868,6 +2938,8 @@ impl App {
                 format!("{action_name} {ok} session(s)")
             } else if action == Action::DeleteRemote {
                 format!("{action_name} {ok} machine(s)")
+            } else if action == Action::RenameRemote {
+                format!("{action_name} {ok} machine(s) -> {target_display}")
             } else if skipped > 0 {
                 format!(
                     "{action_name} {ok} session(s), skipped {skipped} unchanged -> {target_display}"
@@ -3062,7 +3134,7 @@ impl App {
                 Ok(())
             }
             Action::Delete => self.apply_delete_action(session),
-            Action::AddRemote | Action::DeleteRemote => Ok(()),
+            Action::AddRemote | Action::DeleteRemote | Action::RenameRemote => Ok(()),
         }
     }
 
@@ -3775,7 +3847,7 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::styled("dblclick", Style::default().fg(Color::Cyan)),
             Span::raw(" toggle folder  "),
             Span::styled("m or r", Style::default().fg(Color::Green)),
-            Span::raw(" rename folder sessions  "),
+            Span::raw(" rename folder/remote  "),
             Span::styled("c or y", Style::default().fg(Color::Green)),
             Span::raw(" copy folder sessions  "),
             Span::styled("R", Style::default().fg(Color::Green)),
@@ -3922,6 +3994,7 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Some(Action::Export) => "EXPORT",
             Some(Action::Delete) => "DELETE",
             Some(Action::DeleteRemote) => "DELETE REMOTE",
+            Some(Action::RenameRemote) => "RENAME REMOTE",
             Some(Action::ProjectRename) => "RENAME FOLDER",
             Some(Action::ProjectCopy) => "COPY FOLDER",
             Some(Action::AddRemote) => "CONNECT REMOTE",
@@ -10042,6 +10115,40 @@ codex_home = "/root/.codex"
     }
 
     #[test]
+    fn rename_keys_start_rename_remote_action_for_machine_root() {
+        let mut app = empty_test_app();
+        app.config.machines.push(ConfigMachine {
+            name: String::from("dev"),
+            ssh_target: String::from("root@example-host"),
+            exec_prefix: Some(String::from("lxc-attach -n dev --")),
+            codex_home: Some(String::from("/root/.codex")),
+        });
+        app.browser_cursor = BrowserCursor::Group;
+        app.selected_group_path = Some(String::from("dev"));
+        app.focus = Focus::Projects;
+
+        let quit = handle_normal_mode(
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+            &mut app,
+        )
+        .expect("handle");
+        assert!(!quit);
+        assert_eq!(app.mode, Mode::Input);
+        assert_eq!(app.pending_action, Some(Action::RenameRemote));
+
+        app.cancel_input();
+
+        let quit = handle_normal_mode(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &mut app,
+        )
+        .expect("handle");
+        assert!(!quit);
+        assert_eq!(app.mode, Mode::Input);
+        assert_eq!(app.pending_action, Some(Action::RenameRemote));
+    }
+
+    #[test]
     fn submit_input_delete_remote_removes_machine_from_config() {
         let mut app = empty_test_app();
         app.config.machines.push(ConfigMachine {
@@ -10058,6 +10165,28 @@ codex_home = "/root/.codex"
 
         app.submit_input().expect("submit");
         assert!(app.config.machines.is_empty());
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn submit_input_rename_remote_renames_machine_in_config() {
+        let mut app = empty_test_app();
+        app.config.machines.push(ConfigMachine {
+            name: String::from("dev"),
+            ssh_target: String::from("root@example-host"),
+            exec_prefix: Some(String::from("lxc-attach -n dev --")),
+            codex_home: Some(String::from("/root/.codex")),
+        });
+        app.browser_cursor = BrowserCursor::Group;
+        app.selected_group_path = Some(String::from("dev"));
+        app.pending_action = Some(Action::RenameRemote);
+        app.mode = Mode::Input;
+        app.input = String::from("devbox");
+
+        app.submit_input().expect("submit");
+        assert_eq!(app.config.machines.len(), 1);
+        assert_eq!(app.config.machines[0].name, "devbox");
+        assert_eq!(app.selected_group_path.as_deref(), Some("devbox"));
         assert_eq!(app.mode, Mode::Normal);
     }
 

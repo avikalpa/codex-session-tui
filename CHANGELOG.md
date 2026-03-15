@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.7 - 2026-03-15
+
+### Fixed
+- Enabled `m` and `r` on remote machine rows to rename the selected machine entry, matching the existing delete-remote UX on `d`.
+- Preserved browser focus on the renamed machine after the config reload so the rename action feels stable in-place.
+
 ## 1.3.6 - 2026-03-15
 
 ### Fixed
