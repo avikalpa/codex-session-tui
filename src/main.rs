@@ -612,6 +612,9 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
         match key.code {
             KeyCode::Esc => {
                 app.search_focused = false;
+                app.search_query.clear();
+                app.search_dirty = true;
+                app.status = String::from("Search cleared");
             }
             KeyCode::Enter => {
                 app.search_focused = false;
@@ -9675,6 +9678,34 @@ mod tests {
         assert!(!quit);
         assert!(!app.search_focused);
         assert_eq!(app.focus, Focus::Preview);
+    }
+
+    #[test]
+    fn search_esc_clears_query_and_hides_search_bar() {
+        let mut app = empty_test_app();
+        app.search_focused = true;
+        app.search_query = String::from("johyperr");
+        app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            cwd: String::from("/repo"),
+            sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
+        }];
+        app.all_projects = app.projects.clone();
+
+        let quit = handle_normal_mode(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut app)
+            .expect("handle");
+        assert!(!quit);
+        assert!(!app.search_focused);
+        assert!(app.search_query.is_empty());
+        assert!(app.search_dirty);
+
+        app.apply_search_filter();
+        assert!(!app.search_visible());
+        assert_eq!(app.projects.len(), 1);
+        assert_eq!(app.status, "Search cleared");
     }
 
     #[test]
