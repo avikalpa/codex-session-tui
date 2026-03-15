@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.3.4 - 2026-03-15
+
+### Fixed
+- Fixed browser machine-root ordering so `local` is always first, configured remotes follow in config order, and arrow navigation traverses all visible machines correctly.
+- Fixed browser keyboard navigation to stop auto-expanding folders and to work even when only machine roots are visible.
+- Fixed remote machine deletion so `d` on a machine root uses the same confirmation UX as session deletion.
+- Fixed `exec_prefix` remote Python execution to use the same SSH wrapper path as other remote operations, improving container-backed remote health detection.
+
+### Changed
+- Updated the README manual for the new browser startup position, explicit-only expansion behavior, and remote deletion flow.
+
 ## 1.3.3 - 2026-03-14
 
 ### Changed
