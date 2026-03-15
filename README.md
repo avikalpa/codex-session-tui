@@ -72,8 +72,10 @@ This is not a file dumper. It is meant to feel like an editor/workspace browser:
 - Search that filters the browser and jumps the preview to relevant matches
 - Multi-select session operations
 - Drag-to-move and `Ctrl+drag`-to-copy across folders and machines
+- Folder-tree drag/drop that preserves grouped subpaths when moving across machines
 - Keyboard copy/cut/paste across local and remote folders
 - Remote machine support including nested container entry via `exec_prefix`
+- Virtual folder creation for cwd targets that do not exist on disk yet
 - Export to another machine as a real Codex session, not a loose JSONL dump
 - Repair of previously broken local `cwd` mappings and Codex thread-index sync
 
@@ -159,6 +161,7 @@ On launch:
 - `F5` / `Ctrl+R`: refresh local and remote state
 - `R`: add or update a remote machine
 - `d`: delete the selected remote machine entry
+- `n`: create a new virtual folder under the selected machine or folder
 
 Mouse:
 
@@ -245,6 +248,7 @@ Browser actions work across connected machines as if everything were local:
 - `Ctrl+V`: paste into the selected folder
 - drag: move into the hovered folder
 - `Ctrl+drag`: copy into the hovered folder
+- dragging a grouped folder preserves that folder as a subtree instead of flattening all sessions into one cwd
 
 This works for:
 
@@ -258,12 +262,33 @@ Typical examples:
 - drag a local chat into `pi:/home/pi/work/repo`
 - `Ctrl+drag` a production debugging conversation from one remote machine into another machine's staging repo
 - cut a session from a host machine and paste it into a container-backed machine configured with `lxc-attach -n dev --`
+- drag the grouped `git` folder from `local` onto a remote machine root and keep the `git/...` subtree intact there
+- create `gh` as a virtual folder on a remote machine, then drag sessions into it before the actual repo exists on disk
 
 Folder and grouped-tree targets resolve automatically, so the Browser can be used like a workspace explorer instead of a path prompt.
 
 ### Folder-Level Work
 
 Project and grouped-folder rows also support folder-wide copy/rename style workflows, so you can remap entire project histories instead of one session at a time.
+
+### Virtual Folders
+
+Sometimes you want a destination cwd before the actual repository exists on that machine.
+
+Use `n` on a machine root or folder row to create a virtual folder.
+
+Important behavior:
+
+- this does not create a real directory on disk
+- it creates a persistent browser destination in the TUI config
+- you can use it as a drop target, paste target, or typed move/copy/fork target later
+- once sessions are moved there, that cwd becomes part of the normal session tree even if no real repo exists yet
+
+Typical use:
+
+- create `gh` on a remote machine
+- drag local `git/...` session groups into `gh`
+- keep session organization aligned with the repo layout you intend to create later
 
 ## Export Over SSH
 

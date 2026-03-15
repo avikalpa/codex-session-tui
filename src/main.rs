@@ -258,6 +258,7 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
                             mode,
                             targets: drag.source.targets.clone(),
                             source_label: drag.source.source_label.clone(),
+                            source_group_cwd: drag.source.source_group_cwd.clone(),
                         };
                         if let Err(err) = app.apply_browser_drop(&source, &target) {
                             app.status = format!("Drop failed: {err}");
@@ -825,6 +826,13 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
         KeyCode::Char('n') => {
             if app.focus == Focus::Preview {
                 app.focus_next_preview_search_match();
+            } else if app.focus == Focus::Projects
+                && matches!(
+                    app.browser_cursor,
+                    BrowserCursor::Group | BrowserCursor::Project
+                )
+            {
+                app.start_action(Action::NewFolder);
             }
         }
         KeyCode::Char('N') => {
@@ -1033,6 +1041,7 @@ enum Action {
     RenameRemote,
     ProjectRename,
     ProjectCopy,
+    NewFolder,
     AddRemote,
 }
 
@@ -1047,6 +1056,7 @@ struct BrowserClipboard {
     mode: BrowserClipboardMode,
     targets: Vec<SessionSummary>,
     source_label: String,
+    source_group_cwd: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1118,10 +1128,18 @@ struct ConfigMachine {
     codex_home: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct ConfigVirtualFolder {
+    machine_name: String,
+    cwd: String,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct AppConfig {
     #[serde(default)]
     machines: Vec<ConfigMachine>,
+    #[serde(default)]
+    virtual_folders: Vec<ConfigVirtualFolder>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1565,6 +1583,11 @@ impl App {
                 roots.push(machine.name.clone());
             }
         }
+        for folder in &self.config.virtual_folders {
+            if seen.insert(folder.machine_name.clone()) {
+                roots.push(folder.machine_name.clone());
+            }
+        }
         for project in &self.projects {
             if seen.insert(project.machine_name.clone()) {
                 roots.push(project.machine_name.clone());
@@ -1576,6 +1599,7 @@ impl App {
     fn browser_render_rows(&self) -> Vec<BrowserRow> {
         build_browser_rows(
             &self.projects,
+            &self.config.virtual_folders,
             &self.browser_machine_roots(),
             &self.collapsed_groups,
             &self.collapsed_projects,
@@ -1765,7 +1789,8 @@ impl App {
             .iter()
             .flat_map(|project| [project_bucket_key(project), project.cwd.clone()])
             .collect();
-        self.collapsed_groups = default_collapsed_group_paths(&self.projects);
+        self.collapsed_groups =
+            default_collapsed_group_paths(&self.projects, &self.config.virtual_folders);
         self.pinned_open_projects.clear();
         if let Some(first_root) = self.browser_machine_roots().first().cloned() {
             self.browser_cursor = BrowserCursor::Group;
@@ -1927,7 +1952,8 @@ impl App {
         self.session_idx = 0;
         self.browser_cursor = BrowserCursor::Project;
         self.selected_group_path = None;
-        self.collapsed_groups = default_collapsed_group_paths(&self.projects);
+        self.collapsed_groups =
+            default_collapsed_group_paths(&self.projects, &self.config.virtual_folders);
         if let Some(first_project) = self.projects.first() {
             if let Some(first_session) = first_project.sessions.first() {
                 self.browser_cursor = BrowserCursor::Session;
@@ -2518,6 +2544,29 @@ impl App {
         })
     }
 
+    fn resolve_virtual_folder_target(&self, raw: &str) -> Result<MachineTargetSpec> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow!("Folder path is empty"));
+        }
+        if trimmed.contains(':') && !trimmed.starts_with('/') {
+            let mut target = self.resolve_machine_target(trimmed)?;
+            target.cwd = normalize_virtual_folder_cwd(&target.cwd)
+                .ok_or_else(|| anyhow!("Folder path is empty"))?;
+            return Ok(target);
+        }
+        let Some(current) = self.current_browser_target() else {
+            return Err(anyhow!("Select a machine or folder first"));
+        };
+        let cwd = if trimmed.starts_with('/') {
+            normalize_virtual_folder_cwd(trimmed).ok_or_else(|| anyhow!("Folder path is empty"))?
+        } else {
+            normalize_virtual_folder_cwd(&join_cwd(&current.cwd, trimmed))
+                .ok_or_else(|| anyhow!("Folder path is empty"))?
+        };
+        Ok(MachineTargetSpec { cwd, ..current })
+    }
+
     fn toggle_current_session_selection(&mut self) {
         let Some(session) = self.current_session().cloned() else {
             self.status = String::from("No session selected");
@@ -2589,7 +2638,9 @@ impl App {
                 .current_project()
                 .map(|p| p.sessions.clone())
                 .unwrap_or_default(),
-            Action::AddRemote | Action::DeleteRemote | Action::RenameRemote => Vec::new(),
+            Action::AddRemote | Action::DeleteRemote | Action::RenameRemote | Action::NewFolder => {
+                Vec::new()
+            }
             Action::Move | Action::Copy | Action::Fork | Action::Export | Action::Delete => {
                 let selected = self.selected_sessions_in_current_project();
                 if !selected.is_empty() {
@@ -2664,13 +2715,11 @@ impl App {
 
     fn machine_target_for_group_path(&self, path: &str) -> Option<MachineTargetSpec> {
         let (machine_name, rest) = path.split_once('/').unwrap_or((path, ""));
-        if machine_name == "local" && rest.is_empty() {
-            return None;
-        }
-        if rest.is_empty() {
-            return None;
-        }
-        let cwd = normalize_group_cwd(rest);
+        let cwd = if rest.is_empty() {
+            String::from("/")
+        } else {
+            normalize_group_cwd(rest)
+        };
         self.machine_specs()
             .into_iter()
             .find(|(name, _, _, _)| name == machine_name)
@@ -2713,6 +2762,14 @@ impl App {
         if targets.is_empty() {
             return;
         }
+        let source_group_cwd = if self.browser_cursor == BrowserCursor::Group {
+            self.selected_group_path
+                .as_deref()
+                .and_then(|path| self.machine_target_for_group_path(path))
+                .map(|target| target.cwd)
+        } else {
+            None
+        };
         let source_label = match self.browser_cursor {
             BrowserCursor::Group => self
                 .selected_group_path
@@ -2732,6 +2789,7 @@ impl App {
                 mode,
                 targets,
                 source_label: source_label.clone(),
+                source_group_cwd,
             },
         });
         self.status = match mode {
@@ -2754,16 +2812,28 @@ impl App {
         let mut failures = Vec::new();
 
         for session in &source.targets {
+            let effective_target =
+                if let Some(source_group_cwd) = source.source_group_cwd.as_deref() {
+                    target_for_group_drop(session, source_group_cwd, target)
+                } else {
+                    target.clone()
+                };
             let result = match source.mode {
                 BrowserClipboardMode::Copy => {
-                    self.apply_session_action_to_target(Action::Copy, session, target)
+                    self.apply_session_action_to_target(Action::Copy, session, &effective_target)
                 }
                 BrowserClipboardMode::Cut => {
-                    if session.machine_target == target.ssh_target && session.cwd == target.cwd {
+                    if session.machine_target == effective_target.ssh_target
+                        && session.cwd == effective_target.cwd
+                    {
                         skipped += 1;
                         Ok(())
                     } else {
-                        self.apply_session_action_to_target(Action::Move, session, target)
+                        self.apply_session_action_to_target(
+                            Action::Move,
+                            session,
+                            &effective_target,
+                        )
                     }
                 }
             };
@@ -2848,6 +2918,14 @@ impl App {
             mode,
             targets: targets.clone(),
             source_label: source_label.clone(),
+            source_group_cwd: if self.browser_cursor == BrowserCursor::Group {
+                self.selected_group_path
+                    .as_deref()
+                    .and_then(|path| self.machine_target_for_group_path(path))
+                    .map(|target| target.cwd)
+            } else {
+                None
+            },
         });
         self.status = match mode {
             BrowserClipboardMode::Copy => format!(
@@ -2891,7 +2969,7 @@ impl App {
         let targets = self.action_targets(action);
         if !matches!(
             action,
-            Action::AddRemote | Action::DeleteRemote | Action::RenameRemote
+            Action::AddRemote | Action::DeleteRemote | Action::RenameRemote | Action::NewFolder
         ) && targets.is_empty()
         {
             self.status = match action {
@@ -2899,6 +2977,7 @@ impl App {
                 Action::AddRemote => String::from("Enter remote connection details"),
                 Action::DeleteRemote => String::from("No remote machine selected"),
                 Action::RenameRemote => String::from("No remote machine selected"),
+                Action::NewFolder => String::from("Select a machine or folder first"),
                 _ => String::from("No session selected"),
             };
             return;
@@ -2959,6 +3038,9 @@ impl App {
                 "Copy folder sessions ({}) to target path (`/path` or `machine:/path`) and press Enter",
                 targets.len()
             ),
+            Action::NewFolder => {
+                String::from("New virtual folder: enter folder name or path and press Enter")
+            }
             Action::AddRemote => String::from(
                 "Add remote: enter user@host, name=user@host, name=user@host:/remote/.codex, or name=user@host|exec-prefix|/remote/.codex and press Enter",
             ),
@@ -2983,7 +3065,7 @@ impl App {
         let targets = self.action_targets(action);
         if !matches!(
             action,
-            Action::AddRemote | Action::DeleteRemote | Action::RenameRemote
+            Action::AddRemote | Action::DeleteRemote | Action::RenameRemote | Action::NewFolder
         ) && targets.is_empty()
         {
             self.status = String::from("No applicable sessions for this action");
@@ -3001,6 +3083,7 @@ impl App {
             Action::Export => self.input.trim().to_string(),
             Action::AddRemote => self.input.trim().to_string(),
             Action::RenameRemote => self.input.trim().to_string(),
+            Action::NewFolder => self.input.trim().to_string(),
             _ => self.resolve_machine_target(&self.input)?.cwd,
         };
         let mut ok = 0usize;
@@ -3063,6 +3146,22 @@ impl App {
                 self.selected_group_path = Some(new_name);
                 self.ensure_selection_visible();
             }
+            Action::NewFolder => {
+                let target = self.resolve_virtual_folder_target(&self.input)?;
+                upsert_virtual_folder(&mut self.config, &target.name, &target.cwd);
+                save_app_config(&self.config_path, &self.config)?;
+                ok = 1;
+                self.reload(true)?;
+                expand_group_ancestors_for_cwd(
+                    &mut self.collapsed_groups,
+                    &target.name,
+                    &target.cwd,
+                );
+                self.browser_cursor = BrowserCursor::Group;
+                self.selected_group_path =
+                    Some(group_path_for_machine_cwd(&target.name, &target.cwd));
+                self.ensure_selection_visible();
+            }
             _ => {
                 let target_machine = if matches!(
                     action,
@@ -3095,7 +3194,10 @@ impl App {
                         }
                         Action::Export => export_session_via_ssh(session, &target_str),
                         Action::Delete => self.apply_delete_action(session),
-                        Action::AddRemote | Action::DeleteRemote | Action::RenameRemote => Ok(()),
+                        Action::AddRemote
+                        | Action::DeleteRemote
+                        | Action::RenameRemote
+                        | Action::NewFolder => Ok(()),
                     };
                     match result {
                         Ok(()) => ok += 1,
@@ -3113,7 +3215,11 @@ impl App {
 
         if !matches!(
             action,
-            Action::Export | Action::AddRemote | Action::DeleteRemote | Action::RenameRemote
+            Action::Export
+                | Action::AddRemote
+                | Action::DeleteRemote
+                | Action::RenameRemote
+                | Action::NewFolder
         ) && (ok > 0 || skipped > 0)
         {
             self.reload(false)?;
@@ -3132,6 +3238,7 @@ impl App {
             Action::ProjectRename => "renamed",
             Action::ProjectCopy => "copied",
             Action::AddRemote => "connected",
+            Action::NewFolder => "created",
         };
         self.status = if failures.is_empty() {
             if action == Action::Delete {
@@ -3140,6 +3247,8 @@ impl App {
                 format!("{action_name} {ok} machine(s)")
             } else if action == Action::RenameRemote {
                 format!("{action_name} {ok} machine(s) -> {target_display}")
+            } else if action == Action::NewFolder {
+                format!("{action_name} virtual folder {target_display}")
             } else if skipped > 0 {
                 format!(
                     "{action_name} {ok} session(s), skipped {skipped} unchanged -> {target_display}"
@@ -3334,7 +3443,9 @@ impl App {
                 Ok(())
             }
             Action::Delete => self.apply_delete_action(session),
-            Action::AddRemote | Action::DeleteRemote | Action::RenameRemote => Ok(()),
+            Action::AddRemote | Action::DeleteRemote | Action::RenameRemote | Action::NewFolder => {
+                Ok(())
+            }
         }
     }
 
@@ -4052,6 +4163,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" toggle folder  "),
             Span::styled("m or r", Style::default().fg(Color::Green)),
             Span::raw(" rename folder/remote  "),
+            Span::styled("n", Style::default().fg(Color::Green)),
+            Span::raw(" new virtual folder  "),
             Span::styled("c or y", Style::default().fg(Color::Green)),
             Span::raw(" copy folder sessions  "),
             Span::styled("R", Style::default().fg(Color::Green)),
@@ -4205,6 +4318,7 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Some(Action::RenameRemote) => "RENAME REMOTE",
             Some(Action::ProjectRename) => "RENAME FOLDER",
             Some(Action::ProjectCopy) => "COPY FOLDER",
+            Some(Action::NewFolder) => "NEW FOLDER",
             Some(Action::AddRemote) => "CONNECT REMOTE",
             None => "ACTION",
         };
@@ -4867,12 +4981,13 @@ struct BrowserTreeNode {
 
 fn build_browser_rows(
     projects: &[ProjectBucket],
+    virtual_folders: &[ConfigVirtualFolder],
     machine_roots: &[String],
     collapsed_groups: &HashSet<String>,
     collapsed_projects: &HashSet<String>,
     _selected_sessions: &HashSet<PathBuf>,
 ) -> Vec<BrowserRow> {
-    let tree = build_browser_tree(projects, machine_roots);
+    let tree = build_browser_tree(projects, virtual_folders, machine_roots);
     let mut rows = Vec::new();
     for root_name in machine_roots {
         if let Some(node) = tree.get(root_name) {
@@ -4891,6 +5006,7 @@ fn build_browser_rows(
 
 fn build_browser_tree(
     projects: &[ProjectBucket],
+    virtual_folders: &[ConfigVirtualFolder],
     machine_roots: &[String],
 ) -> BTreeMap<String, BrowserTreeNode> {
     let mut roots = BTreeMap::<String, BrowserTreeNode>::new();
@@ -4916,6 +5032,21 @@ fn build_browser_tree(
                 ..BrowserTreeNode::default()
             });
         insert_browser_tree_path(root, rest, project_idx);
+    }
+    for folder in virtual_folders {
+        let mut parts = vec![folder.machine_name.clone()];
+        parts.extend(browser_tree_segments(&folder.cwd));
+        let Some((root_name, rest)) = parts.split_first() else {
+            continue;
+        };
+        let root = roots
+            .entry(root_name.clone())
+            .or_insert_with(|| BrowserTreeNode {
+                name: root_name.clone(),
+                full_path: root_name.clone(),
+                ..BrowserTreeNode::default()
+            });
+        insert_browser_tree_group_path(root, rest);
     }
     compress_browser_tree_children(&mut roots);
     roots
@@ -4943,6 +5074,29 @@ fn insert_browser_tree_path(node: &mut BrowserTreeNode, segments: &[String], pro
             ..BrowserTreeNode::default()
         });
     insert_browser_tree_path(child, &segments[1..], project_idx);
+}
+
+fn insert_browser_tree_group_path(node: &mut BrowserTreeNode, segments: &[String]) {
+    if segments.is_empty() {
+        return;
+    }
+    let name = &segments[0];
+    let child_path = if node.full_path == "/" {
+        format!("/{name}")
+    } else if name == "/" {
+        format!("{}/", node.full_path)
+    } else {
+        format!("{}/{}", node.full_path, name)
+    };
+    let child = node
+        .children
+        .entry(name.clone())
+        .or_insert_with(|| BrowserTreeNode {
+            name: name.clone(),
+            full_path: child_path,
+            ..BrowserTreeNode::default()
+        });
+    insert_browser_tree_group_path(child, &segments[1..]);
 }
 
 fn compress_browser_tree_children(nodes: &mut BTreeMap<String, BrowserTreeNode>) {
@@ -5065,13 +5219,17 @@ fn browser_tree_segments_for_project(project: &ProjectBucket) -> Vec<String> {
     parts
 }
 
-fn default_collapsed_group_paths(projects: &[ProjectBucket]) -> HashSet<String> {
+fn default_collapsed_group_paths(
+    projects: &[ProjectBucket],
+    virtual_folders: &[ConfigVirtualFolder],
+) -> HashSet<String> {
     let mut collapsed = HashSet::new();
     let mut machine_roots = vec![String::from("local")];
     machine_roots.extend(projects.iter().map(|p| p.machine_name.clone()));
+    machine_roots.extend(virtual_folders.iter().map(|f| f.machine_name.clone()));
     machine_roots.sort();
     machine_roots.dedup();
-    for node in build_browser_tree(projects, &machine_roots).values() {
+    for node in build_browser_tree(projects, virtual_folders, &machine_roots).values() {
         collect_group_paths(node, &mut collapsed);
     }
     collapsed
@@ -6061,6 +6219,97 @@ fn normalize_group_cwd(rest: &str) -> String {
     format!("/{}", trimmed)
 }
 
+fn group_drop_leaf(source_group_cwd: &str) -> Option<&str> {
+    let trimmed = source_group_cwd.trim_matches('/');
+    if trimmed.is_empty() {
+        None
+    } else {
+        trimmed.rsplit('/').next()
+    }
+}
+
+fn relative_cwd_from_group(source_group_cwd: &str, session_cwd: &str) -> Option<String> {
+    if source_group_cwd == "/" {
+        return Some(session_cwd.trim_start_matches('/').to_string());
+    }
+    if session_cwd == source_group_cwd {
+        return Some(String::new());
+    }
+    let prefix = format!("{}/", source_group_cwd.trim_end_matches('/'));
+    session_cwd
+        .strip_prefix(&prefix)
+        .map(std::string::ToString::to_string)
+}
+
+fn join_cwd(base: &str, suffix: &str) -> String {
+    let left = base.trim_end_matches('/');
+    let right = suffix.trim_matches('/');
+    match (left.is_empty(), right.is_empty()) {
+        (_, true) => {
+            if left.is_empty() {
+                String::from("/")
+            } else {
+                left.to_string()
+            }
+        }
+        (true, false) => format!("/{}", right),
+        (false, false) => format!("{left}/{right}"),
+    }
+}
+
+fn target_for_group_drop(
+    session: &SessionSummary,
+    source_group_cwd: &str,
+    target: &MachineTargetSpec,
+) -> MachineTargetSpec {
+    let mut effective = target.clone();
+    if let Some(leaf) = group_drop_leaf(source_group_cwd) {
+        let relative = relative_cwd_from_group(source_group_cwd, &session.cwd).unwrap_or_default();
+        let suffix = if relative.is_empty() {
+            leaf.to_string()
+        } else {
+            format!("{leaf}/{relative}")
+        };
+        effective.cwd = join_cwd(&target.cwd, &suffix);
+    }
+    effective
+}
+
+fn group_path_for_machine_cwd(machine_name: &str, cwd: &str) -> String {
+    let mut out = machine_name.to_string();
+    for segment in browser_tree_segments(cwd) {
+        if segment == "/" {
+            out.push('/');
+        } else if out.ends_with('/') {
+            out.push_str(&segment);
+        } else {
+            out.push('/');
+            out.push_str(&segment);
+        }
+    }
+    out
+}
+
+fn expand_group_ancestors_for_cwd(
+    collapsed_groups: &mut HashSet<String>,
+    machine_name: &str,
+    cwd: &str,
+) {
+    let mut current = machine_name.to_string();
+    collapsed_groups.remove(&current);
+    for segment in browser_tree_segments(cwd) {
+        if segment == "/" {
+            current.push('/');
+        } else if current.ends_with('/') {
+            current.push_str(&segment);
+        } else {
+            current.push('/');
+            current.push_str(&segment);
+        }
+        collapsed_groups.remove(&current);
+    }
+}
+
 fn path_to_string(path: &Path) -> String {
     let s = path.to_string_lossy().to_string();
     if s.len() > 1 {
@@ -6936,6 +7185,7 @@ fn load_app_config(path: &Path) -> Result<AppConfig> {
     let mut config: AppConfig =
         toml::from_str(&raw).with_context(|| format!("invalid config {}", path.display()))?;
     normalize_config_machine_prefixes(&mut config);
+    normalize_config_virtual_folders(&mut config);
     Ok(config)
 }
 
@@ -6971,6 +7221,51 @@ fn normalize_config_machine_prefixes(config: &mut AppConfig) {
     for machine in &mut config.machines {
         machine.exec_prefix = normalize_exec_prefix(machine.exec_prefix.take());
     }
+}
+
+fn normalize_virtual_folder_cwd(cwd: &str) -> Option<String> {
+    let trimmed = cwd.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let with_leading = if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    };
+    let normalized = normalize_group_cwd(&with_leading);
+    Some(normalized)
+}
+
+fn normalize_config_virtual_folders(config: &mut AppConfig) {
+    let mut seen = HashSet::new();
+    config.virtual_folders.retain_mut(|folder| {
+        if folder.machine_name.trim().is_empty() {
+            return false;
+        }
+        let Some(cwd) = normalize_virtual_folder_cwd(&folder.cwd) else {
+            return false;
+        };
+        folder.cwd = cwd;
+        seen.insert((folder.machine_name.clone(), folder.cwd.clone()))
+    });
+}
+
+fn upsert_virtual_folder(config: &mut AppConfig, machine_name: &str, cwd: &str) {
+    let Some(cwd) = normalize_virtual_folder_cwd(cwd) else {
+        return;
+    };
+    if config
+        .virtual_folders
+        .iter()
+        .any(|folder| folder.machine_name == machine_name && folder.cwd == cwd)
+    {
+        return;
+    }
+    config.virtual_folders.push(ConfigVirtualFolder {
+        machine_name: machine_name.to_string(),
+        cwd,
+    });
 }
 
 fn infer_machine_name_from_ssh_target(target: &str) -> String {
@@ -7800,6 +8095,7 @@ mod tests {
             mode: BrowserClipboardMode::Copy,
             targets: vec![source],
             source_label: String::from("/old"),
+            source_group_cwd: None,
         });
 
         handle_normal_mode(
@@ -7866,6 +8162,98 @@ mod tests {
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[0].id, "a");
         assert_eq!(targets[1].id, "b");
+    }
+
+    #[test]
+    fn virtual_folder_appears_in_browser_tree_without_sessions() {
+        let mut app = empty_test_app();
+        app.config.virtual_folders.push(ConfigVirtualFolder {
+            machine_name: String::from("pi"),
+            cwd: String::from("/gh"),
+        });
+
+        let rows = app.browser_rows();
+        assert!(
+            rows.iter()
+                .any(|row| matches!(&row.kind, BrowserRowKind::Group { path } if path.starts_with("pi") && path.ends_with("gh")))
+        );
+    }
+
+    #[test]
+    fn target_for_group_drop_preserves_group_leaf_and_subtree() {
+        let session = sample_session("/tmp/a.jsonl", "/git/foo", "a");
+        let target = MachineTargetSpec {
+            name: String::from("pi"),
+            ssh_target: Some(String::from("pi@host")),
+            codex_home: String::from("/home/pi/.codex"),
+            cwd: String::from("/gh"),
+            exec_prefix: None,
+        };
+
+        let effective = target_for_group_drop(&session, "/git", &target);
+        assert_eq!(effective.cwd, "/gh/git/foo");
+    }
+
+    #[test]
+    fn resolve_virtual_folder_target_supports_relative_input() {
+        let mut app = empty_test_app();
+        app.config.machines.push(ConfigMachine {
+            name: String::from("pi"),
+            ssh_target: String::from("pi@host"),
+            exec_prefix: None,
+            codex_home: Some(String::from("/home/pi/.codex")),
+        });
+        app.config.virtual_folders.push(ConfigVirtualFolder {
+            machine_name: String::from("pi"),
+            cwd: String::from("/gh"),
+        });
+        let row_path = app
+            .browser_rows()
+            .into_iter()
+            .find_map(|row| match row.kind {
+                BrowserRowKind::Group { path }
+                    if path.starts_with("pi") && path.ends_with("gh") =>
+                {
+                    Some(path)
+                }
+                _ => None,
+            })
+            .expect("virtual folder row");
+        app.selected_group_path = Some(row_path);
+        app.browser_cursor = BrowserCursor::Group;
+
+        let target = app.resolve_virtual_folder_target("repo").expect("target");
+        assert_eq!(target.name, "pi");
+        assert_eq!(target.cwd, "/gh/repo");
+    }
+
+    #[test]
+    fn submit_new_folder_persists_virtual_folder() {
+        let base = std::env::temp_dir().join(format!("cse-new-folder-{}", Uuid::new_v4()));
+        fs::create_dir_all(&base).expect("mkdir");
+
+        let mut app = empty_test_app();
+        app.config_path = base.join("codex-session-tui.toml");
+        app.selected_group_path = Some(String::from("local"));
+        app.browser_cursor = BrowserCursor::Group;
+        app.focus = Focus::Projects;
+
+        app.start_action(Action::NewFolder);
+        app.input = String::from("gh");
+        app.submit_input().expect("submit");
+
+        assert!(
+            app.config
+                .virtual_folders
+                .iter()
+                .any(|folder| folder.machine_name == "local" && folder.cwd == "/gh")
+        );
+        assert!(app
+            .browser_rows()
+            .iter()
+            .any(|row| matches!(&row.kind, BrowserRowKind::Group { path } if path.starts_with("local") && path.ends_with("gh"))));
+
+        std::fs::remove_dir_all(&base).expect("cleanup");
     }
 
     #[test]
@@ -8328,7 +8716,8 @@ mod tests {
         ];
         app.collapsed_projects.insert(String::from("/repo-a"));
         app.collapsed_projects.insert(String::from("/repo-b"));
-        app.collapsed_groups = default_collapsed_group_paths(&app.projects);
+        app.collapsed_groups =
+            default_collapsed_group_paths(&app.projects, &app.config.virtual_folders);
         app.browser_cursor = BrowserCursor::Group;
         app.selected_group_path = Some(String::from("local"));
 
@@ -10417,6 +10806,7 @@ codex_home = "/root/.codex"
                 exec_prefix: Some(String::from("lxc-attach -n dev --")),
                 codex_home: Some(String::from("/root/.codex")),
             }],
+            virtual_folders: Vec::new(),
         };
         upsert_config_machine(
             &mut config,
