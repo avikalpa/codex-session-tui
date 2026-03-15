@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.15 - 2026-03-15
+
+- Fixed browser session id collisions by expanding the displayed suffix until it is unique across the loaded sessions.
+- Fixed reload after operations so the browser tree preserves the current collapsed/expanded state instead of collapsing unexpectedly.
+- Added wrap-around navigation for browser rows and preview blocks when moving past the top or bottom.
+- Added `!` to select user-only sessions in the current folder only.
+- Fixed copy semantics so duplicated sessions get a fresh session id instead of reusing the source id.
+
 ## 1.3.14 - 2026-03-15
 
 - Added non-blocking browser transfer progress for paste and drag/drop, with a live status-bar progress indicator showing completed, skipped, and failed session transfers.

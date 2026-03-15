@@ -746,6 +746,16 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
                 app.invert_sessions_selection_current_project();
             }
         }
+        KeyCode::Char('!') => {
+            if app.focus == Focus::Projects
+                && matches!(
+                    app.browser_cursor,
+                    BrowserCursor::Project | BrowserCursor::Session
+                )
+            {
+                app.select_user_only_sessions_current_project();
+            }
+        }
         KeyCode::Tab => {
             if app.focus == Focus::Preview {
                 app.toggle_fold_focused_preview_turn();
@@ -1613,9 +1623,23 @@ impl App {
     }
 
     fn reload(&mut self, force_remote_scan: bool) -> Result<()> {
+        let had_projects_before = !self.projects.is_empty();
         self.all_projects = self.scan_all_projects(force_remote_scan)?;
         self.prune_selected_sessions();
-        self.apply_search_filter();
+        if self.search_query.trim().is_empty() {
+            self.projects = self.all_projects.clone();
+            self.project_idx = self.project_idx.min(self.projects.len().saturating_sub(1));
+            self.clamp_session_idx();
+            self.preview_search_matches.clear();
+            self.preview_search_index = None;
+            self.pending_preview_search_jump = None;
+            self.search_dirty = false;
+            if !had_projects_before {
+                self.collapse_all_projects();
+            }
+        } else {
+            self.apply_search_filter();
+        }
 
         if self.projects.is_empty() {
             self.project_idx = 0;
@@ -1807,7 +1831,14 @@ impl App {
             return;
         }
         let current = self.current_browser_row_index() as isize;
-        let next = (current + delta).clamp(0, rows.len().saturating_sub(1) as isize) as usize;
+        let len = rows.len() as isize;
+        let next = if delta < 0 && current <= 0 {
+            len.saturating_sub(1)
+        } else if delta > 0 && current >= len.saturating_sub(1) {
+            0
+        } else {
+            current + delta
+        } as usize;
         self.set_browser_row(rows[next].clone());
         self.session_select_anchor = None;
     }
@@ -2493,7 +2524,7 @@ impl App {
         let Some(pos) = turns.iter().position(|t| *t == current) else {
             return;
         };
-        let next = (pos + 1).min(turns.len().saturating_sub(1));
+        let next = if pos + 1 >= turns.len() { 0 } else { pos + 1 };
         self.preview_focus_turn = Some(turns[next]);
         self.scroll_preview_focus_into_view();
     }
@@ -2511,7 +2542,11 @@ impl App {
         let Some(pos) = turns.iter().position(|t| *t == current) else {
             return;
         };
-        let prev = pos.saturating_sub(1);
+        let prev = if pos == 0 {
+            turns.len().saturating_sub(1)
+        } else {
+            pos - 1
+        };
         self.preview_focus_turn = Some(turns[prev]);
         self.scroll_preview_focus_into_view();
     }
@@ -2892,6 +2927,32 @@ impl App {
         }
         self.status = format!(
             "Selected {} session(s)",
+            self.selected_count_current_project()
+        );
+    }
+
+    fn select_user_only_sessions_current_project(&mut self) {
+        let Some(project) = self.current_project() else {
+            self.status = String::from("No folder selected");
+            return;
+        };
+        let selected = project
+            .sessions
+            .iter()
+            .filter(|session| {
+                session.user_message_count > 0 && session.assistant_message_count == 0
+            })
+            .map(|session| session.path.clone())
+            .collect::<Vec<_>>();
+        let project_len = project.sessions.len();
+        for path in selected {
+            self.selected_sessions.insert(path);
+        }
+        if project_len > 0 {
+            self.session_select_anchor = Some(self.session_idx.min(project_len - 1));
+        }
+        self.status = format!(
+            "Selected {} user-only session(s) in current folder",
             self.selected_count_current_project()
         );
     }
@@ -3593,8 +3654,17 @@ impl App {
                 Ok(())
             }
             Action::Copy | Action::ProjectCopy | Action::Fork | Action::Export => {
-                let fork = matches!(action, Action::Fork);
-                let (out, session_id, _) = duplicate_session_content(session, &target.cwd, fork)?;
+                let rewrite_id = matches!(
+                    action,
+                    Action::Copy | Action::ProjectCopy | Action::Fork | Action::Export
+                );
+                let rewrite_start_timestamp = matches!(action, Action::Fork);
+                let (out, session_id, _) = duplicate_session_content(
+                    session,
+                    &target.cwd,
+                    rewrite_id,
+                    rewrite_start_timestamp,
+                )?;
                 if let Some(ssh_target) = &target.ssh_target {
                     let remote_path = write_new_remote_session(
                         ssh_target,
@@ -3798,10 +3868,40 @@ fn machine_status_suffix(status: RemoteMachineStatus) -> &'static str {
     }
 }
 
-fn format_session_browser_line(session: &SessionSummary) -> String {
-    let chars = session.id.chars().collect::<Vec<_>>();
-    let start = chars.len().saturating_sub(7);
-    let mut out = chars[start..].iter().collect::<String>();
+fn session_id_suffix(id: &str, width: usize) -> String {
+    let chars = id.chars().collect::<Vec<_>>();
+    let start = chars.len().saturating_sub(width);
+    chars[start..].iter().collect::<String>()
+}
+
+fn shortest_unique_session_suffixes(projects: &[ProjectBucket]) -> HashMap<PathBuf, String> {
+    let sessions = projects
+        .iter()
+        .flat_map(|project| project.sessions.iter())
+        .collect::<Vec<_>>();
+    let mut out = HashMap::new();
+    for session in &sessions {
+        let id_len = session.id.chars().count();
+        let mut width = 7usize.min(id_len).max(1);
+        while width < id_len {
+            let suffix = session_id_suffix(&session.id, width);
+            let collision = sessions.iter().any(|other| {
+                other.path != session.path && session_id_suffix(&other.id, width) == suffix
+            });
+            if !collision {
+                break;
+            }
+            width += 1;
+        }
+        out.insert(session.path.clone(), session_id_suffix(&session.id, width));
+    }
+    out
+}
+
+fn format_session_browser_line(session: &SessionSummary, short_id: Option<&str>) -> String {
+    let mut out = short_id
+        .map(std::string::ToString::to_string)
+        .unwrap_or_else(|| session_id_suffix(&session.id, 7));
     if is_user_only_session(session) {
         out.push_str(" !");
     }
@@ -4407,6 +4507,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" select-all  "),
             Span::styled("i", Style::default().fg(Color::Yellow)),
             Span::raw(" invert  "),
+            Span::styled("!", Style::default().fg(Color::Yellow)),
+            Span::raw(" select *!  "),
             Span::styled("ctrl+c/x/v", Style::default().fg(Color::Green)),
             Span::raw(" copy/cut/paste  "),
             Span::styled("c/x/v", Style::default().fg(Color::Green)),
@@ -5231,12 +5333,14 @@ fn build_browser_rows(
     _selected_sessions: &HashSet<PathBuf>,
 ) -> Vec<BrowserRow> {
     let tree = build_browser_tree(projects, virtual_folders, machine_roots);
+    let short_ids = shortest_unique_session_suffixes(projects);
     let mut rows = Vec::new();
     for root_name in machine_roots {
         if let Some(node) = tree.get(root_name) {
             append_browser_rows(
                 node,
                 projects,
+                &short_ids,
                 collapsed_groups,
                 collapsed_projects,
                 &mut rows,
@@ -5373,6 +5477,7 @@ fn compress_browser_tree_node(node: &mut BrowserTreeNode, can_compress_self: boo
 fn append_browser_rows(
     node: &BrowserTreeNode,
     projects: &[ProjectBucket],
+    short_ids: &HashMap<PathBuf, String>,
     collapsed_groups: &HashSet<String>,
     collapsed_projects: &HashSet<String>,
     rows: &mut Vec<BrowserRow>,
@@ -5409,7 +5514,12 @@ fn append_browser_rows(
                     session_idx,
                 },
                 depth: depth + 1,
-                label: format_session_browser_line(&projects[project_idx].sessions[session_idx]),
+                label: format_session_browser_line(
+                    &projects[project_idx].sessions[session_idx],
+                    short_ids
+                        .get(&projects[project_idx].sessions[session_idx].path)
+                        .map(String::as_str),
+                ),
             });
         }
     }
@@ -5417,6 +5527,7 @@ fn append_browser_rows(
         append_browser_rows(
             child,
             projects,
+            short_ids,
             collapsed_groups,
             collapsed_projects,
             rows,
@@ -6277,10 +6388,11 @@ fn duplicate_session_file(
 fn duplicate_session_content(
     source: &SessionSummary,
     target_cwd: &str,
-    fork: bool,
+    rewrite_id: bool,
+    rewrite_start_timestamp: bool,
 ) -> Result<(String, String, bool)> {
     let content = read_session_content(source)?;
-    let new_id = if fork {
+    let new_id = if rewrite_id {
         Some(Uuid::new_v4().to_string())
     } else {
         None
@@ -6289,10 +6401,14 @@ fn duplicate_session_content(
         &content,
         target_cwd,
         new_id.as_deref(),
-        fork,
+        rewrite_start_timestamp,
         &source.storage_path,
     )?;
-    Ok((out, new_id.unwrap_or_else(|| source.id.clone()), fork))
+    Ok((
+        out,
+        new_id.unwrap_or_else(|| source.id.clone()),
+        rewrite_start_timestamp,
+    ))
 }
 
 fn write_new_local_session(sessions_root: &Path, session_id: &str, out: &str) -> Result<PathBuf> {
@@ -8091,6 +8207,66 @@ mod tests {
     }
 
     #[test]
+    fn select_user_only_sessions_only_in_current_folder() {
+        let mut user_only_a = sample_session("/tmp/a.jsonl", "/repo", "a");
+        user_only_a.assistant_message_count = 0;
+        let mut user_only_b = sample_session("/tmp/b.jsonl", "/repo", "b");
+        user_only_b.assistant_message_count = 0;
+        let normal = sample_session("/tmp/c.jsonl", "/repo", "c");
+        let mut sibling_user_only = sample_session("/tmp/d.jsonl", "/repo/sub", "d");
+        sibling_user_only.assistant_message_count = 0;
+
+        let mut app = empty_test_app();
+        app.projects = vec![
+            ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
+                machine_exec_prefix: None,
+                cwd: String::from("/repo"),
+                sessions: vec![user_only_a, normal, user_only_b],
+            },
+            ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
+                machine_exec_prefix: None,
+                cwd: String::from("/repo/sub"),
+                sessions: vec![sibling_user_only],
+            },
+        ];
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Session;
+        app.project_idx = 0;
+        app.session_idx = 1;
+
+        handle_normal_mode(
+            KeyEvent::new(KeyCode::Char('!'), KeyModifiers::SHIFT),
+            &mut app,
+        )
+        .expect("handle");
+
+        assert_eq!(app.selected_count_current_project(), 2);
+        assert!(
+            app.selected_sessions
+                .contains(&PathBuf::from("/tmp/a.jsonl"))
+        );
+        assert!(
+            app.selected_sessions
+                .contains(&PathBuf::from("/tmp/b.jsonl"))
+        );
+        assert!(
+            !app.selected_sessions
+                .contains(&PathBuf::from("/tmp/c.jsonl"))
+        );
+        assert!(
+            !app.selected_sessions
+                .contains(&PathBuf::from("/tmp/d.jsonl"))
+        );
+        assert!(app.status.contains("user-only"));
+    }
+
+    #[test]
     fn action_targets_prefers_selected_sessions() {
         let mut app = empty_test_app();
         app.focus = Focus::Projects;
@@ -8263,6 +8439,37 @@ mod tests {
             .expect("rewrite");
         assert!(out.contains("\"cwd\":\"/remote/project/path\""));
         assert!(!out.contains("\"cwd\":\"/old/path\""));
+    }
+
+    #[test]
+    fn duplicate_session_content_for_copy_generates_new_session_id() {
+        let dir = std::env::temp_dir().join(format!("cse-dup-copy-{}", Uuid::new_v4()));
+        let source_path = dir.join("source.jsonl");
+        write_test_session(&source_path, &sample_chat_jsonl());
+        let source = SessionSummary {
+            path: source_path.clone(),
+            storage_path: path_to_string(&source_path),
+            file_name: String::from("source.jsonl"),
+            id: String::from("abc"),
+            cwd: String::from("/tmp/x"),
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            started_at: String::from("2026-01-01T00:00:00Z"),
+            modified_epoch: 123,
+            event_count: 4,
+            user_message_count: 2,
+            assistant_message_count: 1,
+            search_blob: String::new(),
+        };
+
+        let (out, session_id, _) =
+            duplicate_session_content(&source, "/tmp/new", true, false).expect("duplicate");
+
+        assert_ne!(session_id, "abc");
+        assert!(out.contains(&format!("\"id\":\"{session_id}\"")));
+        assert!(out.contains("\"cwd\":\"/tmp/new\""));
     }
 
     #[test]
@@ -9180,7 +9387,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_browser_navigation_clamps_at_visible_bounds() {
+    fn browser_navigation_wraps_at_visible_bounds() {
         let mut app = empty_test_app();
         app.projects = vec![
             ProjectBucket {
@@ -9204,36 +9411,16 @@ mod tests {
             },
         ];
 
-        for _ in 0..12 {
-            app.move_down();
-        }
         let rows = app.browser_rows();
+        let first = rows.first().cloned().expect("first row");
         let last = rows.last().cloned().expect("last row");
-        match last.kind {
-            BrowserRowKind::Group { path } => {
-                assert_eq!(app.browser_cursor, BrowserCursor::Group);
-                assert_eq!(app.selected_group_path.as_deref(), Some(path.as_str()));
-            }
-            BrowserRowKind::Project { project_idx } => {
-                assert_eq!(app.browser_cursor, BrowserCursor::Project);
-                assert_eq!(app.project_idx, project_idx);
-            }
-            BrowserRowKind::Session {
-                project_idx,
-                session_idx,
-            } => {
-                assert_eq!(app.browser_cursor, BrowserCursor::Session);
-                assert_eq!(app.project_idx, project_idx);
-                assert_eq!(app.session_idx, session_idx);
-            }
-        }
+        app.set_browser_row(first.clone());
+        app.move_up();
+        assert_eq!(app.current_browser_row_index(), rows.len() - 1);
 
-        for _ in 0..12 {
-            app.move_up();
-        }
-        assert_eq!(app.project_idx, 0);
-        assert_eq!(app.browser_cursor, BrowserCursor::Group);
-        assert_eq!(app.selected_group_path.as_deref(), Some("local"));
+        app.set_browser_row(last.clone());
+        app.move_down();
+        assert_eq!(app.current_browser_row_index(), 0);
     }
 
     #[test]
@@ -9496,6 +9683,67 @@ mod tests {
     }
 
     #[test]
+    fn reload_preserves_browser_tree_collapse_state_without_search() {
+        let dir = std::env::temp_dir().join(format!("cse-reload-preserve-{}", Uuid::new_v4()));
+        let sessions_root = dir.join("sessions");
+        write_test_session(
+            &sessions_root.join("2026/03/15/a.jsonl"),
+            &sample_chat_jsonl().replace("\"/tmp/x\"", "\"/repo/a\""),
+        );
+        write_test_session(
+            &sessions_root.join("2026/03/15/b.jsonl"),
+            &sample_chat_jsonl().replace("\"/tmp/x\"", "\"/repo/b\""),
+        );
+
+        let mut app = empty_test_app();
+        app.sessions_root = sessions_root;
+        app.projects = vec![
+            ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
+                machine_exec_prefix: None,
+                cwd: String::from("/repo/a"),
+                sessions: vec![sample_session("/tmp/a.jsonl", "/repo/a", "a")],
+            },
+            ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
+                machine_exec_prefix: None,
+                cwd: String::from("/repo/b"),
+                sessions: vec![sample_session("/tmp/b.jsonl", "/repo/b", "b")],
+            },
+        ];
+        app.project_idx = 1;
+        app.browser_cursor = BrowserCursor::Project;
+        app.collapsed_projects.insert(String::from("/repo/a"));
+        app.collapsed_groups.insert(String::from("local"));
+        app.selected_group_path = None;
+
+        app.reload(false).expect("reload");
+
+        assert!(app.collapsed_projects.contains("/repo/a"));
+        assert!(app.collapsed_groups.contains("local"));
+        assert_eq!(app.project_idx, 1);
+        assert_eq!(app.browser_cursor, BrowserCursor::Project);
+    }
+
+    #[test]
+    fn preview_focus_wraps_from_top_to_bottom() {
+        let mut app = empty_test_app();
+        app.preview_header_rows = vec![(0, 0), (10, 1), (20, 2)];
+        app.preview_focus_turn = Some(0);
+        app.panes.preview.height = 8;
+
+        app.focus_prev_preview_turn();
+        assert_eq!(app.preview_focus_turn, Some(2));
+
+        app.focus_next_preview_turn();
+        assert_eq!(app.preview_focus_turn, Some(0));
+    }
+
+    #[test]
     fn pinned_project_stays_open_when_navigating_to_next_project() {
         let mut app = empty_test_app();
         app.projects = vec![
@@ -9720,7 +9968,7 @@ mod tests {
             assistant_message_count: 1,
             search_blob: String::from("first user prompt"),
         };
-        let line = format_session_browser_line(&s);
+        let line = format_session_browser_line(&s, None);
         assert_eq!(line, "9abcdef");
     }
 
@@ -9743,9 +9991,70 @@ mod tests {
             assistant_message_count: 0,
             search_blob: String::from("first user prompt"),
         };
-        let line = format_session_browser_line(&s);
+        let line = format_session_browser_line(&s, None);
         assert_eq!(line, "9abcdef !");
         assert!(is_user_only_session(&s));
+    }
+
+    #[test]
+    fn browser_short_ids_expand_until_suffixes_are_unique() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            cwd: String::from("/repo"),
+            sessions: vec![
+                SessionSummary {
+                    path: PathBuf::from("/tmp/a.jsonl"),
+                    storage_path: String::from("/tmp/a.jsonl"),
+                    file_name: String::from("a.jsonl"),
+                    id: String::from("111111119abcdef"),
+                    cwd: String::from("/repo"),
+                    machine_name: String::from("local"),
+                    machine_target: None,
+                    machine_codex_home: None,
+                    machine_exec_prefix: None,
+                    started_at: String::from("2026-01-01T00:00:00Z"),
+                    modified_epoch: 1,
+                    event_count: 1,
+                    user_message_count: 1,
+                    assistant_message_count: 1,
+                    search_blob: String::new(),
+                },
+                SessionSummary {
+                    path: PathBuf::from("/tmp/b.jsonl"),
+                    storage_path: String::from("/tmp/b.jsonl"),
+                    file_name: String::from("b.jsonl"),
+                    id: String::from("222222229abcdef"),
+                    cwd: String::from("/repo"),
+                    machine_name: String::from("local"),
+                    machine_target: None,
+                    machine_codex_home: None,
+                    machine_exec_prefix: None,
+                    started_at: String::from("2026-01-01T00:00:00Z"),
+                    modified_epoch: 2,
+                    event_count: 1,
+                    user_message_count: 1,
+                    assistant_message_count: 1,
+                    search_blob: String::new(),
+                },
+            ],
+        }];
+
+        let labels = app
+            .browser_rows()
+            .into_iter()
+            .filter_map(|row| match row.kind {
+                BrowserRowKind::Session { .. } => Some(row.label),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(labels.len(), 2);
+        assert_ne!(labels[0], labels[1]);
+        assert!(labels[0].len() > 7 || labels[1].len() > 7);
     }
 
     #[test]
