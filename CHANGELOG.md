@@ -1,10 +1,11 @@
 # Changelog
 
-## 1.3.19 - 2026-03-15
+## 1.3.20 - 2026-03-15
 
 - Fixed non-interactive `copy`, `move`, `fork`, and `export` startup so CLI mode no longer blocks on remote browser scans before running the requested action.
 - Fixed cross-machine `move` so it preserves the original session id instead of silently creating a copy with a new id before deleting the source.
-- Documented the non-interactive CLI session-operation mode in `README.md`, including examples for local and remote targets.
+- Added non-interactive `tree` and `ls` commands that print the same grouped Browser model the TUI uses, which makes remote visibility issues reproducible from the shell.
+- Documented the non-interactive CLI commands in `README.md`, including local and remote examples.
 
 ## 1.3.17 - 2026-03-15
 

@@ -59,6 +59,8 @@ enum CliCommand {
     Move { session_id: String, target: String },
     Fork { session_id: String, target: String },
     Export { session_id: String, target: String },
+    Tree,
+    Ls { target: Option<String> },
 }
 
 fn parse_cli_command<I>(args: I) -> Result<Option<CliCommand>>
@@ -70,7 +72,7 @@ where
     if args.len() <= 1 {
         return Ok(None);
     }
-    let usage = "usage: codex-session-tui [copy|move|fork|export] <session-id> <target>";
+    let usage = "usage: codex-session-tui [copy|move|fork|export] <session-id> <target>\n       codex-session-tui tree\n       codex-session-tui ls [machine|machine:/path]";
     match args[1].as_str() {
         "-h" | "--help" | "help" => {
             println!("{usage}");
@@ -78,6 +80,8 @@ where
             println!("  codex-session-tui copy <session-id> pi@openclaw:/home/pi/data/cases");
             println!("  codex-session-tui move <session-id> /new/local/path");
             println!("  codex-session-tui export <session-id> user@host:/remote/project/path");
+            println!("  codex-session-tui tree");
+            println!("  codex-session-tui ls pi@openclaw:/home/pi/data/cases");
             std::process::exit(0);
         }
         "copy" | "move" | "fork" | "export" => {
@@ -95,27 +99,69 @@ where
             };
             Ok(Some(cmd))
         }
+        "tree" => {
+            if args.len() != 2 {
+                return Err(anyhow!(usage));
+            }
+            Ok(Some(CliCommand::Tree))
+        }
+        "ls" => {
+            if args.len() > 3 {
+                return Err(anyhow!(usage));
+            }
+            Ok(Some(CliCommand::Ls {
+                target: args.get(2).cloned(),
+            }))
+        }
         _ => Ok(None),
     }
 }
 
 fn run_cli_command(cmd: CliCommand) -> Result<()> {
-    let mut app = App::load_for_cli()?;
-    let status = match cmd {
+    match cmd {
         CliCommand::Copy { session_id, target } => {
-            app.run_noninteractive_session_action(Action::Copy, &session_id, &target)?
+            let mut app = App::load_for_cli()?;
+            println!(
+                "{}",
+                app.run_noninteractive_session_action(Action::Copy, &session_id, &target)?
+            );
         }
         CliCommand::Move { session_id, target } => {
-            app.run_noninteractive_session_action(Action::Move, &session_id, &target)?
+            let mut app = App::load_for_cli()?;
+            println!(
+                "{}",
+                app.run_noninteractive_session_action(Action::Move, &session_id, &target)?
+            );
         }
         CliCommand::Fork { session_id, target } => {
-            app.run_noninteractive_session_action(Action::Fork, &session_id, &target)?
+            let mut app = App::load_for_cli()?;
+            println!(
+                "{}",
+                app.run_noninteractive_session_action(Action::Fork, &session_id, &target)?
+            );
         }
         CliCommand::Export { session_id, target } => {
-            app.run_noninteractive_session_action(Action::Export, &session_id, &target)?
+            let mut app = App::load_for_cli()?;
+            println!(
+                "{}",
+                app.run_noninteractive_session_action(Action::Export, &session_id, &target)?
+            );
         }
-    };
-    println!("{status}");
+        CliCommand::Tree => {
+            let mut app = App::load()?;
+            app.expand_all_for_cli();
+            for line in app.cli_tree_lines(None)? {
+                println!("{line}");
+            }
+        }
+        CliCommand::Ls { target } => {
+            let mut app = App::load()?;
+            app.expand_all_for_cli();
+            for line in app.cli_ls_lines(target.as_deref())? {
+                println!("{line}");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1765,6 +1811,11 @@ impl App {
         Ok(())
     }
 
+    fn expand_all_for_cli(&mut self) {
+        self.collapsed_groups.clear();
+        self.collapsed_projects.clear();
+    }
+
     fn scan_all_projects(
         &mut self,
         force_remote_scan: bool,
@@ -1971,6 +2022,139 @@ impl App {
 
     fn browser_rows(&self) -> Vec<BrowserRow> {
         self.browser_render_rows()
+    }
+
+    fn cli_tree_lines(&self, root: Option<&str>) -> Result<Vec<String>> {
+        let rows = self.browser_rows();
+        if rows.is_empty() {
+            return Ok(vec![String::from("<empty>")]);
+        }
+        let target_path = root
+            .map(|raw| self.cli_browser_target_path(raw))
+            .transpose()?;
+        let mut out = Vec::new();
+        for row in rows {
+            let row_path = self.browser_row_path(&row);
+            if let Some(target) = target_path.as_deref() {
+                let prefix = format!("{target}/");
+                if row_path != target && !row_path.starts_with(&prefix) {
+                    continue;
+                }
+            }
+            out.push(format!(
+                "{}{}",
+                "  ".repeat(row.depth),
+                self.cli_row_label(&row)
+            ));
+        }
+        if out.is_empty() {
+            Ok(vec![String::from("<empty>")])
+        } else {
+            Ok(out)
+        }
+    }
+
+    fn cli_ls_lines(&self, target: Option<&str>) -> Result<Vec<String>> {
+        let rows = self.browser_rows();
+        if rows.is_empty() {
+            return Ok(vec![String::from("<empty>")]);
+        }
+        let Some(target_path) = target
+            .map(|raw| self.cli_browser_target_path(raw))
+            .transpose()?
+        else {
+            return Ok(rows
+                .into_iter()
+                .filter(|row| row.depth == 0)
+                .map(|row| self.cli_row_label(&row))
+                .collect());
+        };
+
+        let Some((idx, base_depth)) = rows.iter().enumerate().find_map(|(idx, row)| {
+            (self.browser_row_path(row) == target_path).then_some((idx, row.depth))
+        }) else {
+            return Err(anyhow!("browser target not found: {target_path}"));
+        };
+
+        let mut out = Vec::new();
+        for row in rows.into_iter().skip(idx + 1) {
+            if row.depth <= base_depth {
+                break;
+            }
+            if row.depth == base_depth + 1 {
+                out.push(self.cli_row_label(&row));
+            }
+        }
+        if out.is_empty() {
+            Ok(vec![String::from("<empty>")])
+        } else {
+            Ok(out)
+        }
+    }
+
+    fn cli_browser_target_path(&self, raw: &str) -> Result<String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow!("browser target is empty"));
+        }
+        if let Some((machine, cwd)) = trimmed.split_once(':') {
+            if cwd.is_empty() {
+                return Ok(machine.to_string());
+            }
+            return Ok(group_path_for_machine_cwd(machine, cwd));
+        }
+        Ok(trimmed.to_string())
+    }
+
+    fn browser_row_path(&self, row: &BrowserRow) -> String {
+        match &row.kind {
+            BrowserRowKind::Group { path } => path.clone(),
+            BrowserRowKind::Project { project_idx } => {
+                let project = &self.projects[*project_idx];
+                group_path_for_machine_cwd(&project.machine_name, &project.cwd)
+            }
+            BrowserRowKind::Session {
+                project_idx,
+                session_idx,
+            } => {
+                let session = &self.projects[*project_idx].sessions[*session_idx];
+                format!(
+                    "{}#{}",
+                    group_path_for_machine_cwd(&session.machine_name, &session.cwd),
+                    session.id
+                )
+            }
+        }
+    }
+
+    fn cli_row_label(&self, row: &BrowserRow) -> String {
+        match &row.kind {
+            BrowserRowKind::Group { path } => {
+                if !path.contains('/') {
+                    let badge = match self.remote_status_for_machine(path) {
+                        RemoteMachineStatus::Healthy => "[ok]",
+                        RemoteMachineStatus::Cached => "[cached]",
+                        RemoteMachineStatus::Error => "[offline]",
+                        RemoteMachineStatus::Unknown => "[unknown]",
+                    };
+                    format!("🖥 {} {}", row.label, badge)
+                } else {
+                    format!("📁 {}", row.label)
+                }
+            }
+            BrowserRowKind::Project { .. } => format!("📁 {}", row.label),
+            BrowserRowKind::Session {
+                project_idx,
+                session_idx,
+            } => {
+                let session = &self.projects[*project_idx].sessions[*session_idx];
+                if is_user_only_session(session) {
+                    format!("💬 {} !", row.label.trim())
+                } else {
+                    format!("💬 {}", row.label.trim())
+                }
+            }
+        }
     }
 
     fn browser_machine_roots(&self) -> Vec<String> {
@@ -8117,6 +8301,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_cli_command_parses_tree_and_ls() {
+        assert_eq!(
+            parse_cli_command(["codex-session-tui", "tree"]).expect("parse"),
+            Some(CliCommand::Tree)
+        );
+        assert_eq!(
+            parse_cli_command(["codex-session-tui", "ls", "pi@openclaw:/home/pi/data/cases"])
+                .expect("parse"),
+            Some(CliCommand::Ls {
+                target: Some(String::from("pi@openclaw:/home/pi/data/cases")),
+            })
+        );
+    }
+
+    #[test]
     fn run_noninteractive_copy_local_to_local_works() {
         let dir = std::env::temp_dir().join(format!("cse-cli-copy-{}", Uuid::new_v4()));
         let sessions_root = dir.join("sessions");
@@ -8153,6 +8352,69 @@ mod tests {
             .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
             .collect::<Vec<_>>();
         assert!(created.len() >= 2);
+    }
+
+    #[test]
+    fn cli_ls_lines_follow_browser_tree_model() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            machine_name: String::from("pi@openclaw"),
+            machine_target: Some(String::from("pi@192.168.0.124")),
+            machine_codex_home: Some(String::from("/home/pi/.codex")),
+            machine_exec_prefix: None,
+            cwd: String::from("/home/pi/data/cases"),
+            sessions: vec![sample_session(
+                "/tmp/s1.jsonl",
+                "/home/pi/data/cases",
+                "abc123456789",
+            )],
+        }];
+        app.all_projects = app.projects.clone();
+        app.refresh_browser_short_ids();
+        app.expand_all_for_cli();
+
+        let roots = app.cli_ls_lines(None).expect("ls roots");
+        assert!(roots.iter().any(|line| line.contains("pi@openclaw")));
+
+        let machine = app.cli_ls_lines(Some("pi@openclaw")).expect("ls machine");
+        assert!(
+            machine
+                .iter()
+                .any(|line| line.contains("home/pi/data/cases"))
+        );
+
+        let folder = app
+            .cli_ls_lines(Some("pi@openclaw:/home/pi/data/cases"))
+            .expect("ls folder");
+        assert!(folder.iter().any(|line| line.contains("💬")));
+    }
+
+    #[test]
+    fn cli_tree_lines_include_nested_rows() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            cwd: String::from("/home/pi/work/repo"),
+            sessions: vec![sample_session(
+                "/tmp/s1.jsonl",
+                "/home/pi/work/repo",
+                "abc123456789",
+            )],
+        }];
+        app.all_projects = app.projects.clone();
+        app.refresh_browser_short_ids();
+        app.expand_all_for_cli();
+
+        let tree = app.cli_tree_lines(None).expect("tree");
+        assert!(tree.iter().any(|line| line.contains("🖥 local")));
+        assert!(
+            tree.iter()
+                .any(|line| line.contains("📁") && line.contains("repo"))
+        );
+        assert!(tree.iter().any(|line| line.contains("💬")));
     }
 
     #[test]
