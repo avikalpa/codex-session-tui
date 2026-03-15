@@ -35,6 +35,9 @@ use serde_json::Value;
 use uuid::Uuid;
 
 fn main() -> Result<()> {
+    if let Some(cmd) = parse_cli_command(env::args())? {
+        return run_cli_command(cmd);
+    }
     let mut app = App::load()?;
     let mut tui = Tui::new()?;
 
@@ -47,6 +50,72 @@ fn main() -> Result<()> {
     if let Some(spec) = launch {
         launch_codex_resume(&spec)?;
     }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CliCommand {
+    Copy { session_id: String, target: String },
+    Move { session_id: String, target: String },
+    Fork { session_id: String, target: String },
+    Export { session_id: String, target: String },
+}
+
+fn parse_cli_command<I>(args: I) -> Result<Option<CliCommand>>
+where
+    I: IntoIterator,
+    I::Item: Into<String>,
+{
+    let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+    if args.len() <= 1 {
+        return Ok(None);
+    }
+    let usage = "usage: codex-session-tui [copy|move|fork|export] <session-id> <target>";
+    match args[1].as_str() {
+        "-h" | "--help" | "help" => {
+            println!("{usage}");
+            println!("examples:");
+            println!("  codex-session-tui copy <session-id> pi@openclaw:/home/pi/data/cases");
+            println!("  codex-session-tui move <session-id> /new/local/path");
+            println!("  codex-session-tui export <session-id> user@host:/remote/project/path");
+            std::process::exit(0);
+        }
+        "copy" | "move" | "fork" | "export" => {
+            if args.len() != 4 {
+                return Err(anyhow!(usage));
+            }
+            let session_id = args[2].clone();
+            let target = args[3].clone();
+            let cmd = match args[1].as_str() {
+                "copy" => CliCommand::Copy { session_id, target },
+                "move" => CliCommand::Move { session_id, target },
+                "fork" => CliCommand::Fork { session_id, target },
+                "export" => CliCommand::Export { session_id, target },
+                _ => unreachable!(),
+            };
+            Ok(Some(cmd))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn run_cli_command(cmd: CliCommand) -> Result<()> {
+    let mut app = App::load()?;
+    let status = match cmd {
+        CliCommand::Copy { session_id, target } => {
+            app.run_noninteractive_session_action(Action::Copy, &session_id, &target)?
+        }
+        CliCommand::Move { session_id, target } => {
+            app.run_noninteractive_session_action(Action::Move, &session_id, &target)?
+        }
+        CliCommand::Fork { session_id, target } => {
+            app.run_noninteractive_session_action(Action::Fork, &session_id, &target)?
+        }
+        CliCommand::Export { session_id, target } => {
+            app.run_noninteractive_session_action(Action::Export, &session_id, &target)?
+        }
+    };
+    println!("{status}");
     Ok(())
 }
 
@@ -2188,6 +2257,14 @@ impl App {
             })
     }
 
+    fn find_session_by_id(&self, session_id: &str) -> Option<SessionSummary> {
+        self.all_projects
+            .iter()
+            .flat_map(|project| project.sessions.iter())
+            .find(|session| session.id == session_id)
+            .cloned()
+    }
+
     fn ensure_selection_visible(&mut self) {
         let visible = Self::visible_rows(self.panes.browser.height, 1);
         let current = self.current_browser_row_index();
@@ -2699,6 +2776,56 @@ impl App {
         };
         self.launch_codex_after_exit = Some(launch.clone());
         Some(launch)
+    }
+
+    fn run_noninteractive_session_action(
+        &mut self,
+        action: Action,
+        session_id: &str,
+        target_input: &str,
+    ) -> Result<String> {
+        let session = self
+            .find_session_by_id(session_id)
+            .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        let mut ok = 0usize;
+        let mut skipped = 0usize;
+        let target_display = target_input.trim().to_string();
+
+        match action {
+            Action::Copy | Action::Move | Action::Fork => {
+                let target = self.resolve_machine_target(target_input)?;
+                if session.machine_target == target.ssh_target && session.cwd == target.cwd {
+                    skipped = 1;
+                } else {
+                    self.apply_session_action_to_target(action, &session, &target)?;
+                    ok = 1;
+                }
+            }
+            Action::Export => {
+                export_session_via_ssh(&session, target_input)?;
+                ok = 1;
+            }
+            _ => return Err(anyhow!("unsupported non-interactive action")),
+        }
+
+        if matches!(action, Action::Copy | Action::Move | Action::Fork) && (ok > 0 || skipped > 0) {
+            self.reload(false)?;
+        }
+
+        let action_name = match action {
+            Action::Move => "moved",
+            Action::Copy => "copied",
+            Action::Fork => "forked",
+            Action::Export => "exported",
+            _ => unreachable!(),
+        };
+        if skipped > 0 {
+            Ok(format!(
+                "{action_name} {ok} session(s), skipped {skipped} unchanged -> {target_display}"
+            ))
+        } else {
+            Ok(format!("{action_name} {ok} session(s) -> {target_display}"))
+        }
     }
 
     fn clamp_preview_pos(&self, row: usize, col: usize) -> (usize, usize) {
@@ -7789,6 +7916,26 @@ mod tests {
         .join("\n")
     }
 
+    fn sample_session_with_id(path: &str, cwd: &str, id: &str) -> SessionSummary {
+        SessionSummary {
+            path: PathBuf::from(path),
+            storage_path: path_to_string(Path::new(&PathBuf::from(path))),
+            file_name: format!("{id}.jsonl"),
+            id: String::from(id),
+            cwd: String::from(cwd),
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            started_at: String::from("2026-01-01T00:00:00Z"),
+            modified_epoch: 123,
+            event_count: 1,
+            user_message_count: 1,
+            assistant_message_count: 1,
+            search_blob: String::new(),
+        }
+    }
+
     fn buffer_lines(backend: &TestBackend) -> Vec<String> {
         let area = backend.buffer().area;
         (0..area.height)
@@ -7909,23 +8056,9 @@ mod tests {
     }
 
     fn sample_session(path: &str, cwd: &str, id: &str) -> SessionSummary {
-        SessionSummary {
-            path: PathBuf::from(path),
-            storage_path: String::from(path),
-            file_name: format!("{id}.jsonl"),
-            id: String::from(id),
-            cwd: String::from(cwd),
-            machine_name: String::from("local"),
-            machine_target: None,
-            machine_codex_home: None,
-            machine_exec_prefix: None,
-            started_at: String::from("2026-01-01T00:00:00Z"),
-            modified_epoch: 123,
-            event_count: 1,
-            user_message_count: 1,
-            assistant_message_count: 1,
-            search_blob: String::new(),
-        }
+        let mut session = sample_session_with_id(path, cwd, id);
+        session.storage_path = String::from(path);
+        session
     }
 
     #[test]
@@ -7935,6 +8068,63 @@ mod tests {
         assert_eq!(turns[0].role, "user");
         assert_eq!(turns[1].role, "assistant");
         assert_eq!(turns[2].role, "user");
+    }
+
+    #[test]
+    fn parse_cli_command_parses_copy() {
+        let cmd = parse_cli_command([
+            "codex-session-tui",
+            "copy",
+            "session-123",
+            "pi@openclaw:/home/pi/data/cases",
+        ])
+        .expect("parse");
+        assert_eq!(
+            cmd,
+            Some(CliCommand::Copy {
+                session_id: String::from("session-123"),
+                target: String::from("pi@openclaw:/home/pi/data/cases"),
+            })
+        );
+    }
+
+    #[test]
+    fn run_noninteractive_copy_local_to_local_works() {
+        let dir = std::env::temp_dir().join(format!("cse-cli-copy-{}", Uuid::new_v4()));
+        let sessions_root = dir.join("sessions");
+        let source_path = sessions_root.join("2026/03/15/source.jsonl");
+        write_test_session(&source_path, &sample_chat_jsonl());
+
+        let mut app = empty_test_app();
+        app.sessions_root = sessions_root.clone();
+        let session = sample_session_with_id(
+            &path_to_string(&source_path),
+            "/old",
+            "019aee85-21cf-78a2-9a65-5286d2f341b6",
+        );
+        app.all_projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            cwd: String::from("/old"),
+            sessions: vec![session.clone()],
+        }];
+        app.projects = app.all_projects.clone();
+        app.refresh_browser_short_ids();
+
+        let status = app
+            .run_noninteractive_session_action(Action::Copy, &session.id, "/new")
+            .expect("copy");
+
+        assert!(status.contains("copied 1 session"));
+        let created = fs::read_dir(sessions_root.join("2026/03/15"))
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+            .collect::<Vec<_>>();
+        assert!(created.len() >= 2);
     }
 
     #[test]
