@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.11 - 2026-03-15
+
+### Fixed
+- Fixed search escape behavior so `Esc` now fully clears the active search query, removes the kept filter state, and hides the search bar instead of leaving stale search results applied.
+
+### Changed
+- Expanded the README product manual to market cross-machine browsing, drag/drop session transfer, and SSH plus container-backed remotes as first-class command-center workflows.
+
 ## 1.3.10 - 2026-03-15
 
 ### Added
