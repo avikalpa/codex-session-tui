@@ -6644,7 +6644,10 @@ fn load_app_config(path: &Path) -> Result<AppConfig> {
     }
     let raw =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    toml::from_str(&raw).with_context(|| format!("invalid config {}", path.display()))
+    let mut config: AppConfig =
+        toml::from_str(&raw).with_context(|| format!("invalid config {}", path.display()))?;
+    normalize_config_machine_prefixes(&mut config);
+    Ok(config)
 }
 
 fn save_app_config(path: &Path, config: &AppConfig) -> Result<()> {
@@ -6654,6 +6657,31 @@ fn save_app_config(path: &Path, config: &AppConfig) -> Result<()> {
     }
     let body = toml::to_string_pretty(config).context("failed to serialize config")?;
     atomic_write(path, &body)
+}
+
+fn normalize_exec_prefix(exec_prefix: Option<String>) -> Option<String> {
+    let prefix = exec_prefix?;
+    let trimmed = prefix.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if is_lxc_exec_prefix(trimmed) && !trimmed.ends_with(" --") && trimmed != "--" {
+        return Some(format!("{trimmed} --"));
+    }
+    Some(trimmed.to_string())
+}
+
+fn is_lxc_exec_prefix(prefix: &str) -> bool {
+    prefix.starts_with("lxc-attach ")
+        || prefix == "lxc-attach"
+        || prefix.starts_with("lxc exec ")
+        || prefix == "lxc exec"
+}
+
+fn normalize_config_machine_prefixes(config: &mut AppConfig) {
+    for machine in &mut config.machines {
+        machine.exec_prefix = normalize_exec_prefix(machine.exec_prefix.take());
+    }
 }
 
 fn infer_machine_name_from_ssh_target(target: &str) -> String {
@@ -6720,7 +6748,7 @@ fn parse_config_machine_input(input: &str) -> Result<ConfigMachine> {
         return Ok(ConfigMachine {
             name,
             ssh_target: ssh_target.to_string(),
-            exec_prefix: Some(exec_prefix.to_string()),
+            exec_prefix: normalize_exec_prefix(Some(exec_prefix.to_string())),
             codex_home: codex_home.map(str::to_string),
         });
     }
@@ -6751,6 +6779,8 @@ fn parse_config_machine_input(input: &str) -> Result<ConfigMachine> {
 }
 
 fn upsert_config_machine(config: &mut AppConfig, machine: ConfigMachine) {
+    let mut machine = machine;
+    machine.exec_prefix = normalize_exec_prefix(machine.exec_prefix.take());
     if let Some(existing) = config.machines.iter_mut().find(|m| m.name == machine.name) {
         *existing = machine;
     } else if let Some(existing) = config.machines.iter_mut().find(|m| {
@@ -9839,6 +9869,39 @@ mod tests {
                 .expect("bare");
         assert_eq!(bare.name, "example-host");
         assert_eq!(bare.ssh_target, "root@example-host");
+
+        let normalized =
+            parse_config_machine_input("dev=root@example-host|lxc-attach -n dev|/root/.codex")
+                .expect("normalized");
+        assert_eq!(
+            normalized.exec_prefix.as_deref(),
+            Some("lxc-attach -n dev --")
+        );
+    }
+
+    #[test]
+    fn load_app_config_normalizes_lxc_exec_prefixes() {
+        let base = std::env::temp_dir().join(format!("codex-session-tui-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&base).expect("create temp dir");
+        let path = base.join("codex-session-tui.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[machines]]
+name = "dev"
+ssh_target = "root@example-host"
+exec_prefix = "lxc-attach -n dev"
+codex_home = "/root/.codex"
+"#,
+        )
+        .expect("write config");
+
+        let config = load_app_config(&path).expect("load config");
+        assert_eq!(
+            config.machines[0].exec_prefix.as_deref(),
+            Some("lxc-attach -n dev --")
+        );
+        std::fs::remove_dir_all(&base).expect("cleanup temp dir");
     }
 
     #[test]

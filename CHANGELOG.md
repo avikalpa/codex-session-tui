@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.6 - 2026-03-15
+
+### Fixed
+- Normalized saved and newly entered `exec_prefix` values for known LXC container commands so `lxc-attach -n dev` automatically becomes `lxc-attach -n dev --`.
+- Added startup config repair for older machine entries missing the trailing `--`, which was still causing container-backed remotes to appear offline even after the shell-wrapper fix.
+
 ## 1.3.5 - 2026-03-15
 
 ### Fixed
