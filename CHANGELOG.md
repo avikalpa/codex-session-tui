@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3.14 - 2026-03-15
+
+- Added non-blocking browser transfer progress for paste and drag/drop, with a live status-bar progress indicator showing completed, skipped, and failed session transfers.
+- Added plain browser clipboard keys `c`, `x`, and `v`, while keeping `Ctrl+C`, `Ctrl+X`, and `Ctrl+V` working.
+- Moved typed copy-to-target-path to `C` and updated the status bar onboarding accordingly.
+- Changed browser `Tab` to toggle the selected folder open/closed.
+- Added `Alt+Left` / `Alt+Up` and `Alt+Right` / `Alt+Down` for consistent pane switching.
+- Updated `README.md` to document the new clipboard, transfer progress, and pane navigation UX.
+
 ## 1.3.13 - 2026-03-15
 
 ### Added
