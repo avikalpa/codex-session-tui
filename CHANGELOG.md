@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.21 - 2026-03-15
+
+- Fixed remote Browser tree path compression so absolute remote folders like `/home/pi/data/cases` no longer render under a bogus `//home/pi` node.
+- Fixed non-interactive `ls machine:/path` lookup to resolve those remote absolute paths correctly in the Browser model.
+
 ## 1.3.20 - 2026-03-15
 
 - Fixed non-interactive `copy`, `move`, `fork`, and `export` startup so CLI mode no longer blocks on remote browser scans before running the requested action.

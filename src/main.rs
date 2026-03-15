@@ -5759,13 +5759,7 @@ fn insert_browser_tree_path(node: &mut BrowserTreeNode, segments: &[String], pro
         return;
     }
     let name = &segments[0];
-    let child_path = if node.full_path == "/" {
-        format!("/{name}")
-    } else if name == "/" {
-        format!("{}/", node.full_path)
-    } else {
-        format!("{}/{}", node.full_path, name)
-    };
+    let child_path = browser_tree_child_path(&node.full_path, name);
     let child = node
         .children
         .entry(name.clone())
@@ -5782,13 +5776,7 @@ fn insert_browser_tree_group_path(node: &mut BrowserTreeNode, segments: &[String
         return;
     }
     let name = &segments[0];
-    let child_path = if node.full_path == "/" {
-        format!("/{name}")
-    } else if name == "/" {
-        format!("{}/", node.full_path)
-    } else {
-        format!("{}/{}", node.full_path, name)
-    };
+    let child_path = browser_tree_child_path(&node.full_path, name);
     let child = node
         .children
         .entry(name.clone())
@@ -5821,10 +5809,32 @@ fn compress_browser_tree_node(node: &mut BrowserTreeNode, can_compress_self: boo
     }
     while node.project_idx.is_none() && node.children.len() == 1 {
         let (_, child) = node.children.pop_first().expect("child exists");
-        node.name = format!("{}/{}", node.name, child.name);
+        node.name = browser_tree_join_label(&node.name, &child.name);
         node.full_path = child.full_path;
         node.project_idx = child.project_idx;
         node.children = child.children;
+    }
+}
+
+fn browser_tree_child_path(parent: &str, segment: &str) -> String {
+    if segment == "/" {
+        return format!("{}/", parent.trim_end_matches('/'));
+    }
+    if parent.ends_with('/') {
+        format!("{parent}{segment}")
+    } else {
+        format!("{parent}/{segment}")
+    }
+}
+
+fn browser_tree_join_label(left: &str, right: &str) -> String {
+    if left == "/" {
+        return format!("/{right}");
+    }
+    if left.ends_with('/') {
+        format!("{left}{right}")
+    } else {
+        format!("{left}/{right}")
     }
 }
 
@@ -8415,6 +8425,41 @@ mod tests {
                 .any(|line| line.contains("📁") && line.contains("repo"))
         );
         assert!(tree.iter().any(|line| line.contains("💬")));
+    }
+
+    #[test]
+    fn remote_cli_ls_finds_absolute_folder_without_double_slash_path_bug() {
+        let mut app = empty_test_app();
+        app.config.machines.push(ConfigMachine {
+            name: String::from("pi@openclaw"),
+            ssh_target: String::from("pi@192.168.0.124"),
+            exec_prefix: None,
+            codex_home: Some(String::from("/home/pi/.codex")),
+        });
+        app.projects = vec![ProjectBucket {
+            machine_name: String::from("pi@openclaw"),
+            machine_target: Some(String::from("pi@192.168.0.124")),
+            machine_codex_home: Some(String::from("/home/pi/.codex")),
+            machine_exec_prefix: None,
+            cwd: String::from("/home/pi/data/cases"),
+            sessions: vec![sample_session(
+                "/tmp/remote.jsonl",
+                "/home/pi/data/cases",
+                "sess-remote",
+            )],
+        }];
+        app.all_projects = app.projects.clone();
+        app.refresh_browser_short_ids();
+        app.expand_all_for_cli();
+
+        let tree = app.cli_tree_lines(None).expect("tree");
+        assert!(tree.iter().any(|line| line.contains("🖥 pi@openclaw")));
+        assert!(!tree.iter().any(|line| line.contains("//home/pi")));
+
+        let items = app
+            .cli_ls_lines(Some("pi@openclaw:/home/pi/data/cases"))
+            .expect("ls folder");
+        assert!(items.iter().any(|line| line.contains("💬")));
     }
 
     #[test]
