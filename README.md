@@ -29,6 +29,15 @@ Use a different Codex home:
 CODEX_HOME=/path/to/.codex codex-session-tui
 ```
 
+Non-interactive session operations:
+
+```bash
+codex-session-tui copy <session-id> pi@openclaw:/home/pi/data/cases
+codex-session-tui move <session-id> /home/pi/work/repo
+codex-session-tui fork <session-id> dev:/srv/project
+codex-session-tui export <session-id> user@host:/remote/project/path
+```
+
 ## Demo
 
 [![asciinema major release demo](https://asciinema.org/a/3c0x6ukgrqpRCL4a.svg)](https://asciinema.org/a/3c0x6ukgrqpRCL4a)
@@ -258,6 +267,26 @@ Browser actions work across connected machines as if everything were local:
 - dragging a grouped folder preserves that folder as a subtree instead of flattening all sessions into one cwd
 
 The intent is file-manager style session handling: you should be able to move operational context around your estate the same way you move files in Explorer or VS Code's workspace tree, without stopping to type paths every time.
+
+### Non-Interactive CLI
+
+For reproducible operations, automation, or debugging a suspicious session transfer, use the non-interactive CLI mode.
+
+Supported commands:
+
+- `codex-session-tui copy <session-id> <target>`
+- `codex-session-tui move <session-id> <target>`
+- `codex-session-tui fork <session-id> <target>`
+- `codex-session-tui export <session-id> <target>`
+
+Examples:
+
+```bash
+codex-session-tui copy 019aee85-21cf-78a2-9a65-5286d2f341b6 pi@openclaw:/home/pi/data/cases
+codex-session-tui move 019aee85-21cf-78a2-9a65-5286d2f341b6 /home/pi/data/cases-debug
+```
+
+CLI mode loads the local Codex store directly and does not wait for remote browser scans before running the requested session action. That makes it suitable for recovery work and for isolating transfer bugs without going through the interactive UI.
 
 This works for:
 

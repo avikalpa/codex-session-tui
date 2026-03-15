@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.18 - 2026-03-15
+
+- Fixed non-interactive `copy`, `move`, `fork`, and `export` startup so CLI mode no longer blocks on remote browser scans before running the requested action.
+- Documented the non-interactive CLI session-operation mode in `README.md`, including examples for local and remote targets.
+
 ## 1.3.17 - 2026-03-15
 
 - Added a non-interactive CLI mode for `copy`, `move`, `fork`, and `export` by exact session id so session operations can be reproduced and debugged outside the TUI.

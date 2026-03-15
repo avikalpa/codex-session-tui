@@ -100,7 +100,7 @@ where
 }
 
 fn run_cli_command(cmd: CliCommand) -> Result<()> {
-    let mut app = App::load()?;
+    let mut app = App::load_for_cli()?;
     let status = match cmd {
         CliCommand::Copy { session_id, target } => {
             app.run_noninteractive_session_action(Action::Copy, &session_id, &target)?
@@ -1611,6 +1611,14 @@ impl App {
     }
 
     fn load() -> Result<Self> {
+        Self::load_with_remote_scan(true)
+    }
+
+    fn load_for_cli() -> Result<Self> {
+        Self::load_with_remote_scan(false)
+    }
+
+    fn load_with_remote_scan(include_remote_scan: bool) -> Result<Self> {
         let codex_home = resolve_codex_home()?;
         let config_path = resolve_config_path()?;
         let config = load_app_config(&config_path)?;
@@ -1680,7 +1688,7 @@ impl App {
             progress_op: None,
         };
 
-        app.reload(true)?;
+        app.reload_mode(true, include_remote_scan)?;
         let synced_threads = app.sync_state_index()?;
         if repaired_count > 0 || synced_threads > 0 {
             app.status = format!(
@@ -1694,8 +1702,12 @@ impl App {
     }
 
     fn reload(&mut self, force_remote_scan: bool) -> Result<()> {
+        self.reload_mode(force_remote_scan, true)
+    }
+
+    fn reload_mode(&mut self, force_remote_scan: bool, include_remote_scan: bool) -> Result<()> {
         let had_projects_before = !self.projects.is_empty();
-        self.all_projects = self.scan_all_projects(force_remote_scan)?;
+        self.all_projects = self.scan_all_projects(force_remote_scan, include_remote_scan)?;
         self.prune_selected_sessions();
         if self.search_query.trim().is_empty() {
             self.projects = self.all_projects.clone();
@@ -1740,18 +1752,24 @@ impl App {
         Ok(())
     }
 
-    fn scan_all_projects(&mut self, force_remote_scan: bool) -> Result<Vec<ProjectBucket>> {
+    fn scan_all_projects(
+        &mut self,
+        force_remote_scan: bool,
+        include_remote_scan: bool,
+    ) -> Result<Vec<ProjectBucket>> {
         let mut all_projects = scan_local_sessions(&self.sessions_root)?;
         let mut states = BTreeMap::new();
-        for machine in &self.config.machines {
-            let previous = self
-                .remote_states
-                .get(&machine.name)
-                .cloned()
-                .unwrap_or_default();
-            let next = self.scan_remote_machine(machine, &previous, force_remote_scan);
-            all_projects.extend(next.cached_projects.iter().cloned());
-            states.insert(machine.name.clone(), next);
+        if include_remote_scan {
+            for machine in &self.config.machines {
+                let previous = self
+                    .remote_states
+                    .get(&machine.name)
+                    .cloned()
+                    .unwrap_or_default();
+                let next = self.scan_remote_machine(machine, &previous, force_remote_scan);
+                all_projects.extend(next.cached_projects.iter().cloned());
+                states.insert(machine.name.clone(), next);
+            }
         }
         self.remote_states = states;
         all_projects.sort_by(|a, b| {
@@ -2806,10 +2824,6 @@ impl App {
                 ok = 1;
             }
             _ => return Err(anyhow!("unsupported non-interactive action")),
-        }
-
-        if matches!(action, Action::Copy | Action::Move | Action::Fork) && (ok > 0 || skipped > 0) {
-            self.reload(false)?;
         }
 
         let action_name = match action {
@@ -8125,6 +8139,29 @@ mod tests {
             .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
             .collect::<Vec<_>>();
         assert!(created.len() >= 2);
+    }
+
+    #[test]
+    fn reload_mode_can_skip_remote_scan_for_cli() {
+        let dir = std::env::temp_dir().join(format!("cse-cli-local-only-{}", Uuid::new_v4()));
+        let sessions_root = dir.join("sessions");
+        let source_path = sessions_root.join("2026/03/15/source.jsonl");
+        write_test_session(&source_path, &sample_chat_jsonl());
+
+        let mut app = empty_test_app();
+        app.sessions_root = sessions_root;
+        app.config.machines.push(ConfigMachine {
+            name: String::from("offline"),
+            ssh_target: String::from("offline.example"),
+            exec_prefix: None,
+            codex_home: Some(String::from("/home/pi/.codex")),
+        });
+
+        app.reload_mode(false, false).expect("local-only reload");
+
+        assert_eq!(app.projects.len(), 1);
+        assert_eq!(app.projects[0].machine_name, "local");
+        assert!(app.remote_states.is_empty());
     }
 
     #[test]
