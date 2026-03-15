@@ -60,7 +60,7 @@ On launch:
 
 - the left pane shows a grouped folder tree
 - all folders start collapsed
-- the first machine root and its first folder are expanded so you land in a useful starting view
+- the browser starts on the `local` machine root
 - selecting a session opens the preview at the end of the conversation so you see the latest exchange first
 
 ## Core Navigation
@@ -71,10 +71,12 @@ Browser:
 - top-level rows are machines: `local` plus any configured SSH remotes
 - machine rows show health state: `[ok]`, `[cached]`, or `[offline]`
 - grouped folders compress single-child path chains in a GitHub-style tree
+- `Up` / `Down` does not auto-expand folders; expansion is always explicit
 - `Right`: expand a folder or enter its sessions
 - `Left`: collapse a folder or return from a session to its folder row
 - `Enter`: expand/collapse folder or open the selected session
 - `R`: add or update a remote machine in the config
+- `d`: delete the selected remote machine entry with the same confirmation flow used for session delete
 - `F5` / `Ctrl+R`: refresh the session tree
 - `Ctrl+Up` / `Ctrl+Down`: jump between projects
 - `Ctrl+Left`: collapse all folders except the current one
