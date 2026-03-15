@@ -2363,7 +2363,7 @@ impl App {
             return None;
         }
         let name = self.selected_group_path.as_deref()?;
-        if name == "local" || name.contains('/') {
+        if name == "local" {
             return None;
         }
         self.config
@@ -10199,6 +10199,9 @@ codex_home = "/root/.codex"
     #[test]
     fn submit_input_rename_remote_renames_machine_in_config() {
         let mut app = empty_test_app();
+        let base = std::env::temp_dir().join(format!("codex-session-tui-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&base).expect("create temp dir");
+        app.config_path = base.join("codex-session-tui.toml");
         app.config.machines.push(ConfigMachine {
             name: String::from("dev"),
             ssh_target: String::from("root@example-host"),
@@ -10216,6 +10219,24 @@ codex_home = "/root/.codex"
         assert_eq!(app.config.machines[0].name, "devbox");
         assert_eq!(app.selected_group_path.as_deref(), Some("devbox"));
         assert_eq!(app.mode, Mode::Normal);
+        std::fs::remove_dir_all(&base).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn selected_remote_machine_allows_slash_in_saved_machine_name() {
+        let mut app = empty_test_app();
+        let weird_name = String::from("root@example-host|lxc-attach -n dev --|/root/.codex");
+        app.config.machines.push(ConfigMachine {
+            name: weird_name.clone(),
+            ssh_target: String::from("root@example-host"),
+            exec_prefix: Some(String::from("lxc-attach -n dev --")),
+            codex_home: Some(String::from("/root/.codex")),
+        });
+        app.browser_cursor = BrowserCursor::Group;
+        app.selected_group_path = Some(weird_name.clone());
+
+        let selected = app.selected_remote_machine().expect("machine");
+        assert_eq!(selected.name, weird_name);
     }
 
     #[test]

@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.9 - 2026-03-15
+
+### Fixed
+- Fixed remote-machine selection for older saved entries whose machine name contains `/`, which was preventing rename/delete actions from recognizing some prefixed LXC remote rows as machine roots.
+
 ## 1.3.8 - 2026-03-15
 
 ### Fixed
