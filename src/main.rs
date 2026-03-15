@@ -60,6 +60,13 @@ fn run_app(tui: &mut Tui, app: &mut App) -> Result<()> {
 
         tui.draw(app)?;
 
+        if let Some(op) = app.deferred_op.take() {
+            if let Err(err) = app.run_deferred_op(op) {
+                app.status = format!("{err:#}");
+            }
+            continue;
+        }
+
         if !event::poll(Duration::from_millis(150))? {
             continue;
         }
@@ -260,9 +267,20 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut App) {
                             source_label: drag.source.source_label.clone(),
                             source_group_cwd: drag.source.source_group_cwd.clone(),
                         };
-                        if let Err(err) = app.apply_browser_drop(&source, &target) {
-                            app.status = format!("Drop failed: {err}");
-                        }
+                        let verb = if mode == BrowserClipboardMode::Copy {
+                            "copying"
+                        } else {
+                            "moving"
+                        };
+                        let target_label =
+                            format!("{}:{}", target.name, browser_display_path(&target.cwd));
+                        app.queue_deferred_op(
+                            DeferredOp::BrowserDrop(source.clone(), target),
+                            format!(
+                                "Working... {verb} {} into {target_label}",
+                                source.source_label
+                            ),
+                        );
                     } else {
                         app.status = String::from("Drop on a folder to move/copy");
                     }
@@ -670,7 +688,7 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
                 return Ok(false);
             }
             KeyCode::Char('v') => {
-                app.paste_browser_clipboard()?;
+                app.queue_browser_paste()?;
                 return Ok(false);
             }
             KeyCode::Char('r') => {
@@ -805,6 +823,18 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
             }
         }
         KeyCode::Char('c') => {
+            if app.focus == Focus::Projects {
+                app.copy_browser_selection(BrowserClipboardMode::Copy);
+            } else if app.current_session().is_some() {
+                app.start_action(Action::Copy);
+            }
+        }
+        KeyCode::Char('x') => {
+            if app.focus == Focus::Projects {
+                app.copy_browser_selection(BrowserClipboardMode::Cut);
+            }
+        }
+        KeyCode::Char('C') => {
             if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Project {
                 app.start_action(Action::ProjectCopy);
             } else if app.current_session().is_some() {
@@ -865,7 +895,7 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
                 app.start_action(Action::AddRemote);
             }
         }
-        KeyCode::Char('v') if app.selected_remote_machine().is_some() => {
+        KeyCode::Char('V') if app.selected_remote_machine().is_some() => {
             app.start_action(Action::RenameRemote);
         }
         KeyCode::Char('y') => {
@@ -873,7 +903,13 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
                 app.start_action(Action::ProjectCopy);
             }
         }
-        KeyCode::Char('v') => app.toggle_preview_mode(),
+        KeyCode::Char('v') => {
+            if app.focus == Focus::Projects {
+                app.queue_browser_paste()?;
+            } else {
+                app.toggle_preview_mode();
+            }
+        }
         KeyCode::Char('z') => app.toggle_fold_at_scroll(),
         KeyCode::Char('H') | KeyCode::Char('h') => app.resize_focused_pane(-2),
         KeyCode::Char('L') | KeyCode::Char('l') => app.resize_focused_pane(2),
@@ -892,9 +928,8 @@ fn handle_input_mode(key: KeyEvent, app: &mut App) -> Result<()> {
         }
         KeyCode::Enter => {
             app.clear_input_completion_cycle();
-            if let Err(err) = app.submit_input() {
-                app.status = format!("{err:#}");
-            }
+            let status = app.busy_status_for_submit();
+            app.queue_deferred_op(DeferredOp::SubmitInput, status);
         }
         KeyCode::Tab => {
             if app.input_focused && !key.modifiers.intersects(disallowed_mods) {
@@ -1208,6 +1243,14 @@ struct App {
     last_browser_click: Option<(BrowserRow, Instant)>,
     launch_codex_after_exit: Option<CodexLaunchSpec>,
     remote_states: BTreeMap<String, RemoteMachineState>,
+    deferred_op: Option<DeferredOp>,
+}
+
+#[derive(Clone)]
+enum DeferredOp {
+    SubmitInput,
+    BrowserPaste(BrowserClipboard, MachineTargetSpec),
+    BrowserDrop(BrowserClipboard, MachineTargetSpec),
 }
 
 #[derive(Clone)]
@@ -1268,6 +1311,38 @@ enum RemoteMachineStatus {
 }
 
 impl App {
+    fn queue_deferred_op(&mut self, op: DeferredOp, status: impl Into<String>) {
+        self.deferred_op = Some(op);
+        self.status = status.into();
+    }
+
+    fn run_deferred_op(&mut self, op: DeferredOp) -> Result<()> {
+        match op {
+            DeferredOp::SubmitInput => self.submit_input(),
+            DeferredOp::BrowserPaste(clipboard, target)
+            | DeferredOp::BrowserDrop(clipboard, target) => {
+                self.apply_browser_drop(&clipboard, &target)
+            }
+        }
+    }
+
+    fn busy_status_for_submit(&self) -> String {
+        match self.pending_action {
+            Some(Action::Move) => String::from("Working... moving session(s)"),
+            Some(Action::Copy) => String::from("Working... copying session(s)"),
+            Some(Action::Fork) => String::from("Working... forking session(s)"),
+            Some(Action::Export) => String::from("Working... exporting session(s)"),
+            Some(Action::Delete) => String::from("Working... deleting session(s)"),
+            Some(Action::DeleteRemote) => String::from("Working... deleting remote"),
+            Some(Action::RenameRemote) => String::from("Working... renaming remote"),
+            Some(Action::ProjectRename) => String::from("Working... rewriting folder sessions"),
+            Some(Action::ProjectCopy) => String::from("Working... copying folder sessions"),
+            Some(Action::NewFolder) => String::from("Working... creating virtual folder"),
+            Some(Action::AddRemote) => String::from("Working... connecting remote"),
+            None => String::from("Working..."),
+        }
+    }
+
     fn load() -> Result<Self> {
         let codex_home = resolve_codex_home()?;
         let config_path = resolve_config_path()?;
@@ -1333,6 +1408,7 @@ impl App {
             last_browser_click: None,
             launch_codex_after_exit: None,
             remote_states: BTreeMap::new(),
+            deferred_op: None,
         };
 
         app.reload(true)?;
@@ -2941,7 +3017,7 @@ impl App {
         };
     }
 
-    fn paste_browser_clipboard(&mut self) -> Result<()> {
+    fn queue_browser_paste(&mut self) -> Result<()> {
         let Some(clipboard) = self.browser_clipboard.clone() else {
             self.status = String::from("Clipboard empty");
             return Ok(());
@@ -2950,7 +3026,20 @@ impl App {
             self.status = String::from("No target folder selected");
             return Ok(());
         };
-        self.apply_browser_drop(&clipboard, &target)
+        let verb = if clipboard.mode == BrowserClipboardMode::Copy {
+            "copying"
+        } else {
+            "moving"
+        };
+        let target_label = format!("{}:{}", target.name, browser_display_path(&target.cwd));
+        self.queue_deferred_op(
+            DeferredOp::BrowserPaste(clipboard.clone(), target),
+            format!(
+                "Working... {verb} {} into {target_label}",
+                clipboard.source_label
+            ),
+        );
+        Ok(())
     }
 
     fn register_browser_click(&mut self, row: BrowserRow, now: Instant) -> bool {
@@ -4155,6 +4244,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" cut folder  "),
             Span::styled("ctrl+v", Style::default().fg(Color::Green)),
             Span::raw(" paste into folder  "),
+            Span::styled("c/x/v", Style::default().fg(Color::Green)),
+            Span::raw(" clipboard  "),
             Span::styled("drag", Style::default().fg(Color::Cyan)),
             Span::raw(" move into folder  "),
             Span::styled("ctrl+drag", Style::default().fg(Color::Cyan)),
@@ -4165,8 +4256,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" rename folder/remote  "),
             Span::styled("n", Style::default().fg(Color::Green)),
             Span::raw(" new virtual folder  "),
-            Span::styled("c or y", Style::default().fg(Color::Green)),
-            Span::raw(" copy folder sessions  "),
+            Span::styled("C or y", Style::default().fg(Color::Green)),
+            Span::raw(" typed copy folder  "),
             Span::styled("R", Style::default().fg(Color::Green)),
             Span::raw(" connect remote  "),
             Span::styled("d", Style::default().fg(Color::Red)),
@@ -4201,6 +4292,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" invert  "),
             Span::styled("ctrl+c/x/v", Style::default().fg(Color::Green)),
             Span::raw(" copy/cut/paste  "),
+            Span::styled("c/x/v", Style::default().fg(Color::Green)),
+            Span::raw(" browser clipboard  "),
             Span::styled("drag", Style::default().fg(Color::Cyan)),
             Span::raw(" move  "),
             Span::styled("ctrl+drag", Style::default().fg(Color::Cyan)),
@@ -4209,8 +4302,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" delete  "),
             Span::styled("dblclick", Style::default().fg(Color::Cyan)),
             Span::raw(" open  "),
-            Span::styled("m/c/f/d", Style::default().fg(Color::Green)),
-            Span::raw(" move/copy/fork/delete selection  "),
+            Span::styled("m/C/f/d", Style::default().fg(Color::Green)),
+            Span::raw(" move/typed-copy/fork/delete  "),
             Span::styled("target", Style::default().fg(Color::Cyan)),
             Span::raw(" /path or machine:/path  "),
             Span::styled("e", Style::default().fg(Color::Green)),
@@ -4236,8 +4329,10 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" resize-pane  "),
             Span::styled("drag", Style::default().fg(Color::Cyan)),
             Span::raw(" splitter  preview-select "),
-            Span::styled("m/c/f/d", Style::default().fg(Color::Green)),
-            Span::raw(" move/copy/fork/delete  "),
+            Span::styled("c/x/v", Style::default().fg(Color::Green)),
+            Span::raw(" browser clipboard  "),
+            Span::styled("m/C/f/d", Style::default().fg(Color::Green)),
+            Span::raw(" move/typed-copy/fork/delete  "),
             Span::styled("R", Style::default().fg(Color::Green)),
             Span::raw(" connect remote  "),
             Span::styled("e", Style::default().fg(Color::Green)),
@@ -4340,13 +4435,24 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
         if !app.status.trim().is_empty() {
             let status_style = if app.status.starts_with("Matches:") {
                 tab_match_status_style()
+            } else if app.status.starts_with("Working...") {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
             lines.push(Line::from(Span::styled(app.status.clone(), status_style)));
         }
     } else {
-        lines.push(Line::from(app.status.clone()));
+        let status_style = if app.status.starts_with("Working...") {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(app.status.clone(), status_style)));
     }
 
     let para = Paragraph::new(lines)
@@ -7497,6 +7603,7 @@ mod tests {
             last_browser_click: None,
             launch_codex_after_exit: None,
             remote_states: BTreeMap::new(),
+            deferred_op: None,
         }
     }
 
@@ -7939,7 +8046,7 @@ mod tests {
     fn move_copy_and_fork_keys_start_actions_for_session_row() {
         let actions = [
             (KeyCode::Char('m'), Action::Move),
-            (KeyCode::Char('c'), Action::Copy),
+            (KeyCode::Char('C'), Action::Copy),
             (KeyCode::Char('f'), Action::Fork),
             (KeyCode::Char('e'), Action::Export),
         ];
@@ -8051,6 +8158,55 @@ mod tests {
     }
 
     #[test]
+    fn plain_c_copies_browser_selection_into_clipboard() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            cwd: String::from("/repo"),
+            sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
+        }];
+        app.browser_cursor = BrowserCursor::Session;
+        app.focus = Focus::Projects;
+
+        handle_normal_mode(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+            &mut app,
+        )
+        .expect("handle");
+
+        let clipboard = app.browser_clipboard.expect("clipboard");
+        assert_eq!(clipboard.mode, BrowserClipboardMode::Copy);
+        assert_eq!(clipboard.targets[0].id, "a");
+    }
+
+    #[test]
+    fn plain_x_cuts_browser_selection_into_clipboard() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            cwd: String::from("/repo"),
+            sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
+        }];
+        app.browser_cursor = BrowserCursor::Session;
+        app.focus = Focus::Projects;
+
+        handle_normal_mode(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &mut app,
+        )
+        .expect("handle");
+
+        let clipboard = app.browser_clipboard.expect("clipboard");
+        assert_eq!(clipboard.mode, BrowserClipboardMode::Cut);
+    }
+
+    #[test]
     fn ctrl_v_pastes_copied_session_into_current_folder() {
         let dir = std::env::temp_dir().join(format!("cse-paste-{}", Uuid::new_v4()));
         let sessions_root = dir.join("sessions");
@@ -8103,6 +8259,9 @@ mod tests {
             &mut app,
         )
         .expect("handle");
+        let op = app.deferred_op.take().expect("deferred op");
+        assert!(app.status.starts_with("Working... copying"));
+        app.run_deferred_op(op).expect("run deferred");
 
         let created = fs::read_dir(dated_dir)
             .expect("read dir")
@@ -8352,6 +8511,8 @@ mod tests {
             },
             &mut app,
         );
+        let op = app.deferred_op.take().expect("deferred drop");
+        app.run_deferred_op(op).expect("run deferred");
 
         let moved = fs::read_dir(source_dir)
             .expect("read dir")
@@ -9288,6 +9449,7 @@ mod tests {
             last_browser_click: None,
             launch_codex_after_exit: None,
             remote_states: BTreeMap::new(),
+            deferred_op: None,
         };
         let text = app
             .preview_selected_text((0, 1), (1, 2))
@@ -9925,6 +10087,7 @@ mod tests {
             last_browser_click: None,
             launch_codex_after_exit: None,
             remote_states: BTreeMap::new(),
+            deferred_op: None,
         };
 
         app.apply_search_filter();
@@ -10708,6 +10871,7 @@ mod tests {
             last_browser_click: None,
             launch_codex_after_exit: None,
             remote_states: BTreeMap::new(),
+            deferred_op: None,
         };
 
         app.toggle_fold_all_preview_turns();
@@ -10971,7 +11135,7 @@ codex_home = "/root/.codex"
         app.cancel_input();
 
         let quit = handle_normal_mode(
-            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE),
             &mut app,
         )
         .expect("handle");

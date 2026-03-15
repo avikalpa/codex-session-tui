@@ -162,6 +162,8 @@ On launch:
 - `R`: add or update a remote machine
 - `d`: delete the selected remote machine entry
 - `n`: create a new virtual folder under the selected machine or folder
+- `c` / `x` / `v`: browser copy, cut, paste
+- `C`: typed copy-to-target-path flow
 
 Mouse:
 
@@ -243,9 +245,9 @@ If you do not want to type paths, you do not have to.
 
 Browser actions work across connected machines as if everything were local:
 
-- `Ctrl+C`: copy current session selection, current project, or current grouped folder sessions
-- `Ctrl+X`: cut current selection
-- `Ctrl+V`: paste into the selected folder
+- `c` or `Ctrl+C`: copy current session selection, current project, or current grouped folder sessions
+- `x` or `Ctrl+X`: cut current selection
+- `v` or `Ctrl+V`: paste into the selected folder
 - drag: move into the hovered folder
 - `Ctrl+drag`: copy into the hovered folder
 - dragging a grouped folder preserves that folder as a subtree instead of flattening all sessions into one cwd
@@ -289,6 +291,12 @@ Typical use:
 - create `gh` on a remote machine
 - drag local `git/...` session groups into `gh`
 - keep session organization aligned with the repo layout you intend to create later
+
+## Busy Operations
+
+Move, copy, paste, export, and folder-wide operations can take time, especially across SSH machines.
+
+When that happens, the status bar now shows an explicit `Working...` message before the operation starts so the UI does not appear frozen while filesystem or remote work is in progress.
 
 ## Export Over SSH
 
