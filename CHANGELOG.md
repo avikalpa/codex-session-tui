@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.8 - 2026-03-15
+
+### Fixed
+- Added bracketed paste support to the search box and action prompt so terminal paste works reliably in TUI input areas.
+- Allowed `v` on remote machine rows to follow the same rename-machine prompt flow as `m` and `r`, matching the reported machine-line behavior.
+
 ## 1.3.7 - 2026-03-15
 
 ### Fixed

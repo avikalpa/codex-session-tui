@@ -12,8 +12,8 @@ use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-    MouseEventKind,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -78,9 +78,22 @@ fn run_app(tui: &mut Tui, app: &mut App) -> Result<()> {
                     Mode::Input => handle_input_mode(key, app)?,
                 }
             }
+            Event::Paste(text) => handle_paste_event(text, app),
             Event::Mouse(mouse) => handle_mouse_event(mouse, app),
             _ => {}
         }
+    }
+}
+
+fn handle_paste_event(text: String, app: &mut App) {
+    if app.search_focused {
+        app.search_query.push_str(&text);
+        app.search_dirty = true;
+        return;
+    }
+    if app.mode == Mode::Input && app.input_focused {
+        app.input.push_str(&text);
+        app.clear_input_completion_cycle();
     }
 }
 
@@ -800,6 +813,9 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
                 app.start_action(Action::AddRemote);
             }
         }
+        KeyCode::Char('v') if app.selected_remote_machine().is_some() => {
+            app.start_action(Action::RenameRemote);
+        }
         KeyCode::Char('y') => {
             if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Project {
                 app.start_action(Action::ProjectCopy);
@@ -859,7 +875,8 @@ impl Tui {
     fn new() -> Result<Self> {
         enable_raw_mode().context("failed to enable raw mode")?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
+        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
+            .context("failed to enter alternate screen")?;
         // Match edit's conservative mouse tracking (1002 + SGR 1006) instead of
         // crossterm's default capture set, which also enables 1003.
         write!(stdout, "\x1b[?1002;1006h").context("failed to enable mouse reporting")?;
@@ -917,7 +934,7 @@ impl Tui {
             .backend_mut()
             .flush()
             .context("failed to flush mouse reporting disable")?;
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)
+        execute!(self.terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste)
             .context("failed to leave alternate screen")?;
         Ok(())
     }
@@ -10146,6 +10163,17 @@ codex_home = "/root/.codex"
         assert!(!quit);
         assert_eq!(app.mode, Mode::Input);
         assert_eq!(app.pending_action, Some(Action::RenameRemote));
+
+        app.cancel_input();
+
+        let quit = handle_normal_mode(
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+            &mut app,
+        )
+        .expect("handle");
+        assert!(!quit);
+        assert_eq!(app.mode, Mode::Input);
+        assert_eq!(app.pending_action, Some(Action::RenameRemote));
     }
 
     #[test]
@@ -10188,6 +10216,32 @@ codex_home = "/root/.codex"
         assert_eq!(app.config.machines[0].name, "devbox");
         assert_eq!(app.selected_group_path.as_deref(), Some("devbox"));
         assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn paste_event_appends_to_input_prompt() {
+        let mut app = empty_test_app();
+        app.mode = Mode::Input;
+        app.input_focused = true;
+        app.pending_action = Some(Action::AddRemote);
+        app.input = String::from("pi=");
+
+        handle_paste_event(String::from("pi@192.168.0.124"), &mut app);
+
+        assert_eq!(app.input, "pi=pi@192.168.0.124");
+    }
+
+    #[test]
+    fn paste_event_appends_to_search_box() {
+        let mut app = empty_test_app();
+        app.search_focused = true;
+        app.search_query = String::from("open");
+        app.search_dirty = false;
+
+        handle_paste_event(String::from(" router"), &mut app);
+
+        assert_eq!(app.search_query, "open router");
+        assert!(app.search_dirty);
     }
 
     #[test]
