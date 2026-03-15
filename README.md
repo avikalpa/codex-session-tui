@@ -29,7 +29,7 @@ CODEX_HOME=/path/to/.codex codex-session-tui
 
 ## Demo
 
-[![asciinema major release demo](https://asciinema.org/a/P0QAwEBJlNCqeci5.svg)](https://asciinema.org/a/P0QAwEBJlNCqeci5)
+[![asciinema major release demo](https://asciinema.org/a/3c0x6ukgrqpRCL4a.svg)](https://asciinema.org/a/3c0x6ukgrqpRCL4a)
 
 ## Why This Exists
 
