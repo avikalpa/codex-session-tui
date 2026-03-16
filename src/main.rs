@@ -218,6 +218,14 @@ fn run_app(tui: &mut Tui, app: &mut App) -> Result<()> {
             continue;
         }
 
+        if app.action_progress_op.is_some() {
+            if let Err(err) = app.step_session_action_progress() {
+                app.action_progress_op = None;
+                app.status = format!("{err:#}");
+            }
+            continue;
+        }
+
         if app.progress_op.is_some() {
             if let Err(err) = app.step_browser_transfer_progress() {
                 app.progress_op = None;
@@ -1593,6 +1601,7 @@ struct App {
     launch_codex_after_exit: Option<CodexLaunchSpec>,
     remote_states: BTreeMap<String, RemoteMachineState>,
     deferred_op: Option<DeferredOp>,
+    action_progress_op: Option<SessionActionProgress>,
     progress_op: Option<BrowserTransferProgress>,
     delete_progress_op: Option<DeleteProgress>,
 }
@@ -1606,6 +1615,20 @@ enum DeferredOp {
 struct BrowserTransferProgress {
     source: BrowserClipboard,
     target: MachineTargetSpec,
+    index: usize,
+    ok: usize,
+    skipped: usize,
+    failures: Vec<String>,
+}
+
+#[derive(Clone)]
+struct SessionActionProgress {
+    action: Action,
+    targets: Vec<SessionSummary>,
+    target_machine: Option<MachineTargetSpec>,
+    target_display: String,
+    export_target: Option<String>,
+    source_group_cwd: Option<String>,
     index: usize,
     ok: usize,
     skipped: usize,
@@ -1766,6 +1789,188 @@ impl App {
             failures: Vec::new(),
         });
         self.status = status;
+    }
+
+    fn start_session_action_progress(
+        &mut self,
+        action: Action,
+        targets: Vec<SessionSummary>,
+        target_machine: Option<MachineTargetSpec>,
+        target_display: String,
+        export_target: Option<String>,
+        source_group_cwd: Option<String>,
+    ) {
+        self.deferred_op = None;
+        self.action_progress_op = Some(SessionActionProgress {
+            action,
+            targets,
+            target_machine,
+            target_display,
+            export_target,
+            source_group_cwd,
+            index: 0,
+            ok: 0,
+            skipped: 0,
+            failures: Vec::new(),
+        });
+        if let Some(progress) = &self.action_progress_op {
+            self.status = self.session_action_progress_status(progress);
+        }
+    }
+
+    fn step_session_action_progress(&mut self) -> Result<()> {
+        let Some(mut progress) = self.action_progress_op.take() else {
+            return Ok(());
+        };
+        let total = progress.targets.len();
+        if total == 0 {
+            self.status = String::from("Nothing to process");
+            return Ok(());
+        }
+        if progress.index >= total {
+            self.finish_session_action_progress(progress)?;
+            return Ok(());
+        }
+
+        let session = progress.targets[progress.index].clone();
+        let mut skipped_current = false;
+        let result = match progress.action {
+            Action::Move | Action::ProjectRename | Action::Copy | Action::ProjectCopy | Action::Fork => {
+                let raw_target = progress
+                    .target_machine
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("target path missing"))?;
+                let effective_target =
+                    if let Some(source_group_cwd) = progress.source_group_cwd.as_deref() {
+                        target_for_group_remap(&session, source_group_cwd, raw_target)
+                    } else {
+                        raw_target.clone()
+                    };
+                if matches!(progress.action, Action::Move | Action::ProjectRename)
+                    && session.machine_target == effective_target.ssh_target
+                    && session.cwd == effective_target.cwd
+                {
+                    progress.skipped += 1;
+                    skipped_current = true;
+                    Ok(())
+                } else {
+                    self.apply_session_action_to_target(progress.action, &session, &effective_target)
+                }
+            }
+            Action::Export => export_session_via_ssh(
+                &session,
+                progress
+                    .export_target
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("export target missing"))?,
+            ),
+            Action::Delete
+            | Action::AddRemote
+            | Action::DeleteRemote
+            | Action::RenameRemote
+            | Action::NewFolder => Ok(()),
+        };
+
+        match result {
+            Ok(()) => {
+                if !skipped_current {
+                    progress.ok += 1;
+                }
+            }
+            Err(err) => progress
+                .failures
+                .push(format!("{}: {}", session.file_name, err)),
+        }
+
+        progress.index += 1;
+        if progress.index >= total {
+            self.finish_session_action_progress(progress)?;
+        } else {
+            self.status = self.session_action_progress_status(&progress);
+            self.action_progress_op = Some(progress);
+        }
+        Ok(())
+    }
+
+    fn session_action_progress_status(&self, progress: &SessionActionProgress) -> String {
+        let verb = match progress.action {
+            Action::Move | Action::ProjectRename => "moving",
+            Action::Copy | Action::ProjectCopy => "copying",
+            Action::Fork => "forking",
+            Action::Export => "exporting",
+            Action::Delete
+            | Action::AddRemote
+            | Action::DeleteRemote
+            | Action::RenameRemote
+            | Action::NewFolder => "working",
+        };
+        let total = progress.targets.len().max(1);
+        let done = progress.index.min(total);
+        format!(
+            "Working... {verb} {} {} {done}/{total} ok:{} skip:{} fail:{}",
+            progress.target_display,
+            progress_bar(done, total, 14),
+            progress.ok,
+            progress.skipped,
+            progress.failures.len()
+        )
+    }
+
+    fn finish_session_action_progress(&mut self, progress: SessionActionProgress) -> Result<()> {
+        if progress.ok > 0
+            && !matches!(
+                progress.action,
+                Action::Export
+                    | Action::AddRemote
+                    | Action::DeleteRemote
+                    | Action::RenameRemote
+                    | Action::NewFolder
+            )
+        {
+            self.reload(false)?;
+        }
+        self.selected_sessions.clear();
+        self.session_select_anchor = None;
+
+        let action_name = match progress.action {
+            Action::Move => "moved",
+            Action::Copy => "copied",
+            Action::Fork => "forked",
+            Action::Export => "exported",
+            Action::Delete => "deleted",
+            Action::DeleteRemote => "deleted remote",
+            Action::RenameRemote => "renamed remote",
+            Action::ProjectRename => "renamed",
+            Action::ProjectCopy => "copied",
+            Action::AddRemote => "connected",
+            Action::NewFolder => "created",
+        };
+        self.status = if progress.failures.is_empty() {
+            if progress.skipped > 0 {
+                format!(
+                    "{action_name} {} session(s), skipped {} -> {}",
+                    progress.ok, progress.skipped, progress.target_display
+                )
+            } else {
+                format!(
+                    "{action_name} {} session(s) -> {}",
+                    progress.ok, progress.target_display
+                )
+            }
+        } else {
+            let first = progress
+                .failures
+                .first()
+                .cloned()
+                .unwrap_or_else(|| String::from("unknown error"));
+            format!(
+                "{action_name} {} session(s), {} failed, skipped {}. First error: {first}",
+                progress.ok,
+                progress.failures.len(),
+                progress.skipped
+            )
+        };
+        Ok(())
     }
 
     fn step_browser_transfer_progress(&mut self) -> Result<()> {
@@ -2077,6 +2282,7 @@ impl App {
             launch_codex_after_exit: None,
             remote_states: BTreeMap::new(),
             deferred_op: None,
+            action_progress_op: None,
             progress_op: None,
             delete_progress_op: None,
         };
@@ -4076,31 +4282,68 @@ impl App {
             return Ok(());
         }
         let target_display = self.input.trim().to_string();
-        let target_str = match action {
-            Action::Delete | Action::DeleteRemote => {
-                if !delete_confirmation_valid(&self.input) {
-                    self.status = String::from("Delete cancelled: type DELETE to confirm");
-                    return Ok(());
-                }
-                String::new()
-            }
-            Action::Export => self.input.trim().to_string(),
-            Action::AddRemote => self.input.trim().to_string(),
-            Action::RenameRemote => self.input.trim().to_string(),
-            Action::NewFolder => self.input.trim().to_string(),
-            _ => self.resolve_machine_target(&self.input)?.cwd,
-        };
+        if matches!(action, Action::Delete | Action::DeleteRemote)
+            && !delete_confirmation_valid(&self.input)
+        {
+            self.status = String::from("Delete cancelled: type DELETE to confirm");
+            return Ok(());
+        }
         let mut ok = 0usize;
-        let mut skipped = 0usize;
-        let mut failures = Vec::new();
 
         if action == Action::Delete {
             self.mode = Mode::Normal;
             self.pending_action = None;
             self.input.clear();
             self.input_focused = false;
+            self.input_cursor = 0;
             self.clear_input_completion_cycle();
             self.start_delete_progress(targets);
+            return Ok(());
+        }
+
+        if matches!(
+            action,
+            Action::Move
+                | Action::Copy
+                | Action::Fork
+                | Action::Export
+                | Action::ProjectRename
+                | Action::ProjectCopy
+        ) {
+            let target_machine = if matches!(
+                action,
+                Action::Move | Action::Copy | Action::Fork | Action::ProjectRename | Action::ProjectCopy
+            ) {
+                Some(self.resolve_machine_target(&self.input)?)
+            } else {
+                None
+            };
+            let export_target = if action == Action::Export {
+                Some(self.input.trim().to_string())
+            } else {
+                None
+            };
+            let source_group_cwd = if matches!(action, Action::ProjectRename | Action::ProjectCopy)
+            {
+                self.current_group_source_cwd()
+            } else {
+                None
+            };
+
+            self.mode = Mode::Normal;
+            self.pending_action = None;
+            self.input.clear();
+            self.input_focused = false;
+            self.input_cursor = 0;
+            self.clear_input_completion_cycle();
+            self.start_session_action_progress(
+                action,
+                targets,
+                target_machine,
+                target_display,
+                export_target,
+                source_group_cwd,
+            );
             return Ok(());
         }
 
@@ -4176,84 +4419,15 @@ impl App {
                     Some(group_path_for_machine_cwd(&target.name, &target.cwd));
                 self.ensure_selection_visible();
             }
-            _ => {
-                let target_machine = if matches!(
-                    action,
-                    Action::Move
-                        | Action::Copy
-                        | Action::Fork
-                        | Action::ProjectRename
-                        | Action::ProjectCopy
-                ) {
-                    Some(self.resolve_machine_target(&self.input)?)
-                } else {
-                    None
-                };
-                let source_group_cwd = if matches!(action, Action::ProjectRename | Action::ProjectCopy)
-                {
-                    self.current_group_source_cwd()
-                } else {
-                    None
-                };
-                for session in &targets {
-                    let result = match action {
-                        Action::Move
-                        | Action::ProjectRename
-                        | Action::Copy
-                        | Action::ProjectCopy
-                        | Action::Fork => {
-                            let raw_target = target_machine.as_ref().expect("target machine");
-                            let effective_target =
-                                if let Some(source_group_cwd) = source_group_cwd.as_deref() {
-                                    target_for_group_remap(session, source_group_cwd, raw_target)
-                                } else {
-                                    raw_target.clone()
-                                };
-                            if session.machine_target == effective_target.ssh_target
-                                && session.cwd == effective_target.cwd
-                            {
-                                skipped += 1;
-                                Ok(())
-                            } else {
-                                self.apply_session_action_to_target(
-                                    action,
-                                    session,
-                                    &effective_target,
-                                )
-                            }
-                        }
-                        Action::Export => export_session_via_ssh(session, &target_str),
-                        Action::Delete => self.apply_delete_action(session),
-                        Action::AddRemote
-                        | Action::DeleteRemote
-                        | Action::RenameRemote
-                        | Action::NewFolder => Ok(()),
-                    };
-                    match result {
-                        Ok(()) => ok += 1,
-                        Err(err) => failures.push(format!("{}: {}", session.file_name, err)),
-                    }
-                }
-            }
+            _ => {}
         }
 
         self.mode = Mode::Normal;
         self.pending_action = None;
         self.input.clear();
         self.input_focused = false;
+        self.input_cursor = 0;
         self.clear_input_completion_cycle();
-
-        if !matches!(
-            action,
-            Action::Export
-                | Action::AddRemote
-                | Action::DeleteRemote
-                | Action::RenameRemote
-                | Action::NewFolder
-        ) && (ok > 0 || skipped > 0)
-        {
-            self.reload(false)?;
-        }
         self.selected_sessions.clear();
         self.session_select_anchor = None;
 
@@ -4270,31 +4444,14 @@ impl App {
             Action::AddRemote => "connected",
             Action::NewFolder => "created",
         };
-        self.status = if failures.is_empty() {
-            if action == Action::Delete {
-                format!("{action_name} {ok} session(s)")
-            } else if action == Action::DeleteRemote {
-                format!("{action_name} {ok} machine(s)")
-            } else if action == Action::RenameRemote {
-                format!("{action_name} {ok} machine(s) -> {target_display}")
-            } else if action == Action::NewFolder {
-                format!("{action_name} virtual folder {target_display}")
-            } else if skipped > 0 {
-                format!(
-                    "{action_name} {ok} session(s), skipped {skipped} unchanged -> {target_display}"
-                )
-            } else {
-                format!("{action_name} {ok} session(s) -> {target_display}")
-            }
+        self.status = if action == Action::DeleteRemote {
+            format!("{action_name} {ok} machine(s)")
+        } else if action == Action::RenameRemote {
+            format!("{action_name} {ok} machine(s) -> {target_display}")
+        } else if action == Action::NewFolder {
+            format!("{action_name} virtual folder {target_display}")
         } else {
-            let first = failures
-                .first()
-                .cloned()
-                .unwrap_or_else(|| String::from("unknown error"));
-            format!(
-                "{action_name} {ok} session(s), {} failed, skipped {skipped}. First error: {first}",
-                failures.len()
-            )
+            format!("{action_name} {ok} session(s) -> {target_display}")
         };
         Ok(())
     }
@@ -5360,10 +5517,10 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" resize-pane  "),
             Span::styled("drag", Style::default().fg(Color::Cyan)),
             Span::raw(" splitter  preview-select "),
-            Span::styled("c/x/v", Style::default().fg(Color::Green)),
-            Span::raw(" browser clipboard  "),
-            Span::styled("m/C/f/d", Style::default().fg(Color::Green)),
-            Span::raw(" move/typed-copy/fork/delete  "),
+            Span::styled("m/c/f/v", Style::default().fg(Color::Green)),
+            Span::raw(" browser ops  "),
+            Span::styled("M/C/F", Style::default().fg(Color::Green)),
+            Span::raw(" typed target  "),
             Span::styled("R", Style::default().fg(Color::Green)),
             Span::raw(" connect remote  "),
             Span::styled("e", Style::default().fg(Color::Green)),
@@ -5473,7 +5630,10 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            lines.push(Line::from(Span::styled(app.status.clone(), status_style)));
+            lines.push(Line::from(Span::styled(
+                render_working_status_text(&app.status),
+                status_style,
+            )));
         }
     } else {
         let status_style = if app.status.starts_with("Working...") {
@@ -5483,18 +5643,27 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
         } else {
             Style::default()
         };
-        lines.push(Line::from(Span::styled(app.status.clone(), status_style)));
+        lines.push(Line::from(Span::styled(
+            render_working_status_text(&app.status),
+            status_style,
+        )));
     }
 
+    if let Some(progress) = &app.action_progress_op {
+        lines.push(Line::from(Span::styled(
+            render_working_status_text(&app.session_action_progress_status(progress)),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
     if let Some(progress) = &app.progress_op {
         lines.push(Line::from(Span::styled(
-            app.browser_transfer_progress_status(progress),
+            render_working_status_text(&app.browser_transfer_progress_status(progress)),
             Style::default().fg(Color::Yellow),
         )));
     }
     if let Some(progress) = &app.delete_progress_op {
         lines.push(Line::from(Span::styled(
-            app.delete_progress_status(progress),
+            render_working_status_text(&app.delete_progress_status(progress)),
             Style::default().fg(Color::Yellow),
         )));
     }
@@ -5514,6 +5683,24 @@ fn progress_bar(done: usize, total: usize, width: usize) -> String {
         "#".repeat(filled.min(width)),
         ".".repeat(width.saturating_sub(filled.min(width)))
     )
+}
+
+fn working_blink_on() -> bool {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| (d.as_millis() / 450) % 2 == 0)
+        .unwrap_or(true)
+}
+
+fn render_working_status_text(status: &str) -> String {
+    if !status.starts_with("Working...") {
+        return status.to_string();
+    }
+    if working_blink_on() {
+        status.to_string()
+    } else {
+        status.replacen("Working...", "          ", 1)
+    }
 }
 
 #[cfg(test)]
@@ -8979,6 +9166,7 @@ mod tests {
             launch_codex_after_exit: None,
             remote_states: BTreeMap::new(),
             deferred_op: None,
+            action_progress_op: None,
             progress_op: None,
             delete_progress_op: None,
         }
@@ -11522,6 +11710,7 @@ mod tests {
             launch_codex_after_exit: None,
             remote_states: BTreeMap::new(),
             deferred_op: None,
+            action_progress_op: None,
             progress_op: None,
             delete_progress_op: None,
         };
@@ -12232,6 +12421,7 @@ mod tests {
             launch_codex_after_exit: None,
             remote_states: BTreeMap::new(),
             deferred_op: None,
+            action_progress_op: None,
             progress_op: None,
             delete_progress_op: None,
         };
@@ -13047,6 +13237,7 @@ mod tests {
             launch_codex_after_exit: None,
             remote_states: BTreeMap::new(),
             deferred_op: None,
+            action_progress_op: None,
             progress_op: None,
             delete_progress_op: None,
         };
@@ -13174,6 +13365,30 @@ codex_home = "/root/.codex"
 
         assert_eq!(app.mode, Mode::Input);
         assert!(app.status.contains("remote"));
+    }
+
+    #[test]
+    fn submit_input_starts_progress_for_move() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            cwd: String::from("/repo"),
+            sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
+        }];
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Session;
+        app.start_action(Action::Move);
+        app.input = String::from("/repo-next");
+        app.input_cursor = char_count(&app.input);
+
+        app.submit_input().expect("submit");
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.action_progress_op.is_some());
+        assert_eq!(app.input, "");
     }
 
     #[test]
