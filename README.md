@@ -179,8 +179,12 @@ On launch:
 - `R`: add or update a remote machine
 - `d`: delete the selected remote machine entry
 - `n`: create a new virtual folder under the selected machine or folder
-- `c` / `x` / `v`: browser copy, cut, paste
-- `C`: typed copy-to-target-path flow
+- `m` / `x`: cut into the browser clipboard
+- `c`: copy into the browser clipboard
+- `f`: fork into the browser clipboard
+- `v`: paste into the selected folder
+- `M` / `C`: typed move/copy-to-target-path flow for the selected folder or subtree
+- `r`: typed rename of the selected folder or subtree
 
 Mouse:
 
@@ -233,6 +237,8 @@ Search navigation:
 
 - `Enter`: keep the current result
 - `Esc`: close search
+- `Left` / `Right`: move inside the search text
+- `Ctrl+A` / `Ctrl+E`: jump to start/end of the search text
 - `Tab` / `Shift+Tab`: move focus out of the search box
 - `n` / `N` in Preview: next/previous occurrence in the current chat
 
@@ -242,9 +248,13 @@ Search navigation:
 
 On a session:
 
-- `m`: move into another project context
-- `c`: copy into another project context
-- `f`: fork into another project context
+- `m` or `x`: cut into the browser clipboard
+- `c`: copy into the browser clipboard
+- `f`: fork into the browser clipboard
+- `v`: paste into the selected folder or grouped subtree
+- `M`: typed move to `/path` or `machine:/path`
+- `C`: typed copy to `/path` or `machine:/path`
+- `F`: typed fork to `/path` or `machine:/path`
 - `d`: delete
 - delete now runs with live status/progress feedback instead of freezing the UI during long removals
 - `e`: export over SSH
@@ -268,7 +278,8 @@ If you do not want to type paths, you do not have to.
 Browser actions work across connected machines as if everything were local:
 
 - `c` or `Ctrl+C`: copy current session selection, current project, or current grouped folder sessions
-- `x` or `Ctrl+X`: cut current selection
+- `m`, `x`, or `Ctrl+X`: cut current selection
+- `f`: prepare a fork of the current selection
 - `v` or `Ctrl+V`: paste into the selected folder
 - drag: move into the hovered folder
 - `Ctrl+drag`: copy into the hovered folder
@@ -323,6 +334,16 @@ Folder and grouped-tree targets resolve automatically, so the Browser can be use
 
 Project and grouped-folder rows also support folder-wide copy/rename style workflows, so you can remap entire project histories instead of one session at a time.
 
+Important distinction:
+
+- drag/drop on a grouped folder preserves that folder name as part of the destination subtree
+- typed `r`, `M`, or `C` on a grouped folder performs a prefix remap
+
+Example:
+
+- drag `git` onto `pi:/home/pi/work` -> sessions land under `pi:/home/pi/work/git/...`
+- rename grouped `/root` to `/home/pi` -> sessions land under `/home/pi/...` rather than `/home/pi/root/...`
+
 ### Virtual Folders
 
 Sometimes you want a destination cwd before the actual repository exists on that machine.
@@ -349,6 +370,7 @@ Move, copy, paste, export, and folder-wide operations can take time, especially 
 When that happens, the status bar shows:
 
 - an explicit `Working...` state immediately
+- a blinking `Working...` indicator while the operation is active
 - a live progress bar
 - counts for completed, skipped, and failed session transfers
 
@@ -482,6 +504,7 @@ It also repairs common Codex session breakage:
 - relative paths become absolute
 - trailing slashes and `.` / `..` segments are cleaned
 - previously broken local `cwd` rewrites are repaired on startup
+- session files whose internal `session_meta.id` drifted away from the rollout filename are repaired on startup
 - Codex's local `threads` SQLite index is reconciled so repaired sessions reappear in `codex resume`
 
 User-only sessions are also marked clearly:
@@ -495,7 +518,8 @@ User-only sessions are also marked clearly:
 2. Press `/` and search by old path, session hash, or conversation text.
 3. Inspect the conversation in Preview.
 4. Move it with `m`, paste it with `Ctrl+V`, or drag it into the correct project.
-5. Return to Codex and resume from the corrected working directory.
+5. For large tree-level rewrites, select the grouped parent folder and use `r` or `M`.
+6. Return to Codex and resume from the corrected working directory.
 
 ## Safety
 

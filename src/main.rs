@@ -1137,7 +1137,10 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
         }
         KeyCode::Char('M') => {
             if app.focus == Focus::Projects
-                && matches!(app.browser_cursor, BrowserCursor::Project | BrowserCursor::Group)
+                && matches!(
+                    app.browser_cursor,
+                    BrowserCursor::Project | BrowserCursor::Group
+                )
             {
                 app.start_action(Action::ProjectRename);
             } else if app.current_session().is_some() {
@@ -1146,7 +1149,10 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
         }
         KeyCode::Char('C') => {
             if app.focus == Focus::Projects
-                && matches!(app.browser_cursor, BrowserCursor::Project | BrowserCursor::Group)
+                && matches!(
+                    app.browser_cursor,
+                    BrowserCursor::Project | BrowserCursor::Group
+                )
             {
                 app.start_action(Action::ProjectCopy);
             } else if app.current_session().is_some() {
@@ -1202,7 +1208,10 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
             if app.selected_remote_machine().is_some() {
                 app.start_action(Action::RenameRemote);
             } else if app.focus == Focus::Projects
-                && matches!(app.browser_cursor, BrowserCursor::Project | BrowserCursor::Group)
+                && matches!(
+                    app.browser_cursor,
+                    BrowserCursor::Project | BrowserCursor::Group
+                )
             {
                 app.start_action(Action::ProjectRename);
             }
@@ -1217,7 +1226,10 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
         }
         KeyCode::Char('y') => {
             if app.focus == Focus::Projects
-                && matches!(app.browser_cursor, BrowserCursor::Project | BrowserCursor::Group)
+                && matches!(
+                    app.browser_cursor,
+                    BrowserCursor::Project | BrowserCursor::Group
+                )
             {
                 app.start_action(Action::ProjectCopy);
             }
@@ -1835,7 +1847,11 @@ impl App {
         let session = progress.targets[progress.index].clone();
         let mut skipped_current = false;
         let result = match progress.action {
-            Action::Move | Action::ProjectRename | Action::Copy | Action::ProjectCopy | Action::Fork => {
+            Action::Move
+            | Action::ProjectRename
+            | Action::Copy
+            | Action::ProjectCopy
+            | Action::Fork => {
                 let raw_target = progress
                     .target_machine
                     .as_ref()
@@ -1854,7 +1870,11 @@ impl App {
                     skipped_current = true;
                     Ok(())
                 } else {
-                    self.apply_session_action_to_target(progress.action, &session, &effective_target)
+                    self.apply_session_action_to_target(
+                        progress.action,
+                        &session,
+                        &effective_target,
+                    )
                 }
             }
             Action::Export => export_session_via_ssh(
@@ -4312,7 +4332,11 @@ impl App {
         ) {
             let target_machine = if matches!(
                 action,
-                Action::Move | Action::Copy | Action::Fork | Action::ProjectRename | Action::ProjectCopy
+                Action::Move
+                    | Action::Copy
+                    | Action::Fork
+                    | Action::ProjectRename
+                    | Action::ProjectCopy
             ) {
                 Some(self.resolve_machine_target(&self.input)?)
             } else {
@@ -9896,11 +9920,10 @@ mod tests {
     }
 
     #[test]
-    fn move_copy_and_fork_keys_start_actions_for_session_row() {
+    fn typed_copy_fork_and_export_keys_start_actions_for_session_row() {
         let actions = [
-            (KeyCode::Char('m'), Action::Move),
             (KeyCode::Char('C'), Action::Copy),
-            (KeyCode::Char('f'), Action::Fork),
+            (KeyCode::Char('F'), Action::Fork),
             (KeyCode::Char('e'), Action::Export),
         ];
 
@@ -10961,6 +10984,9 @@ mod tests {
         app.input = String::from("/new/path/");
 
         app.submit_input().expect("submit");
+        while app.action_progress_op.is_some() {
+            app.step_session_action_progress().expect("step");
+        }
 
         let conn = Connection::open(&db).expect("open");
         let cwd = conn
@@ -13398,19 +13424,28 @@ codex_home = "/root/.codex"
         app.search_query = String::from("helo");
         app.search_cursor = 3;
 
-        handle_normal_mode(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE), &mut app)
-            .expect("insert");
+        handle_normal_mode(
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            &mut app,
+        )
+        .expect("insert");
         assert_eq!(app.search_query, "hello");
         assert_eq!(app.search_cursor, 4);
 
         handle_normal_mode(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &mut app)
             .expect("left");
-        handle_normal_mode(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL), &mut app)
-            .expect("ctrl+a");
+        handle_normal_mode(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .expect("ctrl+a");
         assert_eq!(app.search_cursor, 0);
 
-        handle_normal_mode(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL), &mut app)
-            .expect("ctrl+e");
+        handle_normal_mode(
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .expect("ctrl+e");
         assert_eq!(app.search_cursor, 5);
     }
 
@@ -13421,17 +13456,26 @@ codex_home = "/root/.codex"
         app.input = String::from("/tmp/helo");
         app.input_cursor = 8;
 
-        handle_input_mode(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE), &mut app)
-            .expect("insert");
+        handle_input_mode(
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            &mut app,
+        )
+        .expect("insert");
         assert_eq!(app.input, "/tmp/hello");
         assert_eq!(app.input_cursor, 9);
 
-        handle_input_mode(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL), &mut app)
-            .expect("ctrl+a");
+        handle_input_mode(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .expect("ctrl+a");
         assert_eq!(app.input_cursor, 0);
 
-        handle_input_mode(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL), &mut app)
-            .expect("ctrl+e");
+        handle_input_mode(
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .expect("ctrl+e");
         assert_eq!(app.input_cursor, char_count("/tmp/hello"));
     }
 
@@ -13549,17 +13593,6 @@ codex_home = "/root/.codex"
         app.focus = Focus::Projects;
 
         let quit = handle_normal_mode(
-            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
-            &mut app,
-        )
-        .expect("handle");
-        assert!(!quit);
-        assert_eq!(app.mode, Mode::Input);
-        assert_eq!(app.pending_action, Some(Action::RenameRemote));
-
-        app.cancel_input();
-
-        let quit = handle_normal_mode(
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
             &mut app,
         )
@@ -13650,6 +13683,7 @@ codex_home = "/root/.codex"
         app.input_focused = true;
         app.pending_action = Some(Action::AddRemote);
         app.input = String::from("pi=");
+        app.input_cursor = char_count(&app.input);
 
         handle_paste_event(String::from("pi@192.168.0.124"), &mut app);
 
@@ -13661,6 +13695,7 @@ codex_home = "/root/.codex"
         let mut app = empty_test_app();
         app.search_focused = true;
         app.search_query = String::from("open");
+        app.search_cursor = char_count(&app.search_query);
         app.search_dirty = false;
 
         handle_paste_event(String::from(" router"), &mut app);
