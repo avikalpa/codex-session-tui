@@ -6575,7 +6575,9 @@ fn coalesce_chat_turns(turns: &[ChatTurn]) -> Vec<ChatTurn> {
 fn default_folded_turns(turns: &[ChatTurn]) -> HashSet<usize> {
     let mut folded = HashSet::new();
     for (idx, turn) in turns.iter().enumerate() {
-        let should_fold = turn.role == "assistant" || (turn.role == "user" && idx == 0);
+        let is_last = idx + 1 == turns.len();
+        let should_fold =
+            !is_last && (turn.role == "assistant" || (turn.role == "user" && idx == 0));
         if should_fold {
             folded.insert(idx);
         }
@@ -11611,7 +11613,7 @@ mod tests {
     }
 
     #[test]
-    fn default_folded_turns_collapses_assistant_and_first_user() {
+    fn default_folded_turns_keeps_last_turn_open() {
         let turns = vec![
             ChatTurn {
                 role: String::from("user"),
@@ -11628,11 +11630,17 @@ mod tests {
                 timestamp: String::from("2026-01-01T00:02:00Z"),
                 text: String::from("real user"),
             },
+            ChatTurn {
+                role: String::from("assistant"),
+                timestamp: String::from("2026-01-01T00:03:00Z"),
+                text: String::from("tail reply"),
+            },
         ];
         let folded = default_folded_turns(&turns);
         assert!(folded.contains(&0));
         assert!(folded.contains(&1));
         assert!(!folded.contains(&2));
+        assert!(!folded.contains(&3));
     }
 
     #[test]
