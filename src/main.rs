@@ -261,12 +261,12 @@ fn run_app(tui: &mut Tui, app: &mut App) -> Result<()> {
 
 fn handle_paste_event(text: String, app: &mut App) {
     if app.search_focused {
-        app.search_query.push_str(&text);
+        insert_text_at_cursor(&mut app.search_query, &mut app.search_cursor, &text);
         app.search_dirty = true;
         return;
     }
     if app.mode == Mode::Input && app.input_focused {
-        app.input.push_str(&text);
+        insert_text_at_cursor(&mut app.input, &mut app.input_cursor, &text);
         app.clear_input_completion_cycle();
     }
 }
@@ -757,6 +757,52 @@ fn copy_to_clipboard_osc52(text: &str) -> Result<()> {
     Ok(())
 }
 
+fn char_count(s: &str) -> usize {
+    s.chars().count()
+}
+
+fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
+    if char_idx == 0 {
+        return 0;
+    }
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(idx, _)| idx)
+        .unwrap_or_else(|| s.len())
+}
+
+fn insert_text_at_cursor(buf: &mut String, cursor: &mut usize, text: &str) {
+    let byte_idx = char_to_byte_idx(buf, *cursor);
+    buf.insert_str(byte_idx, text);
+    *cursor += char_count(text);
+}
+
+fn delete_char_before_cursor(buf: &mut String, cursor: &mut usize) -> bool {
+    if *cursor == 0 {
+        return false;
+    }
+    let end = char_to_byte_idx(buf, *cursor);
+    let start = char_to_byte_idx(buf, cursor.saturating_sub(1));
+    buf.replace_range(start..end, "");
+    *cursor = cursor.saturating_sub(1);
+    true
+}
+
+fn delete_char_at_cursor(buf: &mut String, cursor: usize) -> bool {
+    if cursor >= char_count(buf) {
+        return false;
+    }
+    let start = char_to_byte_idx(buf, cursor);
+    let end = char_to_byte_idx(buf, cursor + 1);
+    buf.replace_range(start..end, "");
+    true
+}
+
+fn split_at_char(s: &str, cursor: usize) -> (String, String) {
+    let byte_idx = char_to_byte_idx(s, cursor);
+    (s[..byte_idx].to_string(), s[byte_idx..].to_string())
+}
+
 fn launch_codex_resume(spec: &CodexLaunchSpec) -> Result<()> {
     let status = if let Some(ssh_target) = &spec.ssh_target {
         let inner = format!(
@@ -800,6 +846,7 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
             KeyCode::Esc => {
                 app.search_focused = false;
                 app.search_query.clear();
+                app.search_cursor = 0;
                 app.search_dirty = true;
                 app.status = String::from("Search cleared");
             }
@@ -815,12 +862,40 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
                 app.prev_focus();
             }
             KeyCode::Backspace => {
-                app.search_query.pop();
-                app.search_dirty = true;
+                if delete_char_before_cursor(&mut app.search_query, &mut app.search_cursor) {
+                    app.search_dirty = true;
+                }
+            }
+            KeyCode::Delete => {
+                if delete_char_at_cursor(&mut app.search_query, app.search_cursor) {
+                    app.search_dirty = true;
+                }
+            }
+            KeyCode::Left => {
+                app.search_cursor = app.search_cursor.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                app.search_cursor = (app.search_cursor + 1).min(char_count(&app.search_query));
+            }
+            KeyCode::Home => {
+                app.search_cursor = 0;
+            }
+            KeyCode::End => {
+                app.search_cursor = char_count(&app.search_query);
             }
             KeyCode::Char(ch) => {
-                if !key.modifiers.intersects(disallowed_mods) {
-                    app.search_query.push(ch);
+                if key.modifiers == KeyModifiers::CONTROL {
+                    match ch {
+                        'a' | 'A' => app.search_cursor = 0,
+                        'e' | 'E' => app.search_cursor = char_count(&app.search_query),
+                        _ => {}
+                    }
+                } else if !key.modifiers.intersects(disallowed_mods) {
+                    insert_text_at_cursor(
+                        &mut app.search_query,
+                        &mut app.search_cursor,
+                        &ch.to_string(),
+                    );
                     app.search_dirty = true;
                 }
             }
@@ -913,6 +988,7 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
         KeyCode::Char('q') => return Ok(true),
         KeyCode::Char('/') => {
             app.search_focused = true;
+            app.search_cursor = char_count(&app.search_query);
         }
         KeyCode::Char(' ') => {
             if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Session {
@@ -1161,14 +1237,48 @@ fn handle_input_mode(key: KeyEvent, app: &mut App) -> Result<()> {
         }
         KeyCode::Backspace => {
             if app.input_focused {
-                app.input.pop();
+                if delete_char_before_cursor(&mut app.input, &mut app.input_cursor) {
+                    app.clear_input_completion_cycle();
+                }
+            }
+        }
+        KeyCode::Delete => {
+            if app.input_focused && delete_char_at_cursor(&mut app.input, app.input_cursor) {
                 app.clear_input_completion_cycle();
             }
         }
+        KeyCode::Left => {
+            if app.input_focused {
+                app.input_cursor = app.input_cursor.saturating_sub(1);
+            }
+        }
+        KeyCode::Right => {
+            if app.input_focused {
+                app.input_cursor = (app.input_cursor + 1).min(char_count(&app.input));
+            }
+        }
+        KeyCode::Home => {
+            if app.input_focused {
+                app.input_cursor = 0;
+            }
+        }
+        KeyCode::End => {
+            if app.input_focused {
+                app.input_cursor = char_count(&app.input);
+            }
+        }
         KeyCode::Char(ch) => {
-            if app.input_focused && !key.modifiers.intersects(disallowed_mods) {
-                app.input.push(ch);
-                app.clear_input_completion_cycle();
+            if app.input_focused {
+                if key.modifiers == KeyModifiers::CONTROL {
+                    match ch {
+                        'a' | 'A' => app.input_cursor = 0,
+                        'e' | 'E' => app.input_cursor = char_count(&app.input),
+                        _ => {}
+                    }
+                } else if !key.modifiers.intersects(disallowed_mods) {
+                    insert_text_at_cursor(&mut app.input, &mut app.input_cursor, &ch.to_string());
+                    app.clear_input_completion_cycle();
+                }
             }
         }
         _ => {}
@@ -1427,9 +1537,11 @@ struct App {
     pending_action: Option<Action>,
     input: String,
     input_focused: bool,
+    input_cursor: usize,
     input_tab_last_at: Option<Instant>,
     input_tab_last_query: String,
     search_query: String,
+    search_cursor: usize,
     search_focused: bool,
     search_dirty: bool,
     preview_mode: PreviewMode,
@@ -1904,9 +2016,11 @@ impl App {
             pending_action: None,
             input: String::new(),
             input_focused: false,
+            input_cursor: 0,
             input_tab_last_at: None,
             input_tab_last_query: String::new(),
             search_query: String::new(),
+            search_cursor: 0,
             search_focused: false,
             search_dirty: false,
             preview_mode: PreviewMode::Chat,
@@ -3811,6 +3925,7 @@ impl App {
         self.pending_action = Some(action);
         self.input.clear();
         self.input_focused = true;
+        self.input_cursor = 0;
         self.clear_input_completion_cycle();
         self.search_focused = false;
         self.status = match action {
@@ -3876,6 +3991,7 @@ impl App {
         self.pending_action = None;
         self.input.clear();
         self.input_focused = false;
+        self.input_cursor = 0;
         self.clear_input_completion_cycle();
         self.status = String::from("Action cancelled");
     }
@@ -4315,12 +4431,15 @@ fn render_search(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
     };
 
     let query_prefix = if app.search_focused { ">" } else { " " };
+    let (before, after) = split_at_char(&app.search_query, app.search_cursor);
     let cursor = if app.search_focused { "█" } else { " " };
-    let content = format!("{query_prefix} {}{cursor}", app.search_query);
 
     let para = Paragraph::new(Line::from(vec![
         Span::styled("Search ", Style::default().fg(Color::Cyan)),
-        Span::raw(content),
+        Span::raw(format!("{query_prefix} ")),
+        Span::raw(before),
+        Span::raw(cursor),
+        Span::raw(after),
     ]))
     .block(
         Block::default()
@@ -4963,6 +5082,10 @@ fn tab_match_status_style() -> Style {
 fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
     let key_line = if app.mode == Mode::Input {
         Line::from(vec![
+            Span::styled("←/→", Style::default().fg(Color::Cyan)),
+            Span::raw(" cursor  "),
+            Span::styled("ctrl+a/e", Style::default().fg(Color::Cyan)),
+            Span::raw(" start/end  "),
             Span::styled("tab", Style::default().fg(Color::Cyan)),
             Span::raw(" path-complete  "),
             Span::styled("tab tab", Style::default().fg(Color::Cyan)),
@@ -4976,6 +5099,10 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
         Line::from(vec![
             Span::styled("type", Style::default().fg(Color::Cyan)),
             Span::raw(" text/path/hash  "),
+            Span::styled("←/→", Style::default().fg(Color::Cyan)),
+            Span::raw(" cursor  "),
+            Span::styled("ctrl+a/e", Style::default().fg(Color::Cyan)),
+            Span::raw(" start/end  "),
             Span::styled("enter", Style::default().fg(Color::Green)),
             Span::raw(" keep results  "),
             Span::styled("esc", Style::default().fg(Color::Red)),
@@ -5238,9 +5365,9 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
         } else {
             " "
         };
+        let (before, after) = split_at_char(&app.input, app.input_cursor);
         lines.push(Line::from(format!(
-            "{focus_mark} {action} target> {}{cursor}",
-            app.input,
+            "{focus_mark} {action} target> {before}{cursor}{after}",
         )));
         if !app.status.trim().is_empty() {
             let status_style = if app.status.starts_with("Matches:") {
@@ -8698,9 +8825,11 @@ mod tests {
             pending_action: None,
             input: String::new(),
             input_focused: false,
+            input_cursor: 0,
             input_tab_last_at: None,
             input_tab_last_query: String::new(),
             search_query: String::new(),
+            search_cursor: 0,
             search_focused: false,
             search_dirty: false,
             preview_mode: PreviewMode::Chat,
@@ -11135,9 +11264,11 @@ mod tests {
             pending_action: None,
             input: String::new(),
             input_focused: false,
+            input_cursor: 0,
             input_tab_last_at: None,
             input_tab_last_query: String::new(),
             search_query: String::new(),
+            search_cursor: 0,
             search_focused: false,
             search_dirty: false,
             preview_mode: PreviewMode::Chat,
@@ -11837,9 +11968,11 @@ mod tests {
             pending_action: None,
             input: String::new(),
             input_focused: false,
+            input_cursor: 0,
             input_tab_last_at: None,
             input_tab_last_query: String::new(),
             search_query: String::from("alpha"),
+            search_cursor: 5,
             search_focused: true,
             search_dirty: true,
             preview_mode: PreviewMode::Chat,
@@ -12650,9 +12783,11 @@ mod tests {
             pending_action: None,
             input: String::new(),
             input_focused: false,
+            input_cursor: 0,
             input_tab_last_at: None,
             input_tab_last_query: String::new(),
             search_query: String::new(),
+            search_cursor: 0,
             search_focused: false,
             search_dirty: false,
             preview_mode: PreviewMode::Chat,
@@ -12818,6 +12953,50 @@ codex_home = "/root/.codex"
 
         assert_eq!(app.mode, Mode::Input);
         assert!(app.status.contains("remote"));
+    }
+
+    #[test]
+    fn search_editing_supports_cursor_motion() {
+        let mut app = empty_test_app();
+        app.search_focused = true;
+        app.search_query = String::from("helo");
+        app.search_cursor = 3;
+
+        handle_normal_mode(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE), &mut app)
+            .expect("insert");
+        assert_eq!(app.search_query, "hello");
+        assert_eq!(app.search_cursor, 4);
+
+        handle_normal_mode(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &mut app)
+            .expect("left");
+        handle_normal_mode(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL), &mut app)
+            .expect("ctrl+a");
+        assert_eq!(app.search_cursor, 0);
+
+        handle_normal_mode(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL), &mut app)
+            .expect("ctrl+e");
+        assert_eq!(app.search_cursor, 5);
+    }
+
+    #[test]
+    fn input_mode_editing_supports_cursor_motion() {
+        let mut app = empty_test_app();
+        app.start_action(Action::AddRemote);
+        app.input = String::from("/tmp/helo");
+        app.input_cursor = 8;
+
+        handle_input_mode(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE), &mut app)
+            .expect("insert");
+        assert_eq!(app.input, "/tmp/hello");
+        assert_eq!(app.input_cursor, 9);
+
+        handle_input_mode(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL), &mut app)
+            .expect("ctrl+a");
+        assert_eq!(app.input_cursor, 0);
+
+        handle_input_mode(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL), &mut app)
+            .expect("ctrl+e");
+        assert_eq!(app.input_cursor, char_count("/tmp/hello"));
     }
 
     #[test]
