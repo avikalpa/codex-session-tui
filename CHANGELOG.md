@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.25 - 2026-03-16
+
+- Fixed startup thread-index sync so stale SQLite rows that already own the target session id are removed before a rollout-path rekey. This prevents `UNIQUE constraint failed: threads.id` crashes when launching the TUI against previously corrupted local Codex state.
+
 ## 1.3.24 - 2026-03-16
 
 - Added real cursor editing to the search box and status-bar path prompts, including `Left`/`Right` plus `Ctrl+A`/`Ctrl+E`, so long queries and remote targets can be corrected in place instead of being retyped.
