@@ -195,6 +195,7 @@ fn duplicate_rewrite_flags(action: Action) -> (bool, bool) {
         Action::Fork => (true, true),
         Action::AddRemote
         | Action::Delete
+        | Action::ProjectDelete
         | Action::DeleteRemote
         | Action::RenameRemote
         | Action::NewFolder => (false, false),
@@ -541,6 +542,8 @@ enum StatusButton {
     Fork,
     Export,
     Delete,
+    DeleteRemote,
+    ProjectDelete,
     ProjectRename,
     ProjectCopy,
     AddRemote,
@@ -558,13 +561,19 @@ fn status_buttons(app: &App) -> Vec<StatusButton> {
             BrowserCursor::Project | BrowserCursor::Group
         )
     {
-        return vec![
+        let mut buttons = vec![
             StatusButton::ProjectRename,
             StatusButton::ProjectCopy,
             StatusButton::AddRemote,
             StatusButton::Refresh,
             StatusButton::Quit,
         ];
+        if app.selected_remote_machine().is_some() {
+            buttons.insert(1, StatusButton::DeleteRemote);
+        } else {
+            buttons.insert(2, StatusButton::ProjectDelete);
+        }
+        return buttons;
     }
     if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Session {
         return vec![
@@ -601,6 +610,8 @@ fn status_button_label(button: StatusButton) -> &'static str {
         StatusButton::Fork => "[Fork]",
         StatusButton::Export => "[Export]",
         StatusButton::Delete => "[Delete]",
+        StatusButton::DeleteRemote => "[Delete Remote]",
+        StatusButton::ProjectDelete => "[Delete Folder]",
         StatusButton::ProjectRename => "[Rename Folder]",
         StatusButton::ProjectCopy => "[Copy Folder]",
         StatusButton::AddRemote => "[Connect Remote]",
@@ -628,6 +639,8 @@ fn trigger_status_button(button: StatusButton, app: &mut App) {
                 app.start_action(Action::Delete);
             }
         }
+        StatusButton::DeleteRemote => app.start_action(Action::DeleteRemote),
+        StatusButton::ProjectDelete => app.start_action(Action::ProjectDelete),
         StatusButton::ProjectRename => {
             if app.selected_remote_machine().is_some() {
                 app.start_action(Action::RenameRemote);
@@ -1200,6 +1213,13 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
         KeyCode::Char('d') | KeyCode::Delete => {
             if app.selected_remote_machine().is_some() {
                 app.start_action(Action::DeleteRemote);
+            } else if app.focus == Focus::Projects
+                && matches!(
+                    app.browser_cursor,
+                    BrowserCursor::Project | BrowserCursor::Group
+                )
+            {
+                app.start_action(Action::ProjectDelete);
             } else if app.current_session().is_some() {
                 app.start_action(Action::Delete);
             }
@@ -1437,6 +1457,7 @@ enum Action {
     Fork,
     Export,
     Delete,
+    ProjectDelete,
     DeleteRemote,
     RenameRemote,
     ProjectRename,
@@ -1649,6 +1670,7 @@ struct SessionActionProgress {
 
 #[derive(Clone)]
 struct DeleteProgress {
+    action: Action,
     targets: Vec<SessionSummary>,
     index: usize,
     ok: usize,
@@ -1885,6 +1907,7 @@ impl App {
                     .ok_or_else(|| anyhow!("export target missing"))?,
             ),
             Action::Delete
+            | Action::ProjectDelete
             | Action::AddRemote
             | Action::DeleteRemote
             | Action::RenameRemote
@@ -1919,6 +1942,7 @@ impl App {
             Action::Fork => "forking",
             Action::Export => "exporting",
             Action::Delete
+            | Action::ProjectDelete
             | Action::AddRemote
             | Action::DeleteRemote
             | Action::RenameRemote
@@ -1958,6 +1982,7 @@ impl App {
             Action::Fork => "forked",
             Action::Export => "exported",
             Action::Delete => "deleted",
+            Action::ProjectDelete => "deleted",
             Action::DeleteRemote => "deleted remote",
             Action::RenameRemote => "renamed remote",
             Action::ProjectRename => "renamed",
@@ -2132,15 +2157,19 @@ impl App {
         Ok(())
     }
 
-    fn start_delete_progress(&mut self, targets: Vec<SessionSummary>) {
+    fn start_delete_progress(&mut self, action: Action, targets: Vec<SessionSummary>) {
         self.deferred_op = None;
         self.delete_progress_op = Some(DeleteProgress {
+            action,
             targets,
             index: 0,
             ok: 0,
             failures: Vec::new(),
         });
-        self.status = String::from("Working... deleting session(s)");
+        self.status = match action {
+            Action::ProjectDelete => String::from("Working... deleting folder session(s)"),
+            _ => String::from("Working... deleting session(s)"),
+        };
     }
 
     fn step_delete_progress(&mut self) -> Result<()> {
@@ -2177,7 +2206,11 @@ impl App {
         let total = progress.targets.len().max(1);
         let done = progress.index.min(total);
         format!(
-            "Working... deleting session(s) {} {done}/{total} ok:{} fail:{}",
+            "Working... deleting {} {} {done}/{total} ok:{} fail:{}",
+            match progress.action {
+                Action::ProjectDelete => "folder session(s)",
+                _ => "session(s)",
+            },
             progress_bar(done, total, 14),
             progress.ok,
             progress.failures.len()
@@ -2191,18 +2224,28 @@ impl App {
         self.selected_sessions.clear();
         self.session_select_anchor = None;
         self.status = if progress.failures.is_empty() {
-            format!("Deleted {} session(s)", progress.ok)
+            match progress.action {
+                Action::ProjectDelete => format!("Deleted {} folder session(s)", progress.ok),
+                _ => format!("Deleted {} session(s)", progress.ok),
+            }
         } else {
             let first = progress
                 .failures
                 .first()
                 .cloned()
                 .unwrap_or_else(|| String::from("unknown error"));
-            format!(
-                "Deleted {} session(s), {} failed. First error: {first}",
-                progress.ok,
-                progress.failures.len()
-            )
+            match progress.action {
+                Action::ProjectDelete => format!(
+                    "Deleted {} folder session(s), {} failed. First error: {first}",
+                    progress.ok,
+                    progress.failures.len()
+                ),
+                _ => format!(
+                    "Deleted {} session(s), {} failed. First error: {first}",
+                    progress.ok,
+                    progress.failures.len()
+                ),
+            }
         };
         Ok(())
     }
@@ -2214,6 +2257,7 @@ impl App {
             Some(Action::Fork) => String::from("Working... forking session(s)"),
             Some(Action::Export) => String::from("Working... exporting session(s)"),
             Some(Action::Delete) => String::from("Working... deleting session(s)"),
+            Some(Action::ProjectDelete) => String::from("Working... deleting folder session(s)"),
             Some(Action::DeleteRemote) => String::from("Working... deleting remote"),
             Some(Action::RenameRemote) => String::from("Working... renaming remote"),
             Some(Action::ProjectRename) => String::from("Working... rewriting folder sessions"),
@@ -3886,7 +3930,7 @@ impl App {
 
     fn action_targets(&self, action: Action) -> Vec<SessionSummary> {
         match action {
-            Action::ProjectRename | Action::ProjectCopy => self
+            Action::ProjectRename | Action::ProjectCopy | Action::ProjectDelete => self
                 .selected_group_path
                 .as_deref()
                 .and_then(|path| {
@@ -4183,7 +4227,9 @@ impl App {
         ) && targets.is_empty()
         {
             self.status = match action {
-                Action::ProjectRename | Action::ProjectCopy => String::from("No project selected"),
+                Action::ProjectRename | Action::ProjectCopy | Action::ProjectDelete => {
+                    String::from("No project selected")
+                }
                 Action::AddRemote => String::from("Enter remote connection details"),
                 Action::DeleteRemote => String::from("No remote machine selected"),
                 Action::RenameRemote => String::from("No remote machine selected"),
@@ -4221,6 +4267,19 @@ impl App {
                 "Delete {} session(s): type DELETE and press Enter",
                 targets.len()
             ),
+            Action::ProjectDelete => {
+                if self.browser_cursor == BrowserCursor::Group {
+                    format!(
+                        "Delete folder subtree ({}) session(s): type DELETE and press Enter",
+                        targets.len()
+                    )
+                } else {
+                    format!(
+                        "Delete folder sessions ({}) : type DELETE and press Enter",
+                        targets.len()
+                    )
+                }
+            }
             Action::DeleteRemote => self
                 .selected_remote_machine()
                 .map(|machine| {
@@ -4302,22 +4361,24 @@ impl App {
             return Ok(());
         }
         let target_display = self.input.trim().to_string();
-        if matches!(action, Action::Delete | Action::DeleteRemote)
-            && !delete_confirmation_valid(&self.input)
+        if matches!(
+            action,
+            Action::Delete | Action::ProjectDelete | Action::DeleteRemote
+        ) && !delete_confirmation_valid(&self.input)
         {
             self.status = String::from("Delete cancelled: type DELETE to confirm");
             return Ok(());
         }
         let mut ok = 0usize;
 
-        if action == Action::Delete {
+        if matches!(action, Action::Delete | Action::ProjectDelete) {
             self.mode = Mode::Normal;
             self.pending_action = None;
             self.input.clear();
             self.input_focused = false;
             self.input_cursor = 0;
             self.clear_input_completion_cycle();
-            self.start_delete_progress(targets);
+            self.start_delete_progress(action, targets);
             return Ok(());
         }
 
@@ -4461,6 +4522,7 @@ impl App {
             Action::Fork => "forked",
             Action::Export => "exported",
             Action::Delete => "deleted",
+            Action::ProjectDelete => "deleted",
             Action::DeleteRemote => "deleted remote",
             Action::RenameRemote => "renamed remote",
             Action::ProjectRename => "renamed",
@@ -4474,6 +4536,8 @@ impl App {
             format!("{action_name} {ok} machine(s) -> {target_display}")
         } else if action == Action::NewFolder {
             format!("{action_name} virtual folder {target_display}")
+        } else if action == Action::ProjectDelete {
+            format!("{action_name} {ok} folder session(s)")
         } else {
             format!("{action_name} {ok} session(s) -> {target_display}")
         };
@@ -4668,7 +4732,7 @@ impl App {
             Action::Copy | Action::ProjectCopy | Action::Fork | Action::Export => {
                 self.write_duplicate_session_to_target(action, session, target)
             }
-            Action::Delete => self.apply_delete_action(session),
+            Action::Delete | Action::ProjectDelete => self.apply_delete_action(session),
             Action::AddRemote | Action::DeleteRemote | Action::RenameRemote | Action::NewFolder => {
                 Ok(())
             }
@@ -5319,7 +5383,9 @@ fn status_button_style(button: StatusButton) -> Style {
         | StatusButton::ProjectRename
         | StatusButton::ProjectCopy
         | StatusButton::AddRemote => Style::default().fg(Color::Green),
-        StatusButton::Delete => Style::default().fg(Color::Red),
+        StatusButton::Delete | StatusButton::DeleteRemote | StatusButton::ProjectDelete => {
+            Style::default().fg(Color::Red)
+        }
         StatusButton::SelectAll | StatusButton::Invert => Style::default().fg(Color::Yellow),
         StatusButton::Cancel | StatusButton::Quit => Style::default().fg(Color::Red),
         StatusButton::Refresh => Style::default().fg(Color::Yellow),
@@ -5341,8 +5407,8 @@ fn tab_match_status_style() -> Style {
 }
 
 fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
-    let key_line = if app.mode == Mode::Input {
-        Line::from(vec![
+    let key_lines = if app.mode == Mode::Input {
+        vec![Line::from(vec![
             Span::styled("←/→", Style::default().fg(Color::Cyan)),
             Span::raw(" cursor  "),
             Span::styled("ctrl+a/e", Style::default().fg(Color::Cyan)),
@@ -5355,9 +5421,9 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" apply  "),
             Span::styled("esc", Style::default().fg(Color::Red)),
             Span::raw(" cancel"),
-        ])
+        ])]
     } else if app.search_focused {
-        Line::from(vec![
+        vec![Line::from(vec![
             Span::styled("type", Style::default().fg(Color::Cyan)),
             Span::raw(" text/path/hash  "),
             Span::styled("←/→", Style::default().fg(Color::Cyan)),
@@ -5374,9 +5440,9 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" prev pane  "),
             Span::styled("alt+←/→/↑/↓", Style::default().fg(Color::Cyan)),
             Span::raw(" panes"),
-        ])
+        ])]
     } else if app.focus == Focus::Preview && app.mode == Mode::Normal {
-        Line::from(vec![
+        vec![Line::from(vec![
             Span::styled("esc", Style::default().fg(Color::Red)),
             Span::raw(" browser  "),
             Span::styled("↑/↓", Style::default().fg(Color::Cyan)),
@@ -5405,7 +5471,7 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" preview-select+copy  "),
             Span::styled("drag", Style::default().fg(Color::Cyan)),
             Span::raw(" splitter/scrollbar"),
-        ])
+        ])]
     } else if app.focus == Focus::Projects
         && app.mode == Mode::Normal
         && matches!(
@@ -5413,118 +5479,116 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             BrowserCursor::Project | BrowserCursor::Group
         )
     {
-        Line::from(vec![
-            Span::styled("j/k", Style::default().fg(Color::Cyan)),
-            Span::raw(" folder nav  "),
-            Span::styled("ctrl+↑/↓", Style::default().fg(Color::Cyan)),
-            Span::raw(" project jump  "),
-            Span::styled("tab", Style::default().fg(Color::Cyan)),
-            Span::raw(" toggle folder  "),
-            Span::styled("←/→", Style::default().fg(Color::Cyan)),
-            Span::raw(" collapse/expand  "),
-            Span::styled("alt+←/→/↑/↓", Style::default().fg(Color::Cyan)),
-            Span::raw(" panes  "),
-            Span::styled("ctrl+←", Style::default().fg(Color::Cyan)),
-            Span::raw(" collapse others  "),
-            Span::styled("ctrl+→", Style::default().fg(Color::Cyan)),
-            Span::raw(" expand all  "),
-            Span::styled("ctrl+c", Style::default().fg(Color::Green)),
-            Span::raw(" copy folder  "),
-            Span::styled("ctrl+x", Style::default().fg(Color::Yellow)),
-            Span::raw(" cut folder  "),
-            Span::styled("ctrl+v", Style::default().fg(Color::Green)),
-            Span::raw(" paste into folder  "),
-            Span::styled("m/x", Style::default().fg(Color::Yellow)),
-            Span::raw(" cut folder  "),
-            Span::styled("c", Style::default().fg(Color::Green)),
-            Span::raw(" copy folder  "),
-            Span::styled("f", Style::default().fg(Color::Green)),
-            Span::raw(" fork folder  "),
-            Span::styled("v", Style::default().fg(Color::Green)),
-            Span::raw(" paste  "),
-            Span::styled("drag", Style::default().fg(Color::Cyan)),
-            Span::raw(" move into folder  "),
-            Span::styled("ctrl+drag", Style::default().fg(Color::Cyan)),
-            Span::raw(" copy into folder  "),
-            Span::styled("dblclick", Style::default().fg(Color::Cyan)),
-            Span::raw(" toggle folder  "),
-            Span::styled("r", Style::default().fg(Color::Green)),
-            Span::raw(" rename folder/remote  "),
-            Span::styled("n", Style::default().fg(Color::Green)),
-            Span::raw(" new virtual folder  "),
-            Span::styled("M/C", Style::default().fg(Color::Green)),
-            Span::raw(" typed move/copy  "),
-            Span::styled("y", Style::default().fg(Color::Green)),
-            Span::raw(" typed copy folder  "),
-            Span::styled("R", Style::default().fg(Color::Green)),
-            Span::raw(" connect remote  "),
-            Span::styled("d", Style::default().fg(Color::Red)),
-            Span::raw(" delete remote  "),
-            Span::styled("/", Style::default().fg(Color::Cyan)),
-            Span::raw(" search  "),
-            Span::styled("f5/ctrl+r", Style::default().fg(Color::Yellow)),
-            Span::raw(" refresh  "),
-            Span::styled("q", Style::default().fg(Color::Red)),
-            Span::raw(" quit"),
-        ])
+        let action_line = if app.selected_remote_machine().is_some() {
+            Line::from(vec![
+                Span::styled("r", Style::default().fg(Color::Green)),
+                Span::raw(" rename remote  "),
+                Span::styled("d", Style::default().fg(Color::Red)),
+                Span::raw(" delete remote  "),
+                Span::styled("n", Style::default().fg(Color::Green)),
+                Span::raw(" new virtual folder  "),
+                Span::styled("R", Style::default().fg(Color::Green)),
+                Span::raw(" connect remote  "),
+                Span::styled("v", Style::default().fg(Color::Green)),
+                Span::raw(" paste into machine  "),
+                Span::styled("drag", Style::default().fg(Color::Cyan)),
+                Span::raw(" move  "),
+                Span::styled("ctrl+drag", Style::default().fg(Color::Cyan)),
+                Span::raw(" copy"),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("c", Style::default().fg(Color::Green)),
+                Span::raw(" copy folder  "),
+                Span::styled("m/x", Style::default().fg(Color::Yellow)),
+                Span::raw(" cut folder  "),
+                Span::styled("f", Style::default().fg(Color::Green)),
+                Span::raw(" fork branch copy  "),
+                Span::styled("v", Style::default().fg(Color::Green)),
+                Span::raw(" paste  "),
+                Span::styled("M/C", Style::default().fg(Color::Green)),
+                Span::raw(" typed move/copy subtree  "),
+                Span::styled("r", Style::default().fg(Color::Green)),
+                Span::raw(" rename  "),
+                Span::styled("d", Style::default().fg(Color::Red)),
+                Span::raw(" delete folder  "),
+                Span::styled("n", Style::default().fg(Color::Green)),
+                Span::raw(" new virtual folder  "),
+                Span::styled("R", Style::default().fg(Color::Green)),
+                Span::raw(" connect remote  "),
+                Span::styled("drag", Style::default().fg(Color::Cyan)),
+                Span::raw(" move  "),
+                Span::styled("ctrl+drag", Style::default().fg(Color::Cyan)),
+                Span::raw(" copy"),
+            ])
+        };
+        vec![
+            Line::from(vec![
+                Span::styled("j/k", Style::default().fg(Color::Cyan)),
+                Span::raw(" nav  "),
+                Span::styled("tab", Style::default().fg(Color::Cyan)),
+                Span::raw(" toggle folder  "),
+                Span::styled("←/→", Style::default().fg(Color::Cyan)),
+                Span::raw(" collapse/expand  "),
+                Span::styled("ctrl+↑/↓", Style::default().fg(Color::Cyan)),
+                Span::raw(" project jump  "),
+                Span::styled("ctrl+←/→", Style::default().fg(Color::Cyan)),
+                Span::raw(" collapse others/expand all  "),
+                Span::styled("alt+←/→/↑/↓", Style::default().fg(Color::Cyan)),
+                Span::raw(" panes  "),
+                Span::styled("/", Style::default().fg(Color::Cyan)),
+                Span::raw(" search  "),
+                Span::styled("f5/ctrl+r", Style::default().fg(Color::Yellow)),
+                Span::raw(" refresh"),
+            ]),
+            action_line,
+        ]
     } else if app.focus == Focus::Projects
         && app.mode == Mode::Normal
         && app.browser_cursor == BrowserCursor::Session
     {
-        Line::from(vec![
-            Span::styled("j/k", Style::default().fg(Color::Cyan)),
-            Span::raw(" nav  "),
-            Span::styled("ctrl+↑/↓", Style::default().fg(Color::Cyan)),
-            Span::raw(" project jump  "),
-            Span::styled("tab", Style::default().fg(Color::Cyan)),
-            Span::raw(" next pane  "),
-            Span::styled("←", Style::default().fg(Color::Cyan)),
-            Span::raw(" folder row  "),
-            Span::styled("→", Style::default().fg(Color::Cyan)),
-            Span::raw(" open preview  "),
-            Span::styled("alt+←/→/↑/↓", Style::default().fg(Color::Cyan)),
-            Span::raw(" panes  "),
-            Span::styled("space", Style::default().fg(Color::Yellow)),
-            Span::raw(" toggle-select  "),
-            Span::styled("checkbox click", Style::default().fg(Color::Yellow)),
-            Span::raw(" toggle  "),
-            Span::styled("a", Style::default().fg(Color::Yellow)),
-            Span::raw(" select-all  "),
-            Span::styled("i", Style::default().fg(Color::Yellow)),
-            Span::raw(" invert  "),
-            Span::styled("!", Style::default().fg(Color::Yellow)),
-            Span::raw(" select *!  "),
-            Span::styled("ctrl+c/x/v", Style::default().fg(Color::Green)),
-            Span::raw(" copy/cut/paste  "),
-            Span::styled("m/x", Style::default().fg(Color::Yellow)),
-            Span::raw(" cut  "),
-            Span::styled("c", Style::default().fg(Color::Green)),
-            Span::raw(" copy  "),
-            Span::styled("f", Style::default().fg(Color::Green)),
-            Span::raw(" fork  "),
-            Span::styled("v", Style::default().fg(Color::Green)),
-            Span::raw(" paste  "),
-            Span::styled("drag", Style::default().fg(Color::Cyan)),
-            Span::raw(" move  "),
-            Span::styled("ctrl+drag", Style::default().fg(Color::Cyan)),
-            Span::raw(" copy  "),
-            Span::styled("del", Style::default().fg(Color::Red)),
-            Span::raw(" delete  "),
-            Span::styled("dblclick", Style::default().fg(Color::Cyan)),
-            Span::raw(" open  "),
-            Span::styled("M/C/F", Style::default().fg(Color::Green)),
-            Span::raw(" typed move/copy/fork  "),
-            Span::styled("target", Style::default().fg(Color::Cyan)),
-            Span::raw(" /path or machine:/path  "),
-            Span::styled("e", Style::default().fg(Color::Green)),
-            Span::raw(" export ssh  "),
-            Span::styled("/", Style::default().fg(Color::Cyan)),
-            Span::raw(" search  "),
-            Span::styled("f5/ctrl+r", Style::default().fg(Color::Yellow)),
-            Span::raw(" refresh"),
-        ])
+        vec![
+            Line::from(vec![
+                Span::styled("j/k", Style::default().fg(Color::Cyan)),
+                Span::raw(" nav  "),
+                Span::styled("←/→", Style::default().fg(Color::Cyan)),
+                Span::raw(" folder/preview  "),
+                Span::styled("space", Style::default().fg(Color::Yellow)),
+                Span::raw(" toggle-select  "),
+                Span::styled("a/i/!", Style::default().fg(Color::Yellow)),
+                Span::raw(" select all/invert/*!  "),
+                Span::styled("dblclick", Style::default().fg(Color::Cyan)),
+                Span::raw(" open  "),
+                Span::styled("/", Style::default().fg(Color::Cyan)),
+                Span::raw(" search  "),
+                Span::styled("f5/ctrl+r", Style::default().fg(Color::Yellow)),
+                Span::raw(" refresh"),
+            ]),
+            Line::from(vec![
+                Span::styled("c", Style::default().fg(Color::Green)),
+                Span::raw(" copy clone  "),
+                Span::styled("m/x", Style::default().fg(Color::Yellow)),
+                Span::raw(" cut/move  "),
+                Span::styled("f", Style::default().fg(Color::Green)),
+                Span::raw(" fork branch copy  "),
+                Span::styled("v", Style::default().fg(Color::Green)),
+                Span::raw(" paste  "),
+                Span::styled("M/C/F", Style::default().fg(Color::Green)),
+                Span::raw(" typed target  "),
+                Span::styled("e", Style::default().fg(Color::Green)),
+                Span::raw(" export ssh  "),
+                Span::styled("del", Style::default().fg(Color::Red)),
+                Span::raw(" delete  "),
+                Span::styled("drag", Style::default().fg(Color::Cyan)),
+                Span::raw(" move  "),
+                Span::styled("ctrl+drag", Style::default().fg(Color::Cyan)),
+                Span::raw(" copy  "),
+                Span::styled("alt+←/→/↑/↓", Style::default().fg(Color::Cyan)),
+                Span::raw(" panes"),
+            ]),
+        ]
     } else {
-        Line::from(vec![
+        vec![Line::from(vec![
             Span::styled("tab", Style::default().fg(Color::Cyan)),
             Span::raw(" focus  "),
             Span::styled("alt+←/→/↑/↓", Style::default().fg(Color::Cyan)),
@@ -5553,7 +5617,7 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" refresh  "),
             Span::styled("q", Style::default().fg(Color::Red)),
             Span::raw(" quit"),
-        ])
+        ])]
     };
     let matched_sessions = app
         .projects
@@ -5609,10 +5673,9 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
     } else {
         "  wheel scrolls panes"
     }));
-    let mut lines = vec![Line::from(controls_spans)];
-
-    lines.insert(0, meta_line);
-    lines.insert(0, key_line);
+    let mut lines = key_lines;
+    lines.push(meta_line);
+    lines.push(Line::from(controls_spans));
 
     if app.mode == Mode::Input {
         let action = match app.pending_action {
@@ -5621,6 +5684,7 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Some(Action::Fork) => "FORK",
             Some(Action::Export) => "EXPORT",
             Some(Action::Delete) => "DELETE",
+            Some(Action::ProjectDelete) => "DELETE FOLDER",
             Some(Action::DeleteRemote) => "DELETE REMOTE",
             Some(Action::RenameRemote) => "RENAME REMOTE",
             Some(Action::ProjectRename) => "RENAME FOLDER",
@@ -9935,6 +9999,26 @@ mod tests {
     }
 
     #[test]
+    fn delete_key_starts_project_delete_for_folder_row() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            cwd: String::from("/repo"),
+            sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
+        }];
+        app.browser_cursor = BrowserCursor::Project;
+        app.focus = Focus::Projects;
+        let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE);
+        let quit = handle_normal_mode(key, &mut app).expect("handle");
+        assert!(!quit);
+        assert_eq!(app.mode, Mode::Input);
+        assert_eq!(app.pending_action, Some(Action::ProjectDelete));
+    }
+
+    #[test]
     fn typed_copy_fork_and_export_keys_start_actions_for_session_row() {
         let actions = [
             (KeyCode::Char('C'), Action::Copy),
@@ -11736,6 +11820,27 @@ mod tests {
     }
 
     #[test]
+    fn project_delete_targets_all_project_sessions() {
+        let mut app = empty_test_app();
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Project;
+        app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            cwd: String::from("/repo"),
+            sessions: vec![
+                sample_session("/tmp/a.jsonl", "/repo", "a"),
+                sample_session("/tmp/b.jsonl", "/repo", "b"),
+            ],
+        }];
+
+        let targets = app.action_targets(Action::ProjectDelete);
+        assert_eq!(targets.len(), 2);
+    }
+
+    #[test]
     fn preview_selected_text_uses_character_bounds() {
         let app = App {
             config_path: PathBuf::from("/tmp/codex-session-tui.toml"),
@@ -12746,7 +12851,7 @@ mod tests {
         app.focus = Focus::Projects;
         app.browser_cursor = BrowserCursor::Project;
 
-        let backend = TestBackend::new(220, 5);
+        let backend = TestBackend::new(320, 6);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|frame| {
@@ -12755,8 +12860,8 @@ mod tests {
                     ratatui::layout::Rect {
                         x: 0,
                         y: 0,
-                        width: 220,
-                        height: 5,
+                        width: 320,
+                        height: 6,
                     },
                     &app,
                 );
@@ -12764,12 +12869,11 @@ mod tests {
             .expect("draw");
 
         let backend = terminal.backend();
-        assert!(buffer_contains(backend, "ctrl+←"));
         assert!(buffer_contains(backend, "collapse others"));
-        assert!(buffer_contains(backend, "ctrl+→"));
         assert!(buffer_contains(backend, "expand all"));
         assert!(buffer_contains(backend, "ctrl+↑/↓"));
         assert!(buffer_contains(backend, "project jump"));
+        assert!(buffer_contains(backend, "delete folder"));
     }
 
     #[test]
