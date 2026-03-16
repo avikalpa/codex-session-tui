@@ -1885,6 +1885,7 @@ impl App {
         let state_db_path = resolve_state_db_path(&codex_home);
         let cwd_base = env::current_dir().context("failed to resolve current directory")?;
         let repaired_count = repair_session_cwds(&sessions_root, &cwd_base)?;
+        let repaired_id_count = repair_session_ids(&sessions_root)?;
 
         let mut app = Self {
             config_path,
@@ -1950,11 +1951,12 @@ impl App {
 
         app.reload_mode(true, include_remote_scan)?;
         let synced_threads = app.sync_state_index()?;
-        if repaired_count > 0 || synced_threads > 0 {
+        if repaired_count > 0 || repaired_id_count > 0 || synced_threads > 0 {
             app.status = format!(
-                "Loaded {} projects, repaired {} session file(s), synced {} thread row(s)",
+                "Loaded {} projects, repaired {} cwd(s), repaired {} id(s), synced {} thread row(s)",
                 app.projects.len(),
                 repaired_count,
+                repaired_id_count,
                 synced_threads
             );
         }
@@ -6942,6 +6944,73 @@ fn repair_session_file_cwds(path: &Path, cwd_base: &Path) -> Result<bool> {
     Ok(true)
 }
 
+fn rollout_filename_session_id(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let rest = stem.strip_prefix("rollout-")?;
+    if rest.len() <= 20 || rest.as_bytes().get(19) != Some(&b'-') {
+        return None;
+    }
+    let id = &rest[20..];
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
+}
+
+fn extract_session_meta_id(content: &str) -> Option<String> {
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(line).ok()?;
+        if value.get("type").and_then(Value::as_str) == Some("session_meta") {
+            return value
+                .get("payload")
+                .and_then(|payload| payload.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+    }
+    None
+}
+
+fn rewrite_session_content_with_session_id(content: &str, new_id: &str) -> Result<String> {
+    let mut out = String::with_capacity(content.len() + 64);
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            out.push('\n');
+            continue;
+        }
+        let mut value: Value =
+            serde_json::from_str(line).context("invalid JSON line while repairing session id")?;
+        rewrite_session_id(&mut value, new_id);
+        out.push_str(&serde_json::to_string(&value)?);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn repair_session_file_id(path: &Path) -> Result<bool> {
+    let Some(desired_id) = rollout_filename_session_id(path) else {
+        return Ok(false);
+    };
+    let content =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let Some(current_id) = extract_session_meta_id(&content) else {
+        return Ok(false);
+    };
+    if current_id == desired_id {
+        return Ok(false);
+    }
+
+    let repaired = rewrite_session_content_with_session_id(&content, &desired_id)?;
+    backup_file(path)?;
+    atomic_write(path, &repaired)?;
+    Ok(true)
+}
+
 #[allow(dead_code)]
 fn duplicate_session_file(
     sessions_root: &Path,
@@ -7297,6 +7366,22 @@ fn repair_session_cwds(root: &Path, cwd_base: &Path) -> Result<usize> {
     Ok(repaired)
 }
 
+fn repair_session_ids(root: &Path) -> Result<usize> {
+    if !root.exists() {
+        return Ok(0);
+    }
+
+    let mut files = Vec::new();
+    collect_jsonl_files(root, &mut files)?;
+    let mut repaired = 0usize;
+    for path in files {
+        if repair_session_file_id(&path)? {
+            repaired += 1;
+        }
+    }
+    Ok(repaired)
+}
+
 fn resolve_state_db_path(codex_home: &Path) -> Option<PathBuf> {
     let mut candidates = fs::read_dir(codex_home)
         .ok()?
@@ -7392,11 +7477,11 @@ fn sync_thread_record_tx(
     let mut stmt = tx.prepare(
         "SELECT id, cwd, rollout_path
          FROM threads
-         WHERE id = ?1 OR rollout_path = ?2
+         WHERE rollout_path = ?1
          LIMIT 1",
     )?;
-    let existing = stmt
-        .query_row(params![session_id, rollout_path_s], |row| {
+    let by_rollout = stmt
+        .query_row(params![rollout_path_s], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -7406,18 +7491,55 @@ fn sync_thread_record_tx(
         .optional()?;
     drop(stmt);
 
+    let existing = if let Some(row) = by_rollout {
+        Some(row)
+    } else {
+        let mut stmt = tx.prepare(
+            "SELECT id, cwd, rollout_path
+             FROM threads
+             WHERE id = ?1
+             LIMIT 1",
+        )?;
+        let by_id = stmt
+            .query_row(params![session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .optional()?;
+        drop(stmt);
+        by_id
+    };
+
     let Some((row_id, current_cwd, current_rollout_path)) = existing else {
         return Ok(false);
     };
 
-    if current_cwd == target_cwd && current_rollout_path == target_rollout_path_s {
+    if row_id == session_id
+        && current_cwd == target_cwd
+        && current_rollout_path == target_rollout_path_s
+    {
         return Ok(false);
     }
 
-    tx.execute(
-        "UPDATE threads SET cwd = ?1, rollout_path = ?2 WHERE id = ?3",
-        params![target_cwd, target_rollout_path_s, row_id],
-    )?;
+    if current_rollout_path == rollout_path_s && row_id != session_id {
+        tx.execute(
+            "UPDATE threads SET id = ?1, cwd = ?2, rollout_path = ?3 WHERE rollout_path = ?4",
+            params![
+                session_id,
+                target_cwd,
+                target_rollout_path_s,
+                current_rollout_path
+            ],
+        )?;
+    } else {
+        tx.execute(
+            "UPDATE threads SET cwd = ?1, rollout_path = ?2 WHERE id = ?3",
+            params![target_cwd, target_rollout_path_s, row_id],
+        )?;
+    }
     Ok(true)
 }
 
@@ -8745,12 +8867,8 @@ mod tests {
             .expect("copy");
 
         assert!(status.contains("copied 1 session"));
-        let created = fs::read_dir(sessions_root.join("2026/03/15"))
-            .expect("read dir")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-            .collect::<Vec<_>>();
+        let mut created = Vec::new();
+        collect_jsonl_files(&sessions_root, &mut created).expect("collect jsonl");
         assert!(created.len() >= 2);
     }
 
@@ -9992,6 +10110,26 @@ mod tests {
     }
 
     #[test]
+    fn repair_session_file_id_uses_rollout_filename_id() {
+        let dir = std::env::temp_dir().join(format!("cse-repair-id-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path =
+            dir.join("rollout-2026-03-16T08-51-07-00e09586-5c8b-43df-b6bd-74d4bfdcfbf4.jsonl");
+        fs::write(
+            &path,
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"old-id","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}}"#,
+        )
+        .expect("write");
+
+        let changed = repair_session_file_id(&path).expect("repair id");
+        assert!(changed);
+
+        let repaired = fs::read_to_string(&path).expect("read repaired");
+        assert!(repaired.contains("\"id\":\"00e09586-5c8b-43df-b6bd-74d4bfdcfbf4\""));
+        assert!(!repaired.contains("\"id\":\"old-id\""));
+    }
+
+    #[test]
     fn resolve_state_db_path_picks_latest_state_db() {
         let dir = std::env::temp_dir().join(format!("cse-state-db-{}", Uuid::new_v4()));
         fs::create_dir_all(&dir).expect("mkdir");
@@ -10088,6 +10226,46 @@ mod tests {
             })
             .expect("select");
         assert_eq!(cwd, "/new/path");
+    }
+
+    #[test]
+    fn sync_thread_record_prefers_rollout_path_over_id() {
+        let dir = std::env::temp_dir().join(format!("cse-sync-rollout-first-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let db = dir.join("state_5.sqlite");
+        init_test_state_db(&db);
+
+        let rollout = dir.join("sessions/2026/03/16/session.jsonl");
+        let rollout_s = path_to_string(&rollout);
+        let conn = Connection::open(&db).expect("open");
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path, cwd, title, first_user_message) VALUES (?1, ?2, ?3, '', '')",
+            params!["old-id", rollout_s, "/old/path"],
+        )
+        .expect("insert");
+        drop(conn);
+
+        let changed =
+            sync_thread_record(&db, "new-id", &rollout, "/new/path", &rollout).expect("sync");
+        assert!(changed);
+
+        let conn = Connection::open(&db).expect("open");
+        let row = conn
+            .query_row(
+                "SELECT id, cwd, rollout_path FROM threads WHERE rollout_path = ?1",
+                params![path_to_string(&rollout)],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .expect("select");
+        assert_eq!(row.0, "new-id");
+        assert_eq!(row.1, "/new/path");
+        assert_eq!(row.2, path_to_string(&rollout));
     }
 
     #[test]
