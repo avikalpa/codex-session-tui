@@ -1113,19 +1113,13 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
         }
         KeyCode::Char('g') | KeyCode::F(5) => app.reload(true)?,
         KeyCode::Char('m') => {
-            if app.selected_remote_machine().is_some() {
-                app.start_action(Action::RenameRemote);
-            } else if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Project {
-                app.start_action(Action::ProjectRename);
-            } else if app.current_session().is_some() {
-                app.start_action(Action::Move);
+            if app.focus == Focus::Projects {
+                app.copy_browser_selection(BrowserClipboardMode::Cut);
             }
         }
         KeyCode::Char('c') => {
             if app.focus == Focus::Projects {
                 app.copy_browser_selection(BrowserClipboardMode::Copy);
-            } else if app.current_session().is_some() {
-                app.start_action(Action::Copy);
             }
         }
         KeyCode::Char('x') => {
@@ -1133,17 +1127,31 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
                 app.copy_browser_selection(BrowserClipboardMode::Cut);
             }
         }
+        KeyCode::Char('M') => {
+            if app.focus == Focus::Projects
+                && matches!(app.browser_cursor, BrowserCursor::Project | BrowserCursor::Group)
+            {
+                app.start_action(Action::ProjectRename);
+            } else if app.current_session().is_some() {
+                app.start_action(Action::Move);
+            }
+        }
         KeyCode::Char('C') => {
-            if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Project {
+            if app.focus == Focus::Projects
+                && matches!(app.browser_cursor, BrowserCursor::Project | BrowserCursor::Group)
+            {
                 app.start_action(Action::ProjectCopy);
             } else if app.current_session().is_some() {
                 app.start_action(Action::Copy);
             }
         }
         KeyCode::Char('f') => {
-            if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Project {
-                app.status = String::from("Project scope supports rename/copy");
-            } else if app.current_session().is_some() {
+            if app.focus == Focus::Projects {
+                app.copy_browser_selection(BrowserClipboardMode::Fork);
+            }
+        }
+        KeyCode::Char('F') => {
+            if app.current_session().is_some() {
                 app.start_action(Action::Fork);
             }
         }
@@ -1185,7 +1193,9 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
         KeyCode::Char('r') => {
             if app.selected_remote_machine().is_some() {
                 app.start_action(Action::RenameRemote);
-            } else if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Project {
+            } else if app.focus == Focus::Projects
+                && matches!(app.browser_cursor, BrowserCursor::Project | BrowserCursor::Group)
+            {
                 app.start_action(Action::ProjectRename);
             }
         }
@@ -1198,7 +1208,9 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
             app.start_action(Action::RenameRemote);
         }
         KeyCode::Char('y') => {
-            if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Project {
+            if app.focus == Focus::Projects
+                && matches!(app.browser_cursor, BrowserCursor::Project | BrowserCursor::Group)
+            {
                 app.start_action(Action::ProjectCopy);
             }
         }
@@ -1417,6 +1429,7 @@ enum Action {
 enum BrowserClipboardMode {
     Copy,
     Cut,
+    Fork,
 }
 
 #[derive(Clone)]
@@ -1792,6 +1805,9 @@ impl App {
                     self.apply_session_action_to_target(Action::Move, &session, &effective_target)
                 }
             }
+            BrowserClipboardMode::Fork => {
+                self.apply_session_action_to_target(Action::Fork, &session, &effective_target)
+            }
         };
 
         match result {
@@ -1822,6 +1838,7 @@ impl App {
         let verb = match progress.source.mode {
             BrowserClipboardMode::Copy => "copying",
             BrowserClipboardMode::Cut => "moving",
+            BrowserClipboardMode::Fork => "forking",
         };
         let total = progress.source.targets.len().max(1);
         let done = progress.index.min(total);
@@ -1853,6 +1870,7 @@ impl App {
         let verb = match progress.source.mode {
             BrowserClipboardMode::Copy => "Copied",
             BrowserClipboardMode::Cut => "Moved",
+            BrowserClipboardMode::Fork => "Forked",
         };
         self.status = if progress.failures.is_empty() {
             if progress.skipped > 0 {
@@ -3643,8 +3661,16 @@ impl App {
     fn action_targets(&self, action: Action) -> Vec<SessionSummary> {
         match action {
             Action::ProjectRename | Action::ProjectCopy => self
-                .current_project()
-                .map(|p| p.sessions.clone())
+                .selected_group_path
+                .as_deref()
+                .and_then(|path| {
+                    if self.browser_cursor == BrowserCursor::Group {
+                        self.group_prefix_target(path)
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| self.current_project().map(|p| p.sessions.clone()))
                 .unwrap_or_default(),
             Action::AddRemote | Action::DeleteRemote | Action::RenameRemote | Action::NewFolder => {
                 Vec::new()
@@ -3681,6 +3707,16 @@ impl App {
             .get(self.current_browser_row_index())
             .cloned()?;
         self.browser_target_for_row(&row)
+    }
+
+    fn current_group_source_cwd(&self) -> Option<String> {
+        if self.browser_cursor != BrowserCursor::Group {
+            return None;
+        }
+        self.selected_group_path
+            .as_deref()
+            .and_then(|path| self.machine_target_for_group_path(path))
+            .map(|target| target.cwd)
     }
 
     fn browser_target_for_row(&self, row: &BrowserRow) -> Option<MachineTargetSpec> {
@@ -3807,6 +3843,9 @@ impl App {
             BrowserClipboardMode::Cut => {
                 format!("Dragging move from {source_label}. Drop on a folder to move")
             }
+            BrowserClipboardMode::Fork => {
+                format!("Dragging fork from {source_label}. Drop on a folder to fork")
+            }
         };
     }
 
@@ -3853,12 +3892,17 @@ impl App {
         });
         self.status = match mode {
             BrowserClipboardMode::Copy => format!(
-                "Copied {} session(s) from {}. Select target folder and press Ctrl+V",
+                "Copied {} session(s) from {}. Select target folder and press v/Ctrl+V",
                 targets.len(),
                 source_label
             ),
             BrowserClipboardMode::Cut => format!(
-                "Cut {} session(s) from {}. Select target folder and press Ctrl+V",
+                "Cut {} session(s) from {}. Select target folder and press v/Ctrl+V",
+                targets.len(),
+                source_label
+            ),
+            BrowserClipboardMode::Fork => format!(
+                "Fork-ready {} session(s) from {}. Select target folder and press v/Ctrl+V",
                 targets.len(),
                 source_label
             ),
@@ -3876,8 +3920,10 @@ impl App {
         };
         let verb = if clipboard.mode == BrowserClipboardMode::Copy {
             "copying"
-        } else {
+        } else if clipboard.mode == BrowserClipboardMode::Cut {
             "moving"
+        } else {
+            "forking"
         };
         let target_label = format!("{}:{}", target.name, browser_display_path(&target.cwd));
         self.start_browser_transfer(
@@ -3969,14 +4015,32 @@ impl App {
                 .unwrap_or_else(|| {
                     String::from("Rename remote: enter new machine name and press Enter")
                 }),
-            Action::ProjectRename => format!(
-                "Rename folder sessions ({}) to target path and press Enter",
-                targets.len()
-            ),
-            Action::ProjectCopy => format!(
-                "Copy folder sessions ({}) to target path (`/path` or `machine:/path`) and press Enter",
-                targets.len()
-            ),
+            Action::ProjectRename => {
+                if self.browser_cursor == BrowserCursor::Group {
+                    format!(
+                        "Rename folder subtree ({}) to target path (`/path` or `machine:/path`) and press Enter",
+                        targets.len()
+                    )
+                } else {
+                    format!(
+                        "Rename folder sessions ({}) to target path and press Enter",
+                        targets.len()
+                    )
+                }
+            }
+            Action::ProjectCopy => {
+                if self.browser_cursor == BrowserCursor::Group {
+                    format!(
+                        "Copy folder subtree ({}) to target path (`/path` or `machine:/path`) and press Enter",
+                        targets.len()
+                    )
+                } else {
+                    format!(
+                        "Copy folder sessions ({}) to target path (`/path` or `machine:/path`) and press Enter",
+                        targets.len()
+                    )
+                }
+            }
             Action::NewFolder => {
                 String::from("New virtual folder: enter folder name or path and press Enter")
             }
@@ -4125,6 +4189,12 @@ impl App {
                 } else {
                     None
                 };
+                let source_group_cwd = if matches!(action, Action::ProjectRename | Action::ProjectCopy)
+                {
+                    self.current_group_source_cwd()
+                } else {
+                    None
+                };
                 for session in &targets {
                     let result = match action {
                         Action::Move
@@ -4132,14 +4202,24 @@ impl App {
                         | Action::Copy
                         | Action::ProjectCopy
                         | Action::Fork => {
-                            let target = target_machine.as_ref().expect("target machine");
-                            if session.machine_target == target.ssh_target
-                                && session.cwd == target.cwd
+                            let raw_target = target_machine.as_ref().expect("target machine");
+                            let effective_target =
+                                if let Some(source_group_cwd) = source_group_cwd.as_deref() {
+                                    target_for_group_remap(session, source_group_cwd, raw_target)
+                                } else {
+                                    raw_target.clone()
+                                };
+                            if session.machine_target == effective_target.ssh_target
+                                && session.cwd == effective_target.cwd
                             {
                                 skipped += 1;
                                 Ok(())
                             } else {
-                                self.apply_session_action_to_target(action, session, target)
+                                self.apply_session_action_to_target(
+                                    action,
+                                    session,
+                                    &effective_target,
+                                )
                             }
                         }
                         Action::Export => export_session_via_ssh(session, &target_str),
@@ -5173,19 +5253,27 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" cut folder  "),
             Span::styled("ctrl+v", Style::default().fg(Color::Green)),
             Span::raw(" paste into folder  "),
-            Span::styled("c/x/v", Style::default().fg(Color::Green)),
-            Span::raw(" clipboard  "),
+            Span::styled("m/x", Style::default().fg(Color::Yellow)),
+            Span::raw(" cut folder  "),
+            Span::styled("c", Style::default().fg(Color::Green)),
+            Span::raw(" copy folder  "),
+            Span::styled("f", Style::default().fg(Color::Green)),
+            Span::raw(" fork folder  "),
+            Span::styled("v", Style::default().fg(Color::Green)),
+            Span::raw(" paste  "),
             Span::styled("drag", Style::default().fg(Color::Cyan)),
             Span::raw(" move into folder  "),
             Span::styled("ctrl+drag", Style::default().fg(Color::Cyan)),
             Span::raw(" copy into folder  "),
             Span::styled("dblclick", Style::default().fg(Color::Cyan)),
             Span::raw(" toggle folder  "),
-            Span::styled("m or r", Style::default().fg(Color::Green)),
+            Span::styled("r", Style::default().fg(Color::Green)),
             Span::raw(" rename folder/remote  "),
             Span::styled("n", Style::default().fg(Color::Green)),
             Span::raw(" new virtual folder  "),
-            Span::styled("C or y", Style::default().fg(Color::Green)),
+            Span::styled("M/C", Style::default().fg(Color::Green)),
+            Span::raw(" typed move/copy  "),
+            Span::styled("y", Style::default().fg(Color::Green)),
             Span::raw(" typed copy folder  "),
             Span::styled("R", Style::default().fg(Color::Green)),
             Span::raw(" connect remote  "),
@@ -5227,8 +5315,14 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" select *!  "),
             Span::styled("ctrl+c/x/v", Style::default().fg(Color::Green)),
             Span::raw(" copy/cut/paste  "),
-            Span::styled("c/x/v", Style::default().fg(Color::Green)),
-            Span::raw(" browser clipboard  "),
+            Span::styled("m/x", Style::default().fg(Color::Yellow)),
+            Span::raw(" cut  "),
+            Span::styled("c", Style::default().fg(Color::Green)),
+            Span::raw(" copy  "),
+            Span::styled("f", Style::default().fg(Color::Green)),
+            Span::raw(" fork  "),
+            Span::styled("v", Style::default().fg(Color::Green)),
+            Span::raw(" paste  "),
             Span::styled("drag", Style::default().fg(Color::Cyan)),
             Span::raw(" move  "),
             Span::styled("ctrl+drag", Style::default().fg(Color::Cyan)),
@@ -5237,8 +5331,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" delete  "),
             Span::styled("dblclick", Style::default().fg(Color::Cyan)),
             Span::raw(" open  "),
-            Span::styled("m/C/f/d", Style::default().fg(Color::Green)),
-            Span::raw(" move/typed-copy/fork/delete  "),
+            Span::styled("M/C/F", Style::default().fg(Color::Green)),
+            Span::raw(" typed move/copy/fork  "),
             Span::styled("target", Style::default().fg(Color::Cyan)),
             Span::raw(" /path or machine:/path  "),
             Span::styled("e", Style::default().fg(Color::Green)),
@@ -7435,6 +7529,21 @@ fn target_for_group_drop(
     effective
 }
 
+fn target_for_group_remap(
+    session: &SessionSummary,
+    source_group_cwd: &str,
+    target: &MachineTargetSpec,
+) -> MachineTargetSpec {
+    let mut effective = target.clone();
+    let relative = relative_cwd_from_group(source_group_cwd, &session.cwd).unwrap_or_default();
+    effective.cwd = if relative.is_empty() {
+        target.cwd.clone()
+    } else {
+        join_cwd(&target.cwd, &relative)
+    };
+    effective
+}
+
 fn group_path_for_machine_cwd(machine_name: &str, cwd: &str) -> String {
     let mut out = machine_name.to_string();
     for segment in browser_tree_segments(cwd) {
@@ -9494,6 +9603,45 @@ mod tests {
     }
 
     #[test]
+    fn group_project_actions_target_subtree_sessions() {
+        let mut app = empty_test_app();
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Group;
+        app.selected_group_path = Some(String::from("local/root"));
+        app.projects = vec![
+            ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
+                machine_exec_prefix: None,
+                cwd: String::from("/root/gh/repo-a"),
+                sessions: vec![sample_session("/tmp/a.jsonl", "/root/gh/repo-a", "a")],
+            },
+            ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
+                machine_exec_prefix: None,
+                cwd: String::from("/root/gh/repo-b"),
+                sessions: vec![sample_session("/tmp/b.jsonl", "/root/gh/repo-b", "b")],
+            },
+            ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
+                machine_exec_prefix: None,
+                cwd: String::from("/home/pi/gh/repo-c"),
+                sessions: vec![sample_session("/tmp/c.jsonl", "/home/pi/gh/repo-c", "c")],
+            },
+        ];
+
+        let targets = app.action_targets(Action::ProjectRename);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].id, "a");
+        assert_eq!(targets[1].id, "b");
+    }
+
+    #[test]
     fn browser_rows_hide_sessions_when_project_collapsed() {
         let mut app = empty_test_app();
         app.projects = vec![ProjectBucket {
@@ -9614,6 +9762,21 @@ mod tests {
             remote_join_path("/var/tmp/codex/", "a.jsonl"),
             "/var/tmp/codex/a.jsonl"
         );
+    }
+
+    #[test]
+    fn target_for_group_remap_replaces_prefix_without_preserving_leaf() {
+        let session = sample_session("/tmp/a.jsonl", "/root/gh/repo", "a");
+        let target = MachineTargetSpec {
+            name: String::from("local"),
+            ssh_target: None,
+            codex_home: String::from("/home/pi/.codex"),
+            cwd: String::from("/home/pi"),
+            exec_prefix: None,
+        };
+
+        let effective = target_for_group_remap(&session, "/root", &target);
+        assert_eq!(effective.cwd, "/home/pi/gh/repo");
     }
 
     #[test]
@@ -9763,6 +9926,56 @@ mod tests {
 
         let clipboard = app.browser_clipboard.expect("clipboard");
         assert_eq!(clipboard.mode, BrowserClipboardMode::Cut);
+    }
+
+    #[test]
+    fn plain_m_cuts_browser_selection_into_clipboard() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            cwd: String::from("/repo"),
+            sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
+        }];
+        app.browser_cursor = BrowserCursor::Session;
+        app.focus = Focus::Projects;
+
+        handle_normal_mode(
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+            &mut app,
+        )
+        .expect("handle");
+
+        let clipboard = app.browser_clipboard.expect("clipboard");
+        assert_eq!(clipboard.mode, BrowserClipboardMode::Cut);
+        assert_eq!(clipboard.targets[0].id, "a");
+    }
+
+    #[test]
+    fn plain_f_prepares_browser_fork_into_clipboard() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            cwd: String::from("/repo"),
+            sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
+        }];
+        app.browser_cursor = BrowserCursor::Session;
+        app.focus = Focus::Projects;
+
+        handle_normal_mode(
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+            &mut app,
+        )
+        .expect("handle");
+
+        let clipboard = app.browser_clipboard.expect("clipboard");
+        assert_eq!(clipboard.mode, BrowserClipboardMode::Fork);
+        assert_eq!(clipboard.targets[0].id, "a");
     }
 
     #[test]
