@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.24 - 2026-03-16
+
+- Added real cursor editing to the search box and status-bar path prompts, including `Left`/`Right` plus `Ctrl+A`/`Ctrl+E`, so long queries and remote targets can be corrected in place instead of being retyped.
+- Changed browser operation semantics so lowercase `m/x/c/f/v` are browser-first cut/copy/fork/paste actions and uppercase `M/C/F` remain typed target-path flows.
+- Added grouped-folder subtree remap behavior for typed folder rename/copy, which makes prefix rewrites like `/root -> /home/pi` preserve child paths instead of flattening them.
+- Changed typed move/copy/fork/export operations to run stepwise with visible progress and a blinking `Working...` status instead of blocking the UI without feedback.
+- Fixed preview defaults so the final conversation block stays expanded, which prevents the newest assistant reply from being hidden behind the default fold state.
+
 ## 1.3.23 - 2026-03-15
 
 - Added `repair-index` CLI maintenance command to back up Codex state DBs and remove stale thread rows whose rollout paths no longer exist, locally or on a selected remote machine.
