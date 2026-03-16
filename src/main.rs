@@ -5498,13 +5498,13 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             ])
         } else {
             Line::from(vec![
-                Span::styled("c", Style::default().fg(Color::Green)),
+                Span::styled("c/ctrl+c", Style::default().fg(Color::Green)),
                 Span::raw(" copy folder  "),
-                Span::styled("m/x", Style::default().fg(Color::Yellow)),
+                Span::styled("m/x/ctrl+x", Style::default().fg(Color::Yellow)),
                 Span::raw(" cut folder  "),
                 Span::styled("f", Style::default().fg(Color::Green)),
                 Span::raw(" fork branch copy  "),
-                Span::styled("v", Style::default().fg(Color::Green)),
+                Span::styled("v/ctrl+v", Style::default().fg(Color::Green)),
                 Span::raw(" paste  "),
                 Span::styled("M/C", Style::default().fg(Color::Green)),
                 Span::raw(" typed move/copy subtree  "),
@@ -5565,13 +5565,13 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
                 Span::raw(" refresh"),
             ]),
             Line::from(vec![
-                Span::styled("c", Style::default().fg(Color::Green)),
+                Span::styled("c/ctrl+c", Style::default().fg(Color::Green)),
                 Span::raw(" copy clone  "),
-                Span::styled("m/x", Style::default().fg(Color::Yellow)),
+                Span::styled("m/x/ctrl+x", Style::default().fg(Color::Yellow)),
                 Span::raw(" cut/move  "),
                 Span::styled("f", Style::default().fg(Color::Green)),
                 Span::raw(" fork branch copy  "),
-                Span::styled("v", Style::default().fg(Color::Green)),
+                Span::styled("v/ctrl+v", Style::default().fg(Color::Green)),
                 Span::raw(" paste  "),
                 Span::styled("M/C/F", Style::default().fg(Color::Green)),
                 Span::raw(" typed target  "),
@@ -12996,6 +12996,35 @@ mod tests {
         assert!(buffer_contains(backend, "copy"));
         assert!(buffer_contains(backend, "drag"));
         assert!(buffer_contains(backend, "move"));
+    }
+
+    #[test]
+    fn render_status_merges_duplicate_clipboard_shortcuts() {
+        let mut app = empty_test_app();
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Session;
+
+        let backend = TestBackend::new(320, 6);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_status(
+                    frame,
+                    ratatui::layout::Rect {
+                        x: 0,
+                        y: 0,
+                        width: 320,
+                        height: 6,
+                    },
+                    &app,
+                );
+            })
+            .expect("draw");
+
+        let backend = terminal.backend();
+        assert!(buffer_contains(backend, "c/ctrl+c"));
+        assert!(buffer_contains(backend, "m/x/ctrl+x"));
+        assert!(buffer_contains(backend, "v/ctrl+v"));
     }
 
     #[test]
