@@ -277,6 +277,11 @@ Semantics:
 - `fork`: duplicate the chat as a new branch with a fresh session id and fresh fork/start metadata
 - `move`: rewrite the existing session into another folder context
 
+Example:
+
+- `copy` is for "same chat, second location". If you copy a session from `local:/home/pi/gh/app` to `pi:/home/pi/gh/app`, the duplicate carries the same conversation history into the remote folder as another copy of that chat.
+- `fork` is for "continue from here as a new branch". If you fork a session after a useful checkpoint, the new session starts with the same history up to that point, but it becomes a distinct conversation with its own identity and fork metadata.
+
 ### Seamless Browser Copy/Paste
 
 If you do not want to type paths, you do not have to.
