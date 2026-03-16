@@ -271,6 +271,12 @@ Targets can be:
 - a local path, for example `/home/me/work/repo`
 - a machine-qualified path, for example `pi:/home/pi/work/repo`
 
+Semantics:
+
+- `copy`: duplicate the chat into another folder and keep the conversation shape
+- `fork`: duplicate the chat as a new branch with a fresh session id and fresh fork/start metadata
+- `move`: rewrite the existing session into another folder context
+
 ### Seamless Browser Copy/Paste
 
 If you do not want to type paths, you do not have to.
@@ -281,6 +287,7 @@ Browser actions work across connected machines as if everything were local:
 - `m`, `x`, or `Ctrl+X`: cut current selection
 - `f`: prepare a fork of the current selection
 - `v` or `Ctrl+V`: paste into the selected folder
+- `d`: delete the selected session, folder, or folder subtree
 - drag: move into the hovered folder
 - `Ctrl+drag`: copy into the hovered folder
 - dragging a grouped folder preserves that folder as a subtree instead of flattening all sessions into one cwd
