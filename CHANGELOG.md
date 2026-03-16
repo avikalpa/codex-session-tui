@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.26 - 2026-03-16
+
+- Added folder and subtree delete from the browser with the same `d` confirmation flow already used for session delete.
+- Reworked the status bar hints so browser actions are grouped more clearly and duplicate clipboard shortcuts are merged as `c/ctrl+c`, `m/x/ctrl+x`, and `v/ctrl+v`.
+- Expanded the README with a concrete explanation of the difference between `copy` and `fork`.
+
 ## 1.3.25 - 2026-03-16
 
 - Fixed startup thread-index sync so stale SQLite rows that already own the target session id are removed before a rollout-path rekey. This prevents `UNIQUE constraint failed: threads.id` crashes when launching the TUI against previously corrupted local Codex state.
