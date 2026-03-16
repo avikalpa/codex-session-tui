@@ -7974,6 +7974,21 @@ fn sync_thread_record_tx(
     }
 
     if current_rollout_path == rollout_path_s && row_id != session_id {
+        let mut conflict_stmt = tx.prepare(
+            "SELECT rollout_path
+             FROM threads
+             WHERE id = ?1
+             LIMIT 1",
+        )?;
+        let conflicting_rollout = conflict_stmt
+            .query_row(params![session_id], |row| row.get::<_, String>(0))
+            .optional()?;
+        drop(conflict_stmt);
+        if let Some(conflicting_rollout) = conflicting_rollout
+            && conflicting_rollout != current_rollout_path
+        {
+            tx.execute("DELETE FROM threads WHERE id = ?1", params![session_id])?;
+        }
         tx.execute(
             "UPDATE threads SET id = ?1, cwd = ?2, rollout_path = ?3 WHERE rollout_path = ?4",
             params![
@@ -10821,6 +10836,52 @@ mod tests {
         assert_eq!(row.0, "new-id");
         assert_eq!(row.1, "/new/path");
         assert_eq!(row.2, path_to_string(&rollout));
+    }
+
+    #[test]
+    fn sync_thread_record_removes_conflicting_stale_id_row_before_rekey() {
+        let dir = std::env::temp_dir().join(format!("cse-sync-conflict-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let db = dir.join("state_5.sqlite");
+        init_test_state_db(&db);
+
+        let rollout = dir.join("sessions/2026/03/16/current.jsonl");
+        let stale_rollout = dir.join("sessions/2026/03/15/stale.jsonl");
+        let conn = Connection::open(&db).expect("open");
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path, cwd, title, first_user_message) VALUES (?1, ?2, ?3, '', '')",
+            params!["new-id", path_to_string(&stale_rollout), "/stale/path"],
+        )
+        .expect("insert stale");
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path, cwd, title, first_user_message) VALUES (?1, ?2, ?3, '', '')",
+            params!["old-id", path_to_string(&rollout), "/old/path"],
+        )
+        .expect("insert current");
+        drop(conn);
+
+        let changed =
+            sync_thread_record(&db, "new-id", &rollout, "/new/path", &rollout).expect("sync");
+        assert!(changed);
+
+        let conn = Connection::open(&db).expect("open");
+        let rows = conn
+            .prepare("SELECT id, rollout_path, cwd FROM threads ORDER BY rollout_path")
+            .expect("prepare")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .expect("query")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "new-id");
+        assert_eq!(rows[0].1, path_to_string(&rollout));
+        assert_eq!(rows[0].2, "/new/path");
     }
 
     #[test]
