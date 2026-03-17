@@ -21,3 +21,7 @@ Prebuilt binaries are published for:
 - Linux: `x86_64`, `aarch64`, `armv7`
 - macOS: `x86_64`, `aarch64`
 - Windows (MSVC): `x86_64`, `aarch64`
+
+## License
+
+Package code is Apache-2.0. Package documentation is CC BY-SA 4.0.
