@@ -29,6 +29,10 @@ Use a different Codex home:
 CODEX_HOME=/path/to/.codex codex-session-tui
 ```
 
+## License
+
+Code in `2.x` releases is Apache-2.0. Repository documentation is CC BY-SA 4.0. Prior `1.x` releases remain under their original terms.
+
 Non-interactive session operations:
 
 ```bash
