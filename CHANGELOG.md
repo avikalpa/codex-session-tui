@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.3 - 2026-03-19
+
+- Fixed browser folder/project counts so tree rows consistently show subtree session totals instead of mixing direct-project counts with descendant-folder counts.
+
 ## 2.0.2 - 2026-03-19
 
 - Fixed async startup status finalization so the footer switches from `Working... loading sessions` to `Loaded ...` when background loading completes cleanly without repair work.

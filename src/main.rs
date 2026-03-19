@@ -7122,11 +7122,7 @@ fn append_browser_rows(
         },
         depth,
         label: node.name.clone(),
-        count: if let Some(project_idx) = node.project_idx {
-            projects[project_idx].sessions.len()
-        } else {
-            node.session_count
-        },
+        count: node.session_count,
     });
 
     let collapsed = if group_only {
@@ -15645,6 +15641,62 @@ codex_home = "/root/.codex"
 
         assert!(buffer_contains(terminal.backend(), "local [ok] (3)"));
         assert!(buffer_contains(terminal.backend(), "/root/git (3)"));
+    }
+
+    #[test]
+    fn project_rows_show_subtree_session_counts() {
+        let mut app = empty_test_app();
+        app.projects = vec![
+            ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
+                machine_exec_prefix: None,
+                cwd: String::from("/home/pi/gh"),
+                sessions: vec![
+                    sample_session("/tmp/gh-a.jsonl", "/home/pi/gh", "abcdef0"),
+                    sample_session("/tmp/gh-b.jsonl", "/home/pi/gh", "abcdef1"),
+                ],
+            },
+            ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
+                machine_exec_prefix: None,
+                cwd: String::from("/home/pi/gh/codex-session-tui"),
+                sessions: vec![
+                    sample_session(
+                        "/tmp/cst-a.jsonl",
+                        "/home/pi/gh/codex-session-tui",
+                        "abcdef2",
+                    ),
+                    sample_session(
+                        "/tmp/cst-b.jsonl",
+                        "/home/pi/gh/codex-session-tui",
+                        "abcdef3",
+                    ),
+                    sample_session(
+                        "/tmp/cst-c.jsonl",
+                        "/home/pi/gh/codex-session-tui",
+                        "abcdef4",
+                    ),
+                ],
+            },
+        ];
+        app.collapsed_groups.clear();
+        app.collapsed_projects.clear();
+
+        let rows = app.browser_render_rows();
+        let gh_row = rows
+            .iter()
+            .find(|row| match row.kind {
+                BrowserRowKind::Project { project_idx } => {
+                    app.projects[project_idx].cwd == "/home/pi/gh"
+                }
+                _ => false,
+            })
+            .expect("gh row exists");
+        assert_eq!(gh_row.count, 5);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 {
   "name": "codex-session-tui",
-  "version": "2.0.2",
+  "version": "2.0.3",
   "description": "Prebuilt codex-session-tui binaries for macOS, Linux, and Windows.",
   "license": "Apache-2.0",
   "bin": {
