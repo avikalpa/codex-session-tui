@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.2 - 2026-03-19
+
+- Fixed async startup status finalization so the footer switches from `Working... loading sessions` to `Loaded ...` when background loading completes cleanly without repair work.
+
 ## 2.0.1 - 2026-03-19
 
 - Streamed startup and refresh loading so the TUI no longer waits for a full local-plus-remote scan before becoming usable.
