@@ -206,17 +206,7 @@ fn run_app(tui: &mut Tui, app: &mut App) -> Result<()> {
     loop {
         app.poll_startup_load();
         app.poll_search_job();
-
-        // Debounce expensive search filtering: apply only when event queue is idle.
-        if app.search_dirty && !event::poll(Duration::from_millis(0))? {
-            if app.search_query.trim().is_empty() {
-                app.apply_search_filter();
-                app.search_dirty = false;
-            } else {
-                app.maybe_start_search_job();
-                app.search_dirty = false;
-            }
-        }
+        app.process_search_update();
 
         tui.draw(app)?;
 
@@ -280,6 +270,7 @@ fn handle_paste_event(text: String, app: &mut App) {
     if app.search_focused {
         insert_text_at_cursor(&mut app.search_query, &mut app.search_cursor, &text);
         app.search_dirty = true;
+        app.process_search_update();
         return;
     }
     if app.mode == Mode::Input && app.input_focused {
@@ -543,6 +534,8 @@ fn is_on_splitter(
 enum StatusButton {
     Apply,
     Cancel,
+    PrevSession,
+    NextSession,
     PrevHit,
     NextHit,
     SelectAll,
@@ -566,6 +559,10 @@ fn status_buttons(app: &App) -> Vec<StatusButton> {
         return vec![StatusButton::Apply, StatusButton::Cancel];
     }
     let mut search_hit_buttons = Vec::new();
+    if !app.search_query.trim().is_empty() && !app.projects.is_empty() {
+        search_hit_buttons.push(StatusButton::PrevSession);
+        search_hit_buttons.push(StatusButton::NextSession);
+    }
     if !app.search_query.trim().is_empty() && !app.preview_search_matches.is_empty() {
         search_hit_buttons.push(StatusButton::PrevHit);
         search_hit_buttons.push(StatusButton::NextHit);
@@ -623,6 +620,8 @@ fn status_button_label(button: StatusButton) -> &'static str {
     match button {
         StatusButton::Apply => "[Apply]",
         StatusButton::Cancel => "[Cancel]",
+        StatusButton::PrevSession => "[Prev Session]",
+        StatusButton::NextSession => "[Next Session]",
         StatusButton::PrevHit => "[Prev Hit]",
         StatusButton::NextHit => "[Next Hit]",
         StatusButton::SelectAll => "[Select All]",
@@ -648,6 +647,8 @@ fn trigger_status_button(button: StatusButton, app: &mut App) {
             let _ = app.submit_input();
         }
         StatusButton::Cancel => app.cancel_input(),
+        StatusButton::PrevSession => app.focus_prev_search_session(),
+        StatusButton::NextSession => app.focus_next_search_session(),
         StatusButton::PrevHit => app.focus_prev_preview_search_match(),
         StatusButton::NextHit => app.focus_next_preview_search_match(),
         StatusButton::SelectAll => app.select_all_sessions_current_project(),
@@ -894,6 +895,7 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
                 app.search_cursor = 0;
                 app.search_dirty = true;
                 app.status = String::from("Search cleared");
+                app.process_search_update();
             }
             KeyCode::Enter => {
                 app.search_focused = false;
@@ -909,11 +911,13 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
             KeyCode::Backspace => {
                 if delete_char_before_cursor(&mut app.search_query, &mut app.search_cursor) {
                     app.search_dirty = true;
+                    app.process_search_update();
                 }
             }
             KeyCode::Delete => {
                 if delete_char_at_cursor(&mut app.search_query, app.search_cursor) {
                     app.search_dirty = true;
+                    app.process_search_update();
                 }
             }
             KeyCode::Left => {
@@ -942,6 +946,7 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
                         &ch.to_string(),
                     );
                     app.search_dirty = true;
+                    app.process_search_update();
                 }
             }
             _ => {}
@@ -1034,6 +1039,16 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
         KeyCode::Char('/') => {
             app.search_focused = true;
             app.search_cursor = char_count(&app.search_query);
+        }
+        KeyCode::Char('[') => {
+            if !app.search_query.trim().is_empty() {
+                app.focus_prev_search_session();
+            }
+        }
+        KeyCode::Char(']') => {
+            if !app.search_query.trim().is_empty() {
+                app.focus_next_search_session();
+            }
         }
         KeyCode::Char(' ') => {
             if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Session {
@@ -3390,6 +3405,16 @@ impl App {
         self.apply_search_result(result);
     }
 
+    fn process_search_update(&mut self) {
+        if !self.search_dirty {
+            return;
+        }
+        self.search_job_running = false;
+        self.search_result_rx = None;
+        self.apply_search_filter();
+        self.search_dirty = false;
+    }
+
     fn toggle_preview_mode(&mut self) {
         self.preview_mode = match self.preview_mode {
             PreviewMode::Chat => PreviewMode::Events,
@@ -3842,13 +3867,101 @@ impl App {
         true
     }
 
+    fn filtered_search_session_locations(&self) -> Vec<(usize, usize)> {
+        self.projects
+            .iter()
+            .enumerate()
+            .flat_map(|(project_idx, project)| {
+                (0..project.sessions.len()).map(move |session_idx| (project_idx, session_idx))
+            })
+            .collect()
+    }
+
+    fn current_search_session_location(&self) -> Option<(usize, usize)> {
+        if self.browser_cursor == BrowserCursor::Session && self.current_session().is_some() {
+            return Some((self.project_idx, self.session_idx));
+        }
+        let current_path = self
+            .current_preview_session()
+            .map(|session| session.path.clone())?;
+        self.projects
+            .iter()
+            .enumerate()
+            .find_map(|(project_idx, project)| {
+                project
+                    .sessions
+                    .iter()
+                    .position(|session| session.path == current_path)
+                    .map(|session_idx| (project_idx, session_idx))
+            })
+    }
+
+    fn focus_search_session_step(&mut self, step: isize) {
+        if self.search_query.trim().is_empty() {
+            return;
+        }
+        let sessions = self.filtered_search_session_locations();
+        if sessions.is_empty() {
+            self.status = format!("Search '{}' matched 0 sessions", self.search_query);
+            return;
+        }
+
+        let current_idx = self
+            .current_search_session_location()
+            .and_then(|location| sessions.iter().position(|candidate| *candidate == location))
+            .unwrap_or(0);
+        let len = sessions.len();
+        let (next_idx, wrapped) = if step >= 0 {
+            if current_idx + 1 >= len {
+                (0, true)
+            } else {
+                (current_idx + 1, false)
+            }
+        } else if current_idx == 0 {
+            (len.saturating_sub(1), true)
+        } else {
+            (current_idx - 1, false)
+        };
+
+        let (project_idx, session_idx) = sessions[next_idx];
+        self.set_browser_row(BrowserRow {
+            kind: BrowserRowKind::Session {
+                project_idx,
+                session_idx,
+            },
+            depth: 0,
+            label: String::new(),
+            count: 0,
+        });
+        self.preview_search_index = Some(0);
+        self.status = if wrapped {
+            format!(
+                "Wrapped to {} matching session ({}/{})",
+                if step >= 0 { "first" } else { "last" },
+                next_idx + 1,
+                len
+            )
+        } else {
+            format!("Matching session {}/{}", next_idx + 1, len)
+        };
+    }
+
+    fn focus_next_search_session(&mut self) {
+        self.focus_search_session_step(1);
+    }
+
+    fn focus_prev_search_session(&mut self) {
+        self.focus_search_session_step(-1);
+    }
+
     fn focus_next_preview_search_match(&mut self) {
         if !self.prepare_preview_search_navigation_state() {
             return;
         }
+        let total = self.preview_search_matches.len();
         let next = match self.preview_search_index {
             Some(idx) => {
-                if idx + 1 >= self.preview_search_matches.len() {
+                if idx + 1 >= total {
                     0
                 } else {
                     idx + 1
@@ -3856,6 +3969,13 @@ impl App {
             }
             None => 0,
         };
+        if self
+            .preview_search_index
+            .is_some_and(|idx| idx + 1 >= total)
+            && total > 0
+        {
+            self.status = format!("Wrapped to first hit in current session (1/{total})");
+        }
         self.preview_search_index = Some(next);
         self.scroll_preview_match_into_view(next);
     }
@@ -3864,10 +3984,14 @@ impl App {
         if !self.prepare_preview_search_navigation_state() {
             return;
         }
+        let total = self.preview_search_matches.len();
         let prev = match self.preview_search_index.unwrap_or(0) {
-            0 => self.preview_search_matches.len().saturating_sub(1),
+            0 => total.saturating_sub(1),
             idx => idx - 1,
         };
+        if self.preview_search_index == Some(0) && total > 0 {
+            self.status = format!("Wrapped to last hit in current session ({total}/{total})");
+        }
         self.preview_search_index = Some(prev);
         self.scroll_preview_match_into_view(prev);
     }
@@ -4095,27 +4219,6 @@ impl App {
             )?,
             exec_prefix: None,
         })
-    }
-
-    fn maybe_start_search_job(&mut self) {
-        if self.search_job_running
-            || self.search_query.trim().is_empty()
-            || self.all_projects.is_empty()
-        {
-            return;
-        }
-        self.search_job_seq += 1;
-        let seq = self.search_job_seq;
-        let query = self.search_query.clone();
-        let projects = self.all_projects.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.search_result_rx = Some(rx);
-        self.search_job_running = true;
-        self.status = format!("Searching '{}'...", self.search_query);
-        std::thread::spawn(move || {
-            let result = compute_search_filter_result(seq, query, projects);
-            let _ = tx.send(result);
-        });
     }
 
     fn poll_search_job(&mut self) {
@@ -5797,6 +5900,8 @@ fn ansi_index_to_rgb(idx: u8) -> (u8, u8, u8) {
 fn status_button_style(button: StatusButton) -> Style {
     match button {
         StatusButton::Apply
+        | StatusButton::PrevSession
+        | StatusButton::NextSession
         | StatusButton::Move
         | StatusButton::Copy
         | StatusButton::Fork
@@ -5857,6 +5962,10 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" keep results  "),
             Span::styled("esc", Style::default().fg(Color::Red)),
             Span::raw(" close search  "),
+            Span::styled("[/]", Style::default().fg(Color::Cyan)),
+            Span::raw(" prev/next session  "),
+            Span::styled("n/N", Style::default().fg(Color::Cyan)),
+            Span::raw(" prev/next hit  "),
             Span::styled("tab", Style::default().fg(Color::Cyan)),
             Span::raw(" next pane  "),
             Span::styled("shift+tab", Style::default().fg(Color::Cyan)),
@@ -5880,6 +5989,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" top/bottom  "),
             Span::styled("←/→", Style::default().fg(Color::Cyan)),
             Span::raw(" fold/unfold block  "),
+            Span::styled("[/]", Style::default().fg(Color::Cyan)),
+            Span::raw(" prev/next session  "),
             Span::styled("n/N", Style::default().fg(Color::Cyan)),
             Span::raw(" next/prev match  "),
             Span::styled("tab", Style::default().fg(Color::Cyan)),
@@ -5961,8 +6072,12 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
                 Span::raw(" panes  "),
                 Span::styled("/", Style::default().fg(Color::Cyan)),
                 Span::raw(" search  "),
+                Span::styled("[/]", Style::default().fg(Color::Cyan)),
+                Span::raw(" prev/next session  "),
+                Span::styled("n/N", Style::default().fg(Color::Cyan)),
+                Span::raw(" prev/next hit  "),
                 Span::styled("buttons", Style::default().fg(Color::Cyan)),
-                Span::raw(" preview hits  "),
+                Span::raw(" search nav  "),
                 Span::styled("f5/ctrl+r", Style::default().fg(Color::Yellow)),
                 Span::raw(" refresh"),
             ]),
@@ -5986,6 +6101,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
                 Span::raw(" open  "),
                 Span::styled("/", Style::default().fg(Color::Cyan)),
                 Span::raw(" search  "),
+                Span::styled("[/]", Style::default().fg(Color::Cyan)),
+                Span::raw(" prev/next session  "),
                 Span::styled("n/N", Style::default().fg(Color::Cyan)),
                 Span::raw(" next/prev hit  "),
                 Span::styled("f5/ctrl+r", Style::default().fg(Color::Yellow)),
@@ -13774,6 +13891,76 @@ mod tests {
     }
 
     #[test]
+    fn search_typing_updates_results_immediately() {
+        let mut app = empty_test_app();
+        app.search_focused = true;
+        app.search_query = String::from("litel");
+        app.search_cursor = char_count(&app.search_query);
+        app.all_projects = vec![
+            ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
+                machine_exec_prefix: None,
+                cwd: String::from("/repo/litellm"),
+                sessions: vec![SessionSummary {
+                    path: PathBuf::from("/tmp/a.jsonl"),
+                    storage_path: path_to_string(Path::new(&PathBuf::from("/tmp/a.jsonl"))),
+                    machine_name: String::from("local"),
+                    machine_target: None,
+                    machine_codex_home: None,
+                    machine_exec_prefix: None,
+                    file_name: String::from("a.jsonl"),
+                    id: String::from("a"),
+                    cwd: String::from("/repo/litellm"),
+                    started_at: String::from("2026-01-01T00:00:00Z"),
+                    modified_epoch: 1,
+                    event_count: 1,
+                    user_message_count: 1,
+                    assistant_message_count: 1,
+                    search_blob: String::from("litellm container config"),
+                }],
+            },
+            ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
+                machine_exec_prefix: None,
+                cwd: String::from("/repo/other"),
+                sessions: vec![SessionSummary {
+                    path: PathBuf::from("/tmp/b.jsonl"),
+                    storage_path: path_to_string(Path::new(&PathBuf::from("/tmp/b.jsonl"))),
+                    machine_name: String::from("local"),
+                    machine_target: None,
+                    machine_codex_home: None,
+                    machine_exec_prefix: None,
+                    file_name: String::from("b.jsonl"),
+                    id: String::from("b"),
+                    cwd: String::from("/repo/other"),
+                    started_at: String::from("2026-01-01T00:00:00Z"),
+                    modified_epoch: 1,
+                    event_count: 1,
+                    user_message_count: 1,
+                    assistant_message_count: 1,
+                    search_blob: String::from("something else"),
+                }],
+            },
+        ];
+
+        handle_normal_mode(
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            &mut app,
+        )
+        .expect("type");
+
+        assert_eq!(app.search_query, "litell");
+        assert!(!app.search_dirty);
+        assert_eq!(app.projects.len(), 1);
+        assert_eq!(app.projects[0].cwd, "/repo/litellm");
+        assert!(app.status.contains("Search 'litell' matched 1 session"));
+    }
+
+    #[test]
     fn render_status_shows_alt_arrow_pane_hints() {
         let app = empty_test_app();
 
@@ -13819,9 +14006,7 @@ mod tests {
         assert!(!quit);
         assert!(!app.search_focused);
         assert!(app.search_query.is_empty());
-        assert!(app.search_dirty);
-
-        app.apply_search_filter();
+        assert!(!app.search_dirty);
         assert!(!app.search_visible());
         assert_eq!(app.projects.len(), 1);
         assert_eq!(app.status, "Search cleared");
@@ -13920,6 +14105,14 @@ mod tests {
         app.focus = Focus::Projects;
         app.browser_cursor = BrowserCursor::Session;
         app.search_query = String::from("johyperr");
+        app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            cwd: String::from("/repo"),
+            sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
+        }];
         app.preview_search_matches = vec![
             PreviewMatch {
                 row: 10,
@@ -13936,7 +14129,7 @@ mod tests {
         ];
         app.preview_search_index = Some(0);
 
-        let backend = TestBackend::new(320, 6);
+        let backend = TestBackend::new(420, 6);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|frame| {
@@ -13954,6 +14147,8 @@ mod tests {
             .expect("draw");
 
         let backend = terminal.backend();
+        assert!(buffer_contains(backend, "[Prev Session]"));
+        assert!(buffer_contains(backend, "[Next Session]"));
         assert!(buffer_contains(backend, "[Prev Hit]"));
         assert!(buffer_contains(backend, "[Next Hit]"));
         assert!(buffer_contains(backend, "next/prev hit"));
@@ -14015,6 +14210,88 @@ mod tests {
 
         handle_normal_mode(KeyEvent::from(KeyCode::Char('N')), &mut app).expect("key");
         assert_eq!(app.preview_search_index, Some(0));
+    }
+
+    #[test]
+    fn search_hit_navigation_wraps_with_status_message() {
+        let mut app = empty_test_app();
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Session;
+        app.search_query = String::from("johyperr");
+        app.preview_search_matches = vec![
+            PreviewMatch {
+                row: 10,
+                col_start: 3,
+                col_end: 11,
+                is_primary: true,
+            },
+            PreviewMatch {
+                row: 25,
+                col_start: 1,
+                col_end: 9,
+                is_primary: false,
+            },
+        ];
+        app.preview_search_index = Some(1);
+        app.panes.preview.height = 12;
+
+        handle_normal_mode(KeyEvent::from(KeyCode::Char('n')), &mut app).expect("key");
+        assert_eq!(app.preview_search_index, Some(0));
+        assert!(
+            app.status
+                .contains("Wrapped to first hit in current session")
+        );
+
+        handle_normal_mode(KeyEvent::from(KeyCode::Char('N')), &mut app).expect("key");
+        assert_eq!(app.preview_search_index, Some(1));
+        assert!(
+            app.status
+                .contains("Wrapped to last hit in current session")
+        );
+    }
+
+    #[test]
+    fn search_session_navigation_moves_between_matching_sessions() {
+        let mut app = empty_test_app();
+        app.search_query = String::from("litellm");
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Session;
+        app.projects = vec![
+            ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
+                machine_exec_prefix: None,
+                cwd: String::from("/repo/a"),
+                sessions: vec![sample_session("/tmp/a.jsonl", "/repo/a", "a")],
+            },
+            ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
+                machine_exec_prefix: None,
+                cwd: String::from("/repo/b"),
+                sessions: vec![sample_session("/tmp/b.jsonl", "/repo/b", "b")],
+            },
+        ];
+        app.all_projects = app.projects.clone();
+        app.project_idx = 0;
+        app.session_idx = 0;
+
+        handle_normal_mode(KeyEvent::from(KeyCode::Char(']')), &mut app).expect("next session");
+        assert_eq!(app.project_idx, 1);
+        assert_eq!(app.session_idx, 0);
+        assert!(app.status.contains("Matching session 2/2"));
+
+        handle_normal_mode(KeyEvent::from(KeyCode::Char(']')), &mut app).expect("wrap session");
+        assert_eq!(app.project_idx, 0);
+        assert_eq!(app.session_idx, 0);
+        assert!(app.status.contains("Wrapped to first matching session"));
+
+        handle_normal_mode(KeyEvent::from(KeyCode::Char('[')), &mut app).expect("prev session");
+        assert_eq!(app.project_idx, 1);
+        assert_eq!(app.session_idx, 0);
+        assert!(app.status.contains("Wrapped to last matching session"));
     }
 
     #[test]
@@ -14364,7 +14641,7 @@ mod tests {
         app.focus = Focus::Projects;
         app.browser_cursor = BrowserCursor::Session;
 
-        let backend = TestBackend::new(160, 4);
+        let backend = TestBackend::new(420, 6);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|frame| {
@@ -14373,8 +14650,8 @@ mod tests {
                     ratatui::layout::Rect {
                         x: 0,
                         y: 0,
-                        width: 160,
-                        height: 4,
+                        width: 420,
+                        height: 6,
                     },
                     &app,
                 );
@@ -15374,7 +15651,7 @@ codex_home = "/root/.codex"
         handle_paste_event(String::from(" router"), &mut app);
 
         assert_eq!(app.search_query, "open router");
-        assert!(app.search_dirty);
+        assert!(!app.search_dirty);
     }
 
     #[test]
