@@ -204,10 +204,18 @@ fn duplicate_rewrite_flags(action: Action) -> (bool, bool) {
 
 fn run_app(tui: &mut Tui, app: &mut App) -> Result<()> {
     loop {
+        app.poll_startup_load();
+        app.poll_search_job();
+
         // Debounce expensive search filtering: apply only when event queue is idle.
         if app.search_dirty && !event::poll(Duration::from_millis(0))? {
-            app.apply_search_filter();
-            app.search_dirty = false;
+            if app.search_query.trim().is_empty() {
+                app.apply_search_filter();
+                app.search_dirty = false;
+            } else {
+                app.maybe_start_search_job();
+                app.search_dirty = false;
+            }
         }
 
         tui.draw(app)?;
@@ -535,6 +543,8 @@ fn is_on_splitter(
 enum StatusButton {
     Apply,
     Cancel,
+    PrevHit,
+    NextHit,
     SelectAll,
     Invert,
     Move,
@@ -555,19 +565,25 @@ fn status_buttons(app: &App) -> Vec<StatusButton> {
     if app.mode == Mode::Input {
         return vec![StatusButton::Apply, StatusButton::Cancel];
     }
+    let mut search_hit_buttons = Vec::new();
+    if !app.search_query.trim().is_empty() && !app.preview_search_matches.is_empty() {
+        search_hit_buttons.push(StatusButton::PrevHit);
+        search_hit_buttons.push(StatusButton::NextHit);
+    }
     if app.focus == Focus::Projects
         && matches!(
             app.browser_cursor,
             BrowserCursor::Project | BrowserCursor::Group
         )
     {
-        let mut buttons = vec![
+        let mut buttons = search_hit_buttons;
+        buttons.extend([
             StatusButton::ProjectRename,
             StatusButton::ProjectCopy,
             StatusButton::AddRemote,
             StatusButton::Refresh,
             StatusButton::Quit,
-        ];
+        ]);
         if app.selected_remote_machine().is_some() {
             buttons.insert(1, StatusButton::DeleteRemote);
         } else {
@@ -576,7 +592,8 @@ fn status_buttons(app: &App) -> Vec<StatusButton> {
         return buttons;
     }
     if app.focus == Focus::Projects && app.browser_cursor == BrowserCursor::Session {
-        return vec![
+        let mut buttons = search_hit_buttons;
+        buttons.extend([
             StatusButton::SelectAll,
             StatusButton::Invert,
             StatusButton::Move,
@@ -586,9 +603,11 @@ fn status_buttons(app: &App) -> Vec<StatusButton> {
             StatusButton::Delete,
             StatusButton::Refresh,
             StatusButton::Quit,
-        ];
+        ]);
+        return buttons;
     }
-    vec![
+    let mut buttons = search_hit_buttons;
+    buttons.extend([
         StatusButton::Move,
         StatusButton::Copy,
         StatusButton::Fork,
@@ -596,13 +615,16 @@ fn status_buttons(app: &App) -> Vec<StatusButton> {
         StatusButton::Delete,
         StatusButton::Refresh,
         StatusButton::Quit,
-    ]
+    ]);
+    buttons
 }
 
 fn status_button_label(button: StatusButton) -> &'static str {
     match button {
         StatusButton::Apply => "[Apply]",
         StatusButton::Cancel => "[Cancel]",
+        StatusButton::PrevHit => "[Prev Hit]",
+        StatusButton::NextHit => "[Next Hit]",
         StatusButton::SelectAll => "[Select All]",
         StatusButton::Invert => "[Invert]",
         StatusButton::Move => "[Move]",
@@ -626,6 +648,8 @@ fn trigger_status_button(button: StatusButton, app: &mut App) {
             let _ = app.submit_input();
         }
         StatusButton::Cancel => app.cancel_input(),
+        StatusButton::PrevHit => app.focus_prev_preview_search_match(),
+        StatusButton::NextHit => app.focus_next_preview_search_match(),
         StatusButton::SelectAll => app.select_all_sessions_current_project(),
         StatusButton::Invert => app.invert_sessions_selection_current_project(),
         StatusButton::Move => app.start_action(Action::Move),
@@ -1188,7 +1212,11 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
             }
         }
         KeyCode::Char('n') => {
-            if app.focus == Focus::Preview {
+            if app.focus == Focus::Preview
+                || (app.focus == Focus::Projects
+                    && app.browser_cursor == BrowserCursor::Session
+                    && !app.search_query.trim().is_empty())
+            {
                 app.focus_next_preview_search_match();
             } else if app.focus == Focus::Projects
                 && matches!(
@@ -1200,7 +1228,11 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
             }
         }
         KeyCode::Char('N') => {
-            if app.focus == Focus::Preview {
+            if app.focus == Focus::Preview
+                || (app.focus == Focus::Projects
+                    && app.browser_cursor == BrowserCursor::Session
+                    && !app.search_query.trim().is_empty())
+            {
                 app.focus_prev_preview_search_match();
             }
         }
@@ -1598,6 +1630,9 @@ struct App {
     search_cursor: usize,
     search_focused: bool,
     search_dirty: bool,
+    search_job_seq: u64,
+    search_job_running: bool,
+    search_result_rx: Option<std::sync::mpsc::Receiver<SearchFilterResult>>,
     preview_mode: PreviewMode,
     preview_selecting: bool,
     preview_mouse_down_pos: Option<(usize, usize)>,
@@ -1637,6 +1672,8 @@ struct App {
     action_progress_op: Option<SessionActionProgress>,
     progress_op: Option<BrowserTransferProgress>,
     delete_progress_op: Option<DeleteProgress>,
+    startup_load_rx: Option<std::sync::mpsc::Receiver<Result<StartupLoadResult, String>>>,
+    startup_loading: bool,
 }
 
 #[derive(Clone)]
@@ -1669,6 +1706,15 @@ struct SessionActionProgress {
 }
 
 #[derive(Clone)]
+struct SearchFilterResult {
+    seq: u64,
+    query: String,
+    projects: Vec<ProjectBucket>,
+    total_matches: usize,
+    first_session_path: Option<PathBuf>,
+}
+
+#[derive(Clone)]
 struct DeleteProgress {
     action: Action,
     targets: Vec<SessionSummary>,
@@ -1690,6 +1736,8 @@ struct RenderedPreviewCache {
     width: usize,
     folded: HashSet<usize>,
     data: Arc<PreviewData>,
+    search_query: Option<String>,
+    search_matches: Vec<PreviewMatch>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -1732,6 +1780,14 @@ enum RemoteMachineStatus {
     Healthy,
     Cached,
     Error,
+}
+
+struct StartupLoadResult {
+    all_projects: Vec<ProjectBucket>,
+    remote_states: BTreeMap<String, RemoteMachineState>,
+    repaired_count: usize,
+    repaired_id_count: usize,
+    synced_threads: usize,
 }
 
 impl App {
@@ -2282,9 +2338,6 @@ impl App {
         let config = load_app_config(&config_path)?;
         let sessions_root = codex_home.join("sessions");
         let state_db_path = resolve_state_db_path(&codex_home);
-        let cwd_base = env::current_dir().context("failed to resolve current directory")?;
-        let repaired_count = repair_session_cwds(&sessions_root, &cwd_base)?;
-        let repaired_id_count = repair_session_ids(&sessions_root)?;
 
         let mut app = Self {
             config_path,
@@ -2310,6 +2363,9 @@ impl App {
             search_cursor: 0,
             search_focused: false,
             search_dirty: false,
+            search_job_seq: 0,
+            search_job_running: false,
+            search_result_rx: None,
             preview_mode: PreviewMode::Chat,
             preview_selecting: false,
             preview_mouse_down_pos: None,
@@ -2349,29 +2405,93 @@ impl App {
             action_progress_op: None,
             progress_op: None,
             delete_progress_op: None,
+            startup_load_rx: None,
+            startup_loading: false,
         };
 
-        app.reload_mode(true, include_remote_scan)?;
-        let synced_threads = app.sync_state_index()?;
-        if repaired_count > 0 || repaired_id_count > 0 || synced_threads > 0 {
-            app.status = format!(
-                "Loaded {} projects, repaired {} cwd(s), repaired {} id(s), synced {} thread row(s)",
-                app.projects.len(),
-                repaired_count,
-                repaired_id_count,
-                synced_threads
-            );
+        if include_remote_scan {
+            app.startup_loading = true;
+            app.status = String::from("Working... loading sessions");
+            let config = app.config.clone();
+            let sessions_root = app.sessions_root.clone();
+            let state_db_path = app.state_db_path.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.startup_load_rx = Some(rx);
+            std::thread::spawn(move || {
+                let result = load_startup_state(config, sessions_root, state_db_path, true)
+                    .map_err(|err| format!("{err:#}"));
+                let _ = tx.send(result);
+            });
+            Ok(app)
+        } else {
+            let cwd_base = env::current_dir().context("failed to resolve current directory")?;
+            let repaired_count = repair_session_cwds(&app.sessions_root, &cwd_base)?;
+            let repaired_id_count = repair_session_ids(&app.sessions_root)?;
+            let (all_projects, remote_states) = scan_all_projects_from_config(
+                &app.config,
+                &app.sessions_root,
+                &BTreeMap::new(),
+                true,
+                false,
+            )?;
+            app.apply_scanned_projects(all_projects, remote_states, false);
+            let synced_threads = app.sync_state_index()?;
+            if repaired_count > 0 || repaired_id_count > 0 || synced_threads > 0 {
+                app.status = format!(
+                    "Loaded {} projects, repaired {} cwd(s), repaired {} id(s), synced {} thread row(s)",
+                    app.projects.len(),
+                    repaired_count,
+                    repaired_id_count,
+                    synced_threads
+                );
+            }
+            Ok(app)
         }
-        Ok(app)
     }
 
     fn reload(&mut self, force_remote_scan: bool) -> Result<()> {
         self.reload_mode(force_remote_scan, true)
     }
 
-    fn reload_mode(&mut self, force_remote_scan: bool, include_remote_scan: bool) -> Result<()> {
-        let had_projects_before = !self.projects.is_empty();
-        self.all_projects = self.scan_all_projects(force_remote_scan, include_remote_scan)?;
+    fn poll_startup_load(&mut self) {
+        let Some(rx) = &self.startup_load_rx else {
+            return;
+        };
+        let Ok(result) = rx.try_recv() else {
+            return;
+        };
+        self.startup_load_rx = None;
+        self.startup_loading = false;
+        match result {
+            Ok(result) => {
+                self.apply_scanned_projects(result.all_projects, result.remote_states, false);
+                if result.repaired_count > 0
+                    || result.repaired_id_count > 0
+                    || result.synced_threads > 0
+                {
+                    self.status = format!(
+                        "Loaded {} projects, repaired {} cwd(s), repaired {} id(s), synced {} thread row(s)",
+                        self.projects.len(),
+                        result.repaired_count,
+                        result.repaired_id_count,
+                        result.synced_threads
+                    );
+                }
+            }
+            Err(err) => self.status = format!("Startup load failed: {err}"),
+        }
+    }
+
+    fn apply_scanned_projects(
+        &mut self,
+        all_projects: Vec<ProjectBucket>,
+        remote_states: BTreeMap<String, RemoteMachineState>,
+        had_projects_before: bool,
+    ) {
+        self.all_projects = all_projects;
+        self.remote_states = remote_states;
+        self.search_job_running = false;
+        self.search_result_rx = None;
         self.prune_selected_sessions();
         if self.search_query.trim().is_empty() {
             self.projects = self.all_projects.clone();
@@ -2386,14 +2506,14 @@ impl App {
                 self.collapse_all_projects();
             }
         } else {
-            self.apply_search_filter();
+            self.search_dirty = true;
         }
 
         if self.projects.is_empty() {
             self.project_idx = 0;
             self.session_idx = 0;
             self.status = format!("No sessions found under {}", self.sessions_root.display());
-            return Ok(());
+            return;
         }
 
         self.project_idx = self.project_idx.min(self.projects.len().saturating_sub(1));
@@ -2408,11 +2528,23 @@ impl App {
             self.browser_cursor = BrowserCursor::Project;
         }
 
-        self.status = format!("Loaded {} projects", self.projects.len());
-        if let Some(summary) = self.remote_health_summary() {
-            self.status.push_str(&format!("  {summary}"));
+        if self.search_query.trim().is_empty() {
+            self.status = format!("Loaded {} projects", self.projects.len());
+            if let Some(summary) = self.remote_health_summary() {
+                self.status.push_str(&format!("  {summary}"));
+            }
         }
         self.ensure_selection_visible();
+    }
+
+    fn reload_mode(&mut self, force_remote_scan: bool, include_remote_scan: bool) -> Result<()> {
+        let had_projects_before = !self.projects.is_empty();
+        let (all_projects, remote_states) =
+            self.scan_all_projects(force_remote_scan, include_remote_scan)?;
+        self.apply_scanned_projects(all_projects, remote_states, had_projects_before);
+        if !self.search_query.trim().is_empty() {
+            self.apply_search_filter();
+        }
         Ok(())
     }
 
@@ -2425,64 +2557,24 @@ impl App {
         &mut self,
         force_remote_scan: bool,
         include_remote_scan: bool,
-    ) -> Result<Vec<ProjectBucket>> {
-        let mut all_projects = scan_local_sessions(&self.sessions_root)?;
-        let mut states = BTreeMap::new();
-        if include_remote_scan {
-            for machine in &self.config.machines {
-                let previous = self
-                    .remote_states
-                    .get(&machine.name)
-                    .cloned()
-                    .unwrap_or_default();
-                let next = self.scan_remote_machine(machine, &previous, force_remote_scan);
-                all_projects.extend(next.cached_projects.iter().cloned());
-                states.insert(machine.name.clone(), next);
-            }
-        }
-        self.remote_states = states;
-        all_projects.sort_by(|a, b| {
-            a.machine_name
-                .cmp(&b.machine_name)
-                .then_with(|| a.cwd.cmp(&b.cwd))
-        });
-        Ok(all_projects)
+    ) -> Result<(Vec<ProjectBucket>, BTreeMap<String, RemoteMachineState>)> {
+        scan_all_projects_from_config(
+            &self.config,
+            &self.sessions_root,
+            &self.remote_states,
+            force_remote_scan,
+            include_remote_scan,
+        )
     }
 
+    #[allow(dead_code)]
     fn scan_remote_machine(
         &self,
         machine: &ConfigMachine,
         previous: &RemoteMachineState,
         force_remote_scan: bool,
     ) -> RemoteMachineState {
-        let now = Instant::now();
-        if !force_remote_scan
-            && previous
-                .last_scan_at
-                .is_some_and(|last| now.duration_since(last) < REMOTE_SCAN_CACHE_TTL)
-        {
-            return previous.clone();
-        }
-        match scan_remote_sessions(machine) {
-            Ok(projects) => RemoteMachineState {
-                status: RemoteMachineStatus::Healthy,
-                last_error: None,
-                cached_projects: projects,
-                last_scan_at: Some(now),
-            },
-            Err(err) if !previous.cached_projects.is_empty() => RemoteMachineState {
-                status: RemoteMachineStatus::Cached,
-                last_error: Some(err.to_string()),
-                cached_projects: previous.cached_projects.clone(),
-                last_scan_at: previous.last_scan_at.or(Some(now)),
-            },
-            Err(err) => RemoteMachineState {
-                status: RemoteMachineStatus::Error,
-                last_error: Some(err.to_string()),
-                cached_projects: Vec::new(),
-                last_scan_at: Some(now),
-            },
-        }
+        scan_remote_machine_with_previous(machine, previous, force_remote_scan)
     }
 
     fn remote_status_for_machine(&self, machine_name: &str) -> RemoteMachineStatus {
@@ -2871,6 +2963,7 @@ impl App {
             }
         }
         self.clamp_session_idx();
+        self.sync_search_preview_target();
         self.note_browser_navigation();
         self.ensure_selection_visible();
     }
@@ -3040,8 +3133,36 @@ impl App {
         self.current_preview_session_at(Instant::now())
     }
 
+    fn search_preview_context_session(&self) -> Option<SessionSummary> {
+        if self.search_query.trim().is_empty() {
+            return None;
+        }
+        match self.browser_cursor {
+            BrowserCursor::Session => self.current_session().cloned(),
+            BrowserCursor::Project => self.current_project()?.sessions.first().cloned(),
+            BrowserCursor::Group => self
+                .selected_group_path
+                .as_deref()
+                .and_then(|path| self.group_prefix_target(path))
+                .and_then(|sessions| sessions.into_iter().next()),
+        }
+    }
+
+    fn sync_search_preview_target(&mut self) {
+        if self.search_query.trim().is_empty() {
+            self.pending_preview_search_jump = None;
+            return;
+        }
+        self.pending_preview_search_jump = self
+            .search_preview_context_session()
+            .map(|session| (session.path, self.search_query.clone()));
+    }
+
     fn current_preview_session_at(&self, now: Instant) -> Option<SessionSummary> {
-        let current = self.current_session().cloned();
+        let current = self
+            .current_session()
+            .cloned()
+            .or_else(|| self.search_preview_context_session());
         if self.focus == Focus::Preview {
             return current;
         }
@@ -3108,86 +3229,12 @@ impl App {
             self.search_dirty = false;
             return;
         }
-
-        let query = self.search_query.to_lowercase();
-        let mut filtered = Vec::new();
-        let mut total_matches = 0usize;
-
-        for project in &self.all_projects {
-            let mut scored: Vec<(i64, SessionSummary)> = Vec::new();
-            for session in &project.sessions {
-                if let Some(score) = search_score(
-                    &query,
-                    &session.search_blob,
-                    &project.cwd,
-                    &session.file_name,
-                    &session.id,
-                ) {
-                    scored.push((score, session.clone()));
-                }
-            }
-
-            if !scored.is_empty() {
-                total_matches += scored.len();
-                scored.sort_by(|a, b| {
-                    b.0.cmp(&a.0)
-                        .then_with(|| b.1.started_at.cmp(&a.1.started_at))
-                });
-                let best_score = scored.first().map(|(score, _)| *score).unwrap_or(i64::MIN);
-                filtered.push((
-                    best_score,
-                    ProjectBucket {
-                        machine_name: project.machine_name.clone(),
-                        machine_target: project.machine_target.clone(),
-                        machine_codex_home: project.machine_codex_home.clone(),
-                        machine_exec_prefix: project.machine_exec_prefix.clone(),
-                        cwd: project.cwd.clone(),
-                        sessions: scored.into_iter().map(|(_, s)| s).collect(),
-                    },
-                ));
-            }
-        }
-
-        filtered.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cwd.cmp(&b.1.cwd)));
-        self.projects = filtered.into_iter().map(|(_, project)| project).collect();
-        self.refresh_browser_short_ids();
-        self.project_idx = 0;
-        self.session_idx = 0;
-        self.browser_cursor = BrowserCursor::Project;
-        self.selected_group_path = None;
-        self.collapsed_groups =
-            default_collapsed_group_paths(&self.projects, &self.config.virtual_folders);
-        if let Some(first_project) = self.projects.first() {
-            if let Some(first_session) = first_project.sessions.first() {
-                self.browser_cursor = BrowserCursor::Session;
-                self.collapsed_projects
-                    .remove(&project_bucket_key(first_project));
-                self.collapsed_projects.remove(&first_project.cwd);
-                expand_group_ancestors_for_project(
-                    &self.projects,
-                    &mut self.collapsed_groups,
-                    &first_project.cwd,
-                );
-                self.pending_preview_search_jump =
-                    Some((first_session.path.clone(), self.search_query.clone()));
-            } else {
-                self.pending_preview_search_jump = None;
-            }
-        } else {
-            self.pending_preview_search_jump = None;
-        }
-        self.project_scroll = 0;
-        self.session_scroll = 0;
-        self.preview_scroll = 0;
-        self.note_browser_navigation();
-        self.ensure_selection_visible();
-        self.status = format!(
-            "Search '{}' matched {} session(s) in {} project(s)",
-            self.search_query,
-            total_matches,
-            self.projects.len()
+        let result = compute_search_filter_result(
+            self.search_job_seq,
+            self.search_query.clone(),
+            self.all_projects.clone(),
         );
-        self.search_dirty = false;
+        self.apply_search_result(result);
     }
 
     fn toggle_preview_mode(&mut self) {
@@ -3358,9 +3405,46 @@ impl App {
                 width: inner_width,
                 folded,
                 data: Arc::clone(&data),
+                search_query: None,
+                search_matches: Vec::new(),
             },
         );
         Ok(data)
+    }
+
+    fn preview_match_positions_cached(
+        &mut self,
+        session: &SessionSummary,
+        mode: PreviewMode,
+        inner_width: usize,
+        query: &str,
+    ) -> Result<Vec<PreviewMatch>> {
+        let preview = self.preview_for_session(session, mode, inner_width)?;
+        let folded = self
+            .preview_folded
+            .get(&session.path)
+            .cloned()
+            .unwrap_or_else(|| {
+                self.preview_cache
+                    .get(&session.path)
+                    .map(|cached| default_folded_turns(&coalesce_chat_turns(&cached.turns)))
+                    .unwrap_or_default()
+            });
+        let entry = self
+            .rendered_preview_cache
+            .get_mut(&session.path)
+            .ok_or_else(|| anyhow!("rendered preview cache missing"))?;
+        if entry.mode == mode
+            && entry.width == inner_width
+            && entry.folded == folded
+            && entry.search_query.as_deref() == Some(query)
+        {
+            return Ok(entry.search_matches.clone());
+        }
+        let matches = preview_match_positions(&preview, query);
+        entry.search_query = Some(query.to_string());
+        entry.search_matches = matches.clone();
+        Ok(matches)
     }
 
     fn toggle_fold_by_row(&mut self, row: usize) {
@@ -3568,12 +3652,55 @@ impl App {
         }
     }
 
-    fn focus_next_preview_search_match(&mut self) {
+    fn prepare_preview_search_navigation_state(&mut self) -> bool {
+        if self.search_query.trim().is_empty() {
+            self.preview_search_matches.clear();
+            self.preview_search_index = None;
+            return false;
+        }
+        let Some(session) = self.current_preview_session() else {
+            return !self.preview_search_matches.is_empty();
+        };
+        let inner_width = self.panes.preview.width.saturating_sub(2) as usize;
+        let Ok(preview) = self.preview_for_session(&session, self.preview_mode, inner_width) else {
+            self.preview_search_matches.clear();
+            self.preview_search_index = None;
+            self.status = String::from("Failed to prepare preview search state");
+            return false;
+        };
+        let session_changed = self.preview_session_path.as_ref() != Some(&session.path);
+        self.preview_header_rows = preview.header_rows.clone();
+        self.preview_session_path = Some(session.path.clone());
+        let query = self.search_query.clone();
+        self.preview_search_matches = self
+            .preview_match_positions_cached(&session, self.preview_mode, inner_width, &query)
+            .unwrap_or_default();
         if self.preview_search_matches.is_empty() {
+            self.preview_search_index = None;
+            return false;
+        }
+        if session_changed
+            || self
+                .preview_search_index
+                .is_none_or(|idx| idx >= self.preview_search_matches.len())
+        {
+            self.preview_search_index = Some(0);
+        }
+        true
+    }
+
+    fn focus_next_preview_search_match(&mut self) {
+        if !self.prepare_preview_search_navigation_state() {
             return;
         }
         let next = match self.preview_search_index {
-            Some(idx) => (idx + 1).min(self.preview_search_matches.len().saturating_sub(1)),
+            Some(idx) => {
+                if idx + 1 >= self.preview_search_matches.len() {
+                    0
+                } else {
+                    idx + 1
+                }
+            }
             None => 0,
         };
         self.preview_search_index = Some(next);
@@ -3581,10 +3708,13 @@ impl App {
     }
 
     fn focus_prev_preview_search_match(&mut self) {
-        if self.preview_search_matches.is_empty() {
+        if !self.prepare_preview_search_navigation_state() {
             return;
         }
-        let prev = self.preview_search_index.unwrap_or(0).saturating_sub(1);
+        let prev = match self.preview_search_index.unwrap_or(0) {
+            0 => self.preview_search_matches.len().saturating_sub(1),
+            idx => idx - 1,
+        };
         self.preview_search_index = Some(prev);
         self.scroll_preview_match_into_view(prev);
     }
@@ -3812,6 +3942,84 @@ impl App {
             )?,
             exec_prefix: None,
         })
+    }
+
+    fn maybe_start_search_job(&mut self) {
+        if self.search_job_running
+            || self.search_query.trim().is_empty()
+            || self.all_projects.is_empty()
+        {
+            return;
+        }
+        self.search_job_seq += 1;
+        let seq = self.search_job_seq;
+        let query = self.search_query.clone();
+        let projects = self.all_projects.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.search_result_rx = Some(rx);
+        self.search_job_running = true;
+        self.status = format!("Searching '{}'...", self.search_query);
+        std::thread::spawn(move || {
+            let result = compute_search_filter_result(seq, query, projects);
+            let _ = tx.send(result);
+        });
+    }
+
+    fn poll_search_job(&mut self) {
+        let Some(rx) = &self.search_result_rx else {
+            return;
+        };
+        let Ok(result) = rx.try_recv() else {
+            return;
+        };
+        self.search_job_running = false;
+        self.search_result_rx = None;
+        if result.seq != self.search_job_seq || result.query != self.search_query {
+            return;
+        }
+        self.apply_search_result(result);
+    }
+
+    fn apply_search_result(&mut self, result: SearchFilterResult) {
+        self.projects = result.projects;
+        self.refresh_browser_short_ids();
+        self.project_idx = 0;
+        self.session_idx = 0;
+        self.browser_cursor = BrowserCursor::Project;
+        self.selected_group_path = None;
+        self.collapsed_groups =
+            default_collapsed_group_paths(&self.projects, &self.config.virtual_folders);
+        if let Some(first_project) = self.projects.first() {
+            if let Some(first_session_path) = result.first_session_path {
+                self.browser_cursor = BrowserCursor::Session;
+                self.collapsed_projects
+                    .remove(&project_bucket_key(first_project));
+                self.collapsed_projects.remove(&first_project.cwd);
+                expand_group_ancestors_for_project(
+                    &self.projects,
+                    &mut self.collapsed_groups,
+                    &first_project.cwd,
+                );
+                self.pending_preview_search_jump =
+                    Some((first_session_path, self.search_query.clone()));
+            } else {
+                self.pending_preview_search_jump = None;
+            }
+        } else {
+            self.pending_preview_search_jump = None;
+        }
+        self.project_scroll = 0;
+        self.session_scroll = 0;
+        self.preview_scroll = 0;
+        self.note_browser_navigation();
+        self.ensure_selection_visible();
+        self.status = format!(
+            "Search '{}' matched {} session(s) in {} project(s)",
+            self.search_query,
+            result.total_matches,
+            self.projects.len()
+        );
+        self.search_dirty = false;
     }
 
     fn resolve_virtual_folder_target(&self, raw: &str) -> Result<MachineTargetSpec> {
@@ -4903,28 +5111,62 @@ fn session_id_suffix(id: &str, width: usize) -> String {
     chars[start..].iter().collect::<String>()
 }
 
+fn session_id_suffix_from_chars(chars: &[char], width: usize) -> String {
+    let start = chars.len().saturating_sub(width);
+    chars[start..].iter().collect::<String>()
+}
+
 fn shortest_unique_session_suffixes(projects: &[ProjectBucket]) -> HashMap<PathBuf, String> {
     let sessions = projects
         .iter()
         .flat_map(|project| project.sessions.iter())
         .collect::<Vec<_>>();
-    let mut out = HashMap::new();
-    for session in &sessions {
-        let id_len = session.id.chars().count();
-        let mut width = 7usize.min(id_len).max(1);
-        while width < id_len {
-            let suffix = session_id_suffix(&session.id, width);
-            let collision = sessions.iter().any(|other| {
-                other.path != session.path && session_id_suffix(&other.id, width) == suffix
-            });
-            if !collision {
-                break;
-            }
-            width += 1;
+    let id_chars = sessions
+        .iter()
+        .map(|session| session.id.chars().collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let mut widths = id_chars
+        .iter()
+        .map(|chars| 7usize.min(chars.len()).max(1))
+        .collect::<Vec<_>>();
+    let mut unresolved = (0..sessions.len()).collect::<Vec<_>>();
+    let mut out = HashMap::with_capacity(sessions.len());
+
+    while !unresolved.is_empty() {
+        let mut counts = HashMap::<String, usize>::new();
+        for &idx in &unresolved {
+            let suffix = session_id_suffix_from_chars(&id_chars[idx], widths[idx]);
+            *counts.entry(suffix).or_insert(0) += 1;
         }
-        out.insert(session.path.clone(), session_id_suffix(&session.id, width));
+
+        let mut next_unresolved = Vec::new();
+        for idx in unresolved {
+            let suffix = session_id_suffix_from_chars(&id_chars[idx], widths[idx]);
+            if counts.get(&suffix).copied().unwrap_or(0) == 1 || widths[idx] >= id_chars[idx].len()
+            {
+                out.insert(sessions[idx].path.clone(), suffix);
+            } else {
+                widths[idx] += 1;
+                next_unresolved.push(idx);
+            }
+        }
+        unresolved = next_unresolved;
     }
     out
+}
+
+fn preview_match_style(is_active: bool, dark_theme: bool) -> Style {
+    if is_active {
+        return Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED);
+    }
+    let accent = if dark_theme {
+        Color::LightCyan
+    } else {
+        Color::Blue
+    };
+    Style::default()
+        .fg(accent)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
 }
 
 fn format_session_browser_line(session: &SessionSummary, short_id: Option<&str>) -> String {
@@ -4962,10 +5204,10 @@ fn is_user_only_session(session: &SessionSummary) -> bool {
 }
 
 fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut App) {
+    let preview_inner_width = area.width.saturating_sub(2) as usize;
     let preview_session = app.current_preview_session();
     let preview = if let Some(session) = preview_session.clone() {
-        let inner_width = area.width.saturating_sub(2) as usize;
-        match app.preview_for_session(&session, app.preview_mode, inner_width) {
+        match app.preview_for_session(&session, app.preview_mode, preview_inner_width) {
             Ok(preview) => preview,
             Err(err) => Arc::new(PreviewData {
                 lines: vec![Line::from(format!("Preview error: {err:#}"))],
@@ -4982,25 +5224,15 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
             block_ranges: Vec::new(),
         })
     };
-    let session_title = preview_session
-        .as_ref()
-        .map(|s| {
-            let warning = if is_user_only_session(s) {
-                "  [user-only; may not resume in codex]"
-            } else {
-                ""
-            };
-            format!(
-                "{}  [{}]  {}  user={} assistant={}{}",
-                s.id,
-                s.machine_name,
-                format_human_timestamp(&s.started_at),
-                s.user_message_count,
-                s.assistant_message_count,
-                warning
-            )
-        })
-        .unwrap_or_else(|| String::from("No session selected"));
+    let search_matches = if app.search_query.trim().is_empty() {
+        Vec::new()
+    } else if let Some(session) = preview_session.as_ref() {
+        let query = app.search_query.clone();
+        app.preview_match_positions_cached(session, app.preview_mode, preview_inner_width, &query)
+            .unwrap_or_else(|_| preview_match_positions(&preview, &query))
+    } else {
+        Vec::new()
+    };
     app.preview_content_len = preview.lines.len();
     let viewport_len = area.height.saturating_sub(2) as usize;
     let max_scroll = app.preview_content_len.saturating_sub(viewport_len);
@@ -5013,11 +5245,6 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
     } else {
         app.preview_scroll = app.preview_scroll.min(max_scroll);
     }
-    let search_matches = if app.search_query.trim().is_empty() {
-        Vec::new()
-    } else {
-        preview_match_positions(&preview, &app.search_query)
-    };
     let search_changed = search_matches != app.preview_search_matches;
     app.preview_search_matches = search_matches;
     if app.preview_search_matches.is_empty() {
@@ -5030,13 +5257,53 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
             .as_ref()
             .is_some_and(|session| session.path == path)
     {
-        if let Some(found) = preview_match_positions(&preview, &query).first().cloned() {
+        if let Some(found) = app
+            .preview_search_matches
+            .first()
+            .cloned()
+            .filter(|_| query == app.search_query)
+        {
+            app.preview_scroll = found.row.saturating_sub(viewport_len / 3);
+            app.preview_focus_turn = preview_turn_at_or_before_row(&preview.header_rows, found.row);
+            app.preview_search_index = Some(0);
+        } else if let Some(found) = preview_match_positions(&preview, &query).first().cloned() {
             app.preview_scroll = found.row.saturating_sub(viewport_len / 3);
             app.preview_focus_turn = preview_turn_at_or_before_row(&preview.header_rows, found.row);
             app.preview_search_index = Some(0);
         }
         app.pending_preview_search_jump = None;
     }
+    let search_hit_title = if app.search_query.trim().is_empty() {
+        String::new()
+    } else if app.preview_search_matches.is_empty() {
+        String::from("  hits=0")
+    } else {
+        format!(
+            "  hits={}/{}",
+            app.preview_search_index.map(|idx| idx + 1).unwrap_or(1),
+            app.preview_search_matches.len()
+        )
+    };
+    let session_title = preview_session
+        .as_ref()
+        .map(|s| {
+            let warning = if is_user_only_session(s) {
+                "  [user-only; may not resume in codex]"
+            } else {
+                ""
+            };
+            format!(
+                "{}  [{}]  {}  user={} assistant={}{}{}",
+                s.id,
+                s.machine_name,
+                format_human_timestamp(&s.started_at),
+                s.user_message_count,
+                s.assistant_message_count,
+                warning,
+                search_hit_title,
+            )
+        })
+        .unwrap_or_else(|| String::from("No session selected"));
     if session_changed
         || content_len_changed
         || app.preview_selection.is_some()
@@ -5094,6 +5361,7 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
         );
     }
     if !app.search_query.trim().is_empty() {
+        let dark_theme = infer_dark_theme_from_env().unwrap_or(true);
         for (match_idx, found) in app.preview_search_matches.iter().enumerate() {
             let row = found.row;
             if row < visible_start || row >= visible_end {
@@ -5106,11 +5374,10 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
             if width == 0 || max_w == 0 {
                 continue;
             }
-            let style = if Some(match_idx) == app.preview_search_index || found.is_primary {
-                Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
-            } else {
-                Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-            };
+            let style = preview_match_style(
+                Some(match_idx) == app.preview_search_index || found.is_primary,
+                dark_theme,
+            );
             frame.buffer_mut().set_style(
                 ratatui::layout::Rect {
                     x,
@@ -5380,6 +5647,8 @@ fn status_button_style(button: StatusButton) -> Style {
         | StatusButton::Copy
         | StatusButton::Fork
         | StatusButton::Export
+        | StatusButton::PrevHit
+        | StatusButton::NextHit
         | StatusButton::ProjectRename
         | StatusButton::ProjectCopy
         | StatusButton::AddRemote => Style::default().fg(Color::Green),
@@ -5538,6 +5807,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
                 Span::raw(" panes  "),
                 Span::styled("/", Style::default().fg(Color::Cyan)),
                 Span::raw(" search  "),
+                Span::styled("buttons", Style::default().fg(Color::Cyan)),
+                Span::raw(" preview hits  "),
                 Span::styled("f5/ctrl+r", Style::default().fg(Color::Yellow)),
                 Span::raw(" refresh"),
             ]),
@@ -5561,6 +5832,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
                 Span::raw(" open  "),
                 Span::styled("/", Style::default().fg(Color::Cyan)),
                 Span::raw(" search  "),
+                Span::styled("n/N", Style::default().fg(Color::Cyan)),
+                Span::raw(" next/prev hit  "),
                 Span::styled("f5/ctrl+r", Style::default().fg(Color::Yellow)),
                 Span::raw(" refresh"),
             ]),
@@ -5627,12 +5900,22 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
     let search_meta = if app.search_query.trim().is_empty() {
         String::from("search: <none>")
     } else {
+        let hit_meta = if app.preview_search_matches.is_empty() {
+            String::from("preview hit: 0/0")
+        } else {
+            format!(
+                "preview hit: {}/{}",
+                app.preview_search_index.map(|idx| idx + 1).unwrap_or(1),
+                app.preview_search_matches.len()
+            )
+        };
         format!(
-            "search: '{}' ({} sessions, {} projects, {} focus)",
+            "search: '{}' ({} sessions, {} projects, {} focus, {})",
             app.search_query,
             matched_sessions,
             app.projects.len(),
-            if app.search_focused { "active" } else { "kept" }
+            if app.search_focused { "active" } else { "kept" },
+            hit_meta
         )
     };
     let preview_mode = match app.preview_mode {
@@ -6296,6 +6579,69 @@ fn literal_search_score(token: &str, haystack: &str, weight: i64) -> Option<i64>
         score += 20;
     }
     Some(score)
+}
+
+fn compute_search_filter_result(
+    seq: u64,
+    query: String,
+    all_projects: Vec<ProjectBucket>,
+) -> SearchFilterResult {
+    let query_l = query.to_lowercase();
+    let mut filtered = Vec::new();
+    let mut total_matches = 0usize;
+
+    for project in &all_projects {
+        let mut scored: Vec<(i64, SessionSummary)> = Vec::new();
+        for session in &project.sessions {
+            if let Some(score) = search_score(
+                &query_l,
+                &session.search_blob,
+                &project.cwd,
+                &session.file_name,
+                &session.id,
+            ) {
+                scored.push((score, session.clone()));
+            }
+        }
+
+        if !scored.is_empty() {
+            total_matches += scored.len();
+            scored.sort_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| b.1.started_at.cmp(&a.1.started_at))
+            });
+            let best_score = scored.first().map(|(score, _)| *score).unwrap_or(i64::MIN);
+            filtered.push((
+                best_score,
+                ProjectBucket {
+                    machine_name: project.machine_name.clone(),
+                    machine_target: project.machine_target.clone(),
+                    machine_codex_home: project.machine_codex_home.clone(),
+                    machine_exec_prefix: project.machine_exec_prefix.clone(),
+                    cwd: project.cwd.clone(),
+                    sessions: scored.into_iter().map(|(_, s)| s).collect(),
+                },
+            ));
+        }
+    }
+
+    filtered.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cwd.cmp(&b.1.cwd)));
+    let projects = filtered
+        .into_iter()
+        .map(|(_, project)| project)
+        .collect::<Vec<_>>();
+    let first_session_path = projects
+        .first()
+        .and_then(|project| project.sessions.first())
+        .map(|session| session.path.clone());
+
+    SearchFilterResult {
+        seq,
+        query,
+        projects,
+        total_matches,
+        first_session_path,
+    }
 }
 
 fn highlight_spans(text: &str, query: &str) -> Vec<Span<'static>> {
@@ -7895,6 +8241,36 @@ fn repair_session_ids(root: &Path) -> Result<usize> {
     Ok(repaired)
 }
 
+fn load_startup_state(
+    config: AppConfig,
+    sessions_root: PathBuf,
+    state_db_path: Option<PathBuf>,
+    include_remote_scan: bool,
+) -> Result<StartupLoadResult> {
+    let cwd_base = env::current_dir().context("failed to resolve current directory")?;
+    let repaired_count = repair_session_cwds(&sessions_root, &cwd_base)?;
+    let repaired_id_count = repair_session_ids(&sessions_root)?;
+    let (all_projects, remote_states) = scan_all_projects_from_config(
+        &config,
+        &sessions_root,
+        &BTreeMap::new(),
+        true,
+        include_remote_scan,
+    )?;
+    let synced_threads = if let Some(db_path) = state_db_path.as_deref() {
+        sync_threads_db_from_projects(db_path, &all_projects)?
+    } else {
+        0
+    };
+    Ok(StartupLoadResult {
+        all_projects,
+        remote_states,
+        repaired_count,
+        repaired_id_count,
+        synced_threads,
+    })
+}
+
 fn resolve_state_db_path(codex_home: &Path) -> Option<PathBuf> {
     let mut candidates = fs::read_dir(codex_home)
         .ok()?
@@ -7921,6 +8297,69 @@ fn state_db_sort_key(path: &Path) -> i64 {
         .and_then(|stem| stem.strip_prefix("state_"))
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(i64::MIN)
+}
+
+fn scan_all_projects_from_config(
+    config: &AppConfig,
+    sessions_root: &Path,
+    previous_states: &BTreeMap<String, RemoteMachineState>,
+    force_remote_scan: bool,
+    include_remote_scan: bool,
+) -> Result<(Vec<ProjectBucket>, BTreeMap<String, RemoteMachineState>)> {
+    let mut all_projects = scan_local_sessions(sessions_root)?;
+    let mut states = BTreeMap::new();
+    if include_remote_scan {
+        for machine in &config.machines {
+            let previous = previous_states
+                .get(&machine.name)
+                .cloned()
+                .unwrap_or_default();
+            let next = scan_remote_machine_with_previous(machine, &previous, force_remote_scan);
+            all_projects.extend(next.cached_projects.iter().cloned());
+            states.insert(machine.name.clone(), next);
+        }
+    }
+    all_projects.sort_by(|a, b| {
+        a.machine_name
+            .cmp(&b.machine_name)
+            .then_with(|| a.cwd.cmp(&b.cwd))
+    });
+    Ok((all_projects, states))
+}
+
+fn scan_remote_machine_with_previous(
+    machine: &ConfigMachine,
+    previous: &RemoteMachineState,
+    force_remote_scan: bool,
+) -> RemoteMachineState {
+    let now = Instant::now();
+    if !force_remote_scan
+        && previous
+            .last_scan_at
+            .is_some_and(|last| now.duration_since(last) < REMOTE_SCAN_CACHE_TTL)
+    {
+        return previous.clone();
+    }
+    match scan_remote_sessions(machine) {
+        Ok(projects) => RemoteMachineState {
+            status: RemoteMachineStatus::Healthy,
+            last_error: None,
+            cached_projects: projects,
+            last_scan_at: Some(now),
+        },
+        Err(err) if !previous.cached_projects.is_empty() => RemoteMachineState {
+            status: RemoteMachineStatus::Cached,
+            last_error: Some(err.to_string()),
+            cached_projects: previous.cached_projects.clone(),
+            last_scan_at: previous.last_scan_at.or(Some(now)),
+        },
+        Err(err) => RemoteMachineState {
+            status: RemoteMachineStatus::Error,
+            last_error: Some(err.to_string()),
+            cached_projects: Vec::new(),
+            last_scan_at: Some(now),
+        },
+    }
 }
 
 fn sync_threads_db_from_projects(db_path: &Path, projects: &[ProjectBucket]) -> Result<usize> {
@@ -9233,6 +9672,9 @@ mod tests {
             search_cursor: 0,
             search_focused: false,
             search_dirty: false,
+            search_job_seq: 0,
+            search_job_running: false,
+            search_result_rx: None,
             preview_mode: PreviewMode::Chat,
             preview_selecting: false,
             preview_mouse_down_pos: None,
@@ -9272,6 +9714,8 @@ mod tests {
             action_progress_op: None,
             progress_op: None,
             delete_progress_op: None,
+            startup_load_rx: None,
+            startup_loading: false,
         }
     }
 
@@ -11866,6 +12310,9 @@ mod tests {
             search_cursor: 0,
             search_focused: false,
             search_dirty: false,
+            search_job_seq: 0,
+            search_job_running: false,
+            search_result_rx: None,
             preview_mode: PreviewMode::Chat,
             preview_selecting: false,
             preview_mouse_down_pos: None,
@@ -11905,6 +12352,8 @@ mod tests {
             action_progress_op: None,
             progress_op: None,
             delete_progress_op: None,
+            startup_load_rx: None,
+            startup_loading: false,
         };
         let text = app
             .preview_selected_text((0, 1), (1, 2))
@@ -12577,6 +13026,9 @@ mod tests {
             search_cursor: 5,
             search_focused: true,
             search_dirty: true,
+            search_job_seq: 0,
+            search_job_running: false,
+            search_result_rx: None,
             preview_mode: PreviewMode::Chat,
             preview_selecting: false,
             preview_mouse_down_pos: None,
@@ -12616,6 +13068,8 @@ mod tests {
             action_progress_op: None,
             progress_op: None,
             delete_progress_op: None,
+            startup_load_rx: None,
+            startup_loading: false,
         };
 
         app.apply_search_filter();
@@ -12843,6 +13297,263 @@ mod tests {
         assert!(buffer_contains(backend, "tab"));
         assert!(buffer_contains(backend, "shift+tab"));
         assert!(buffer_contains(backend, "close search"));
+    }
+
+    #[test]
+    fn search_context_preview_uses_first_session_for_project_row() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            cwd: String::from("/work/repo"),
+            sessions: vec![
+                sample_session("/tmp/a.jsonl", "/work/repo", "aaa1111"),
+                sample_session("/tmp/b.jsonl", "/work/repo", "bbb2222"),
+            ],
+        }];
+        app.all_projects = app.projects.clone();
+        app.project_idx = 0;
+        app.browser_cursor = BrowserCursor::Project;
+        app.search_query = String::from("johyperr");
+
+        let preview = app.current_preview_session().expect("preview session");
+        assert_eq!(preview.id, "aaa1111");
+    }
+
+    #[test]
+    fn set_browser_row_syncs_pending_search_jump_for_selected_session() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            cwd: String::from("/work/repo"),
+            sessions: vec![
+                sample_session("/tmp/a.jsonl", "/work/repo", "aaa1111"),
+                sample_session("/tmp/b.jsonl", "/work/repo", "bbb2222"),
+            ],
+        }];
+        app.all_projects = app.projects.clone();
+        app.search_query = String::from("johyperr");
+
+        app.set_browser_row(BrowserRow {
+            kind: BrowserRowKind::Session {
+                project_idx: 0,
+                session_idx: 1,
+            },
+            depth: 1,
+            label: String::new(),
+        });
+
+        assert_eq!(
+            app.pending_preview_search_jump,
+            Some((PathBuf::from("/tmp/b.jsonl"), String::from("johyperr")))
+        );
+    }
+
+    #[test]
+    fn render_status_shows_search_hit_navigation_buttons() {
+        let mut app = empty_test_app();
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Session;
+        app.search_query = String::from("johyperr");
+        app.preview_search_matches = vec![
+            PreviewMatch {
+                row: 10,
+                col_start: 1,
+                col_end: 9,
+                is_primary: true,
+            },
+            PreviewMatch {
+                row: 20,
+                col_start: 1,
+                col_end: 9,
+                is_primary: false,
+            },
+        ];
+        app.preview_search_index = Some(0);
+
+        let backend = TestBackend::new(320, 6);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_status(
+                    frame,
+                    ratatui::layout::Rect {
+                        x: 0,
+                        y: 0,
+                        width: 320,
+                        height: 6,
+                    },
+                    &app,
+                );
+            })
+            .expect("draw");
+
+        let backend = terminal.backend();
+        assert!(buffer_contains(backend, "[Prev Hit]"));
+        assert!(buffer_contains(backend, "[Next Hit]"));
+        assert!(buffer_contains(backend, "next/prev hit"));
+        assert!(buffer_contains(backend, "preview hit: 1/2"));
+    }
+
+    #[test]
+    fn handle_status_click_triggers_prev_hit_button() {
+        let mut app = empty_test_app();
+        app.search_query = String::from("johyperr");
+        app.preview_search_matches = vec![
+            PreviewMatch {
+                row: 10,
+                col_start: 1,
+                col_end: 9,
+                is_primary: true,
+            },
+            PreviewMatch {
+                row: 20,
+                col_start: 1,
+                col_end: 9,
+                is_primary: false,
+            },
+        ];
+        app.preview_search_index = Some(1);
+        app.panes.status = ratatui::layout::Rect::new(0, 0, 120, 5);
+        app.panes.preview.height = 12;
+
+        handle_status_click(1, 3, &mut app);
+
+        assert_eq!(app.preview_search_index, Some(0));
+    }
+
+    #[test]
+    fn browser_session_navigates_preview_hits_when_search_is_kept() {
+        let mut app = empty_test_app();
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Session;
+        app.search_query = String::from("johyperr");
+        app.preview_search_matches = vec![
+            PreviewMatch {
+                row: 10,
+                col_start: 3,
+                col_end: 11,
+                is_primary: true,
+            },
+            PreviewMatch {
+                row: 25,
+                col_start: 1,
+                col_end: 9,
+                is_primary: false,
+            },
+        ];
+        app.preview_search_index = Some(0);
+        app.panes.preview.height = 12;
+
+        handle_normal_mode(KeyEvent::from(KeyCode::Char('n')), &mut app).expect("key");
+        assert_eq!(app.preview_search_index, Some(1));
+
+        handle_normal_mode(KeyEvent::from(KeyCode::Char('N')), &mut app).expect("key");
+        assert_eq!(app.preview_search_index, Some(0));
+    }
+
+    #[test]
+    fn preview_search_navigation_recomputes_for_new_browser_session_without_render() {
+        let dir = std::env::temp_dir().join(format!("cse-search-nav-session-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path_a = dir.join("a.jsonl");
+        let path_b = dir.join("b.jsonl");
+        fs::write(
+            &path_a,
+            [
+                r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"a","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/x"}}"#,
+                r#"{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"johyperr once"}]}}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("write");
+        fs::write(
+            &path_b,
+            [
+                r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"b","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/x"}}"#,
+                r#"{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"johyperr two johyperr"}]}}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("write");
+
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            cwd: String::from("/tmp/x"),
+            sessions: vec![
+                SessionSummary {
+                    path: path_a.clone(),
+                    storage_path: path_to_string(Path::new(&path_a.clone())),
+                    machine_name: String::from("local"),
+                    machine_target: None,
+                    machine_codex_home: None,
+                    machine_exec_prefix: None,
+                    file_name: String::from("a.jsonl"),
+                    id: String::from("a"),
+                    cwd: String::from("/tmp/x"),
+                    started_at: String::from("2026-01-01T00:00:00Z"),
+                    modified_epoch: 1,
+                    event_count: 2,
+                    user_message_count: 1,
+                    assistant_message_count: 0,
+                    search_blob: String::from("johyperr once"),
+                },
+                SessionSummary {
+                    path: path_b.clone(),
+                    storage_path: path_to_string(Path::new(&path_b.clone())),
+                    machine_name: String::from("local"),
+                    machine_target: None,
+                    machine_codex_home: None,
+                    machine_exec_prefix: None,
+                    file_name: String::from("b.jsonl"),
+                    id: String::from("b"),
+                    cwd: String::from("/tmp/x"),
+                    started_at: String::from("2026-01-01T00:00:00Z"),
+                    modified_epoch: 1,
+                    event_count: 2,
+                    user_message_count: 1,
+                    assistant_message_count: 0,
+                    search_blob: String::from("johyperr two johyperr"),
+                },
+            ],
+        }];
+        app.all_projects = app.projects.clone();
+        app.search_query = String::from("johyperr");
+        app.browser_cursor = BrowserCursor::Session;
+        app.session_idx = 0;
+        app.preview_session_path = Some(path_a.clone());
+        app.preview_search_matches = vec![PreviewMatch {
+            row: 1,
+            col_start: 0,
+            col_end: 8,
+            is_primary: true,
+        }];
+        app.preview_search_index = Some(0);
+        app.panes.preview.width = 100;
+        app.panes.preview.height = 12;
+
+        app.set_browser_row(BrowserRow {
+            kind: BrowserRowKind::Session {
+                project_idx: 0,
+                session_idx: 1,
+            },
+            depth: 1,
+            label: String::new(),
+        });
+        app.focus_next_preview_search_match();
+
+        assert_eq!(app.preview_session_path, Some(path_b));
+        assert_eq!(app.preview_search_matches.len(), 2);
+        assert_eq!(app.preview_search_index, Some(1));
     }
 
     #[test]
@@ -13226,6 +13937,17 @@ mod tests {
     }
 
     #[test]
+    fn preview_match_style_distinguishes_active_and_secondary_hits() {
+        let active = preview_match_style(true, true);
+        let secondary = preview_match_style(false, true);
+
+        assert!(active.add_modifier.contains(Modifier::REVERSED));
+        assert!(!secondary.add_modifier.contains(Modifier::REVERSED));
+        assert!(secondary.add_modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(secondary.fg, Some(Color::LightCyan));
+    }
+
+    #[test]
     fn render_preview_title_shows_total_message_counts() {
         let dir = std::env::temp_dir().join(format!("cse-preview-title-{}", Uuid::new_v4()));
         fs::create_dir_all(&dir).expect("mkdir");
@@ -13261,7 +13983,7 @@ mod tests {
         app.focus = Focus::Preview;
         app.browser_cursor = BrowserCursor::Session;
 
-        let backend = TestBackend::new(100, 20);
+        let backend = TestBackend::new(180, 20);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|frame| {
@@ -13270,7 +13992,7 @@ mod tests {
                     ratatui::layout::Rect {
                         x: 0,
                         y: 0,
-                        width: 100,
+                        width: 180,
                         height: 20,
                     },
                     &mut app,
@@ -13280,6 +14002,71 @@ mod tests {
 
         let backend = terminal.backend();
         assert!(buffer_contains(backend, "user=2 assistant=1"));
+    }
+
+    #[test]
+    fn render_preview_title_shows_search_hit_counts() {
+        let dir = std::env::temp_dir().join(format!("cse-preview-hit-title-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("sample.jsonl");
+        let body = [
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"abc","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/x"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello johyperr and johyperr again"}]}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"world"}]}}"#,
+        ]
+        .join("\n");
+        fs::write(&path, body).expect("write");
+
+        let session = SessionSummary {
+            path: path.clone(),
+            storage_path: path_to_string(Path::new(&path.clone())),
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            file_name: String::from("sample.jsonl"),
+            id: String::from("abcdef123456"),
+            cwd: String::from("/tmp/x"),
+            started_at: String::from("2026-01-01T00:00:00Z"),
+            modified_epoch: 123,
+            event_count: 4,
+            user_message_count: 2,
+            assistant_message_count: 1,
+            search_blob: String::from("hello johyperr and johyperr again world"),
+        };
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            cwd: String::from("/tmp/x"),
+            sessions: vec![session],
+        }];
+        app.focus = Focus::Preview;
+        app.browser_cursor = BrowserCursor::Session;
+        app.search_query = String::from("johyperr");
+        app.preview_folded.insert(path.clone(), HashSet::new());
+
+        let backend = TestBackend::new(180, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_preview(
+                    frame,
+                    ratatui::layout::Rect {
+                        x: 0,
+                        y: 0,
+                        width: 180,
+                        height: 20,
+                    },
+                    &mut app,
+                );
+            })
+            .expect("draw");
+
+        let backend = terminal.backend();
+        assert!(buffer_contains(backend, "hits=1/2"));
     }
 
     #[test]
@@ -13421,6 +14208,9 @@ mod tests {
             search_cursor: 0,
             search_focused: false,
             search_dirty: false,
+            search_job_seq: 0,
+            search_job_running: false,
+            search_result_rx: None,
             preview_mode: PreviewMode::Chat,
             preview_selecting: false,
             preview_mouse_down_pos: None,
@@ -13460,6 +14250,8 @@ mod tests {
             action_progress_op: None,
             progress_op: None,
             delete_progress_op: None,
+            startup_load_rx: None,
+            startup_loading: false,
         };
 
         app.toggle_fold_all_preview_turns();
@@ -14160,6 +14952,7 @@ codex_home = "/root/.codex"
     #[test]
     fn preview_search_navigation_moves_between_occurrences() {
         let mut app = empty_test_app();
+        app.search_query = String::from("johyperr");
         app.preview_search_matches = vec![
             PreviewMatch {
                 row: 10,

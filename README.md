@@ -236,6 +236,8 @@ It:
 - jumps the preview to the first relevant occurrence
 - highlights matches in Browser and Preview
 - highlights the primary preview hit more strongly than later hits
+- keeps Preview attached to the current filtered browser context instead of going blank
+- runs filtering asynchronously so typing stays responsive on larger session stores
 
 Search navigation:
 
@@ -245,6 +247,9 @@ Search navigation:
 - `Ctrl+A` / `Ctrl+E`: jump to start/end of the search text
 - `Tab` / `Shift+Tab`: move focus out of the search box
 - `n` / `N` in Preview: next/previous occurrence in the current chat
+- `n` / `N` on a selected session row while search is active: next/previous occurrence in that session without switching panes
+- footer buttons `[Prev Hit]` / `[Next Hit]` are clickable by mouse
+- the Preview header shows the current hit count as `hits=x/y`
 
 ## Session Workflows
 
