@@ -2338,7 +2338,22 @@ impl App {
         let config = load_app_config(&config_path)?;
         let sessions_root = codex_home.join("sessions");
         let state_db_path = resolve_state_db_path(&codex_home);
+        Self::load_from_parts(
+            config_path,
+            config,
+            sessions_root,
+            state_db_path,
+            include_remote_scan,
+        )
+    }
 
+    fn load_from_parts(
+        config_path: PathBuf,
+        config: AppConfig,
+        sessions_root: PathBuf,
+        state_db_path: Option<PathBuf>,
+        include_remote_scan: bool,
+    ) -> Result<Self> {
         let mut app = Self {
             config_path,
             config,
@@ -2410,8 +2425,10 @@ impl App {
         };
 
         if include_remote_scan {
+            let local_projects = scan_local_sessions(&app.sessions_root)?;
+            app.apply_scanned_projects(local_projects, BTreeMap::new(), false);
             app.startup_loading = true;
-            app.status = String::from("Working... loading sessions");
+            app.status = String::from("Working... loading remote sessions");
             let config = app.config.clone();
             let sessions_root = app.sessions_root.clone();
             let state_db_path = app.state_db_path.clone();
@@ -2462,9 +2479,14 @@ impl App {
         };
         self.startup_load_rx = None;
         self.startup_loading = false;
+        let had_projects_before = !self.projects.is_empty();
         match result {
             Ok(result) => {
-                self.apply_scanned_projects(result.all_projects, result.remote_states, false);
+                self.apply_scanned_projects(
+                    result.all_projects,
+                    result.remote_states,
+                    had_projects_before,
+                );
                 if result.repaired_count > 0
                     || result.repaired_id_count > 0
                     || result.synced_threads > 0
@@ -9717,6 +9739,34 @@ mod tests {
             startup_load_rx: None,
             startup_loading: false,
         }
+    }
+
+    #[test]
+    fn load_from_parts_prefills_local_projects_before_background_startup_finishes() {
+        let dir = std::env::temp_dir().join(format!("cse-startup-local-first-{}", Uuid::new_v4()));
+        let sessions_root = dir.join("sessions");
+        let session_path = sessions_root
+            .join("2026")
+            .join("03")
+            .join("19")
+            .join("rollout-2026-03-19T00-00-00-abc.jsonl");
+        write_test_session(&session_path, &sample_chat_jsonl());
+
+        let app = App::load_from_parts(
+            dir.join("codex-session-tui.toml"),
+            AppConfig::default(),
+            sessions_root,
+            None,
+            true,
+        )
+        .expect("load app");
+
+        assert!(app.startup_loading);
+        assert!(app.startup_load_rx.is_some());
+        assert_eq!(app.projects.len(), 1);
+        assert_eq!(app.projects[0].cwd, "/tmp/x");
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn init_test_state_db(path: &Path) {
