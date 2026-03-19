@@ -1606,6 +1606,7 @@ struct PaneLayout {
 }
 
 const REMOTE_SCAN_CACHE_TTL: Duration = Duration::from_secs(15);
+const STARTUP_LOCAL_REPAIR_DELAY: Duration = Duration::from_secs(2);
 
 struct App {
     config_path: PathBuf,
@@ -3031,6 +3032,9 @@ impl App {
         }
         self.clamp_session_idx();
         self.sync_search_preview_target();
+        if !self.search_query.trim().is_empty() {
+            let _ = self.prepare_preview_search_navigation_state();
+        }
         self.note_browser_navigation();
         self.ensure_selection_visible();
     }
@@ -8357,6 +8361,7 @@ fn start_startup_loader(
             let sessions_root = sessions_root.clone();
             let state_db_path = state_db_path.clone();
             std::thread::spawn(move || {
+                std::thread::sleep(STARTUP_LOCAL_REPAIR_DELAY);
                 let result = load_startup_local_state(sessions_root, state_db_path)
                     .map_err(|err| format!("{err:#}"));
                 let _ = work_tx.send(StartupWorkItem::Local(result));
@@ -13835,6 +13840,122 @@ mod tests {
     }
 
     #[test]
+    fn render_status_keeps_search_hit_controls_after_clicking_to_another_session() {
+        let dir =
+            std::env::temp_dir().join(format!("cse-search-status-session-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path_a = dir.join("a.jsonl");
+        let path_b = dir.join("b.jsonl");
+        fs::write(
+            &path_a,
+            [
+                r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"a","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/x"}}"#,
+                r#"{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"johyperr once"}]}}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("write");
+        fs::write(
+            &path_b,
+            [
+                r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"b","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/x"}}"#,
+                r#"{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"johyperr two johyperr"}]}}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("write");
+
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            cwd: String::from("/tmp/x"),
+            sessions: vec![
+                SessionSummary {
+                    path: path_a.clone(),
+                    storage_path: path_to_string(Path::new(&path_a.clone())),
+                    machine_name: String::from("local"),
+                    machine_target: None,
+                    machine_codex_home: None,
+                    machine_exec_prefix: None,
+                    file_name: String::from("a.jsonl"),
+                    id: String::from("a"),
+                    cwd: String::from("/tmp/x"),
+                    started_at: String::from("2026-01-01T00:00:00Z"),
+                    modified_epoch: 1,
+                    event_count: 2,
+                    user_message_count: 1,
+                    assistant_message_count: 0,
+                    search_blob: String::from("johyperr once"),
+                },
+                SessionSummary {
+                    path: path_b.clone(),
+                    storage_path: path_to_string(Path::new(&path_b.clone())),
+                    machine_name: String::from("local"),
+                    machine_target: None,
+                    machine_codex_home: None,
+                    machine_exec_prefix: None,
+                    file_name: String::from("b.jsonl"),
+                    id: String::from("b"),
+                    cwd: String::from("/tmp/x"),
+                    started_at: String::from("2026-01-01T00:00:00Z"),
+                    modified_epoch: 1,
+                    event_count: 2,
+                    user_message_count: 1,
+                    assistant_message_count: 0,
+                    search_blob: String::from("johyperr two johyperr"),
+                },
+            ],
+        }];
+        app.all_projects = app.projects.clone();
+        app.search_query = String::from("johyperr");
+        app.search_focused = true;
+        app.browser_cursor = BrowserCursor::Session;
+        app.session_idx = 0;
+        app.preview_session_path = Some(path_a.clone());
+        app.preview_search_matches.clear();
+        app.preview_search_index = None;
+        app.panes.preview.width = 100;
+        app.panes.preview.height = 12;
+
+        app.set_browser_row(BrowserRow {
+            kind: BrowserRowKind::Session {
+                project_idx: 0,
+                session_idx: 1,
+            },
+            depth: 1,
+            label: String::new(),
+            count: 0,
+        });
+
+        let backend = TestBackend::new(320, 6);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_status(
+                    frame,
+                    ratatui::layout::Rect {
+                        x: 0,
+                        y: 0,
+                        width: 320,
+                        height: 6,
+                    },
+                    &app,
+                );
+            })
+            .expect("draw");
+
+        let backend = terminal.backend();
+        assert!(buffer_contains(backend, "[Prev Hit]"));
+        assert!(buffer_contains(backend, "[Next Hit]"));
+        assert!(buffer_contains(backend, "preview hit: 1/2"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn render_status_shows_bulk_folder_shortcuts() {
         let mut app = empty_test_app();
         app.focus = Focus::Projects;
@@ -14880,6 +15001,11 @@ codex_home = "/root/.codex"
     #[test]
     fn submit_input_delete_remote_removes_machine_from_config() {
         let mut app = empty_test_app();
+        let base = std::env::temp_dir().join(format!("codex-session-tui-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&base).expect("create temp dir");
+        app.config_path = base.join("codex-session-tui.toml");
+        app.sessions_root = base.join("sessions");
+        std::fs::create_dir_all(&app.sessions_root).expect("create sessions dir");
         app.config.machines.push(ConfigMachine {
             name: String::from("dev"),
             ssh_target: String::from("root@example-host"),
@@ -14895,6 +15021,7 @@ codex_home = "/root/.codex"
         app.submit_input().expect("submit");
         assert!(app.config.machines.is_empty());
         assert_eq!(app.mode, Mode::Normal);
+        std::fs::remove_dir_all(&base).expect("cleanup temp dir");
     }
 
     #[test]
@@ -14903,6 +15030,8 @@ codex_home = "/root/.codex"
         let base = std::env::temp_dir().join(format!("codex-session-tui-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&base).expect("create temp dir");
         app.config_path = base.join("codex-session-tui.toml");
+        app.sessions_root = base.join("sessions");
+        std::fs::create_dir_all(&app.sessions_root).expect("create sessions dir");
         app.config.machines.push(ConfigMachine {
             name: String::from("dev"),
             ssh_target: String::from("root@example-host"),
