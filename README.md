@@ -237,6 +237,7 @@ It:
 - supports quoted phrases such as `"openrouter error" auth`
 - auto-selects the best matching session
 - jumps the preview to the first relevant occurrence
+- expands the browser tree to reveal the active matching session as you step through search results
 - highlights matches in Browser and Preview
 - highlights the primary preview hit more strongly than later hits
 - keeps Preview attached to the current filtered browser context instead of going blank

@@ -3404,6 +3404,22 @@ impl App {
         }
     }
 
+    fn reveal_project_in_browser(&mut self, project_idx: usize) {
+        let Some(project) = self.projects.get(project_idx).cloned() else {
+            return;
+        };
+        let key = project_bucket_key(&project);
+        self.collapsed_projects.remove(&key);
+        self.collapsed_projects.remove(&project.cwd);
+        self.pinned_open_projects.insert(key);
+        self.pinned_open_projects.insert(project.cwd.clone());
+        expand_group_ancestors_for_cwd(
+            &mut self.collapsed_groups,
+            &project.machine_name,
+            &project.cwd,
+        );
+    }
+
     fn apply_search_filter(&mut self) {
         if self.search_query.trim().is_empty() {
             self.projects = self.all_projects.clone();
@@ -3953,6 +3969,7 @@ impl App {
         };
 
         let (project_idx, session_idx) = sessions[next_idx];
+        self.reveal_project_in_browser(project_idx);
         self.set_browser_row(BrowserRow {
             kind: BrowserRowKind::Session {
                 project_idx,
@@ -4296,17 +4313,10 @@ impl App {
         self.selected_group_path = None;
         self.collapsed_groups =
             default_collapsed_group_paths(&self.projects, &self.config.virtual_folders);
-        if let Some(first_project) = self.projects.first() {
+        if !self.projects.is_empty() {
             if let Some(first_session_path) = result.first_session_path {
                 self.browser_cursor = BrowserCursor::Session;
-                self.collapsed_projects
-                    .remove(&project_bucket_key(first_project));
-                self.collapsed_projects.remove(&first_project.cwd);
-                expand_group_ancestors_for_project(
-                    &self.projects,
-                    &mut self.collapsed_groups,
-                    &first_project.cwd,
-                );
+                self.reveal_project_in_browser(0);
                 self.pending_preview_search_jump =
                     Some((first_session_path, self.search_query.clone()));
             } else {
@@ -7408,32 +7418,6 @@ fn first_project_index_for_group(projects: &[ProjectBucket], group_path: &str) -
         let display = browser_display_path(&project.cwd);
         display == group_path || display.starts_with(&prefix)
     })
-}
-
-fn expand_group_ancestors_for_project(
-    projects: &[ProjectBucket],
-    collapsed_groups: &mut HashSet<String>,
-    cwd: &str,
-) {
-    let Some(project) = projects.iter().find(|project| project.cwd == cwd) else {
-        return;
-    };
-    let segments = browser_tree_segments_for_project(project);
-    if segments.is_empty() {
-        return;
-    }
-    let mut current = String::new();
-    for (idx, segment) in segments.iter().enumerate() {
-        if idx == 0 {
-            current = segment.clone();
-        } else if current == "/" {
-            current = format!("/{segment}");
-        } else {
-            current = format!("{current}/{segment}");
-        }
-        collapsed_groups.remove(&current);
-    }
-    let _ = projects;
 }
 
 #[cfg(test)]
@@ -14386,6 +14370,61 @@ mod tests {
         assert_eq!(app.project_idx, 1);
         assert_eq!(app.session_idx, 0);
         assert!(app.status.contains("Wrapped to last matching session"));
+    }
+
+    #[test]
+    fn search_session_navigation_expands_browser_path_to_target_session() {
+        let mut app = empty_test_app();
+        app.search_query = String::from("litellm");
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Session;
+        app.projects = vec![
+            ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
+                machine_exec_prefix: None,
+                cwd: String::from("/repo/a"),
+                sessions: vec![sample_session("/tmp/a.jsonl", "/repo/a", "a")],
+            },
+            ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
+                machine_exec_prefix: None,
+                cwd: String::from("/repo/b"),
+                sessions: vec![sample_session("/tmp/b.jsonl", "/repo/b", "b")],
+            },
+        ];
+        app.all_projects = app.projects.clone();
+        app.project_idx = 0;
+        app.session_idx = 0;
+        app.collapsed_groups =
+            default_collapsed_group_paths(&app.projects, &app.config.virtual_folders);
+        app.collapsed_projects
+            .insert(project_bucket_key(&app.projects[1]));
+        app.collapsed_projects.insert(app.projects[1].cwd.clone());
+
+        handle_normal_mode(KeyEvent::from(KeyCode::Char(']')), &mut app).expect("next session");
+
+        assert_eq!(app.project_idx, 1);
+        assert_eq!(app.session_idx, 0);
+        assert_eq!(app.browser_cursor, BrowserCursor::Session);
+        assert!(!project_set_contains(
+            &app.collapsed_projects,
+            &app.projects[1]
+        ));
+        assert!(!app.collapsed_groups.contains("local"));
+        assert!(!app.collapsed_groups.contains("local/repo"));
+        assert_eq!(
+            app.browser_rows()
+                .get(app.current_browser_row_index())
+                .map(|row| &row.kind),
+            Some(&BrowserRowKind::Session {
+                project_idx: 1,
+                session_idx: 0,
+            })
+        );
     }
 
     #[test]
