@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.6 - 2026-03-19
+
+- Fixed search session navigation so stepping to the previous or next matching session expands the browser tree to reveal that session and moves the browser cursor onto it.
+
 ## 2.0.5 - 2026-03-19
 
 - Fixed search typing so the query updates immediately and search jobs start without the old idle wait, while keeping the heavy filtering work off the keystroke path.
