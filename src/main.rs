@@ -2583,14 +2583,20 @@ impl App {
                         } else {
                             "loading"
                         };
+                        let loaded_project_count = self.all_projects.len();
+                        let loaded_session_count = self
+                            .all_projects
+                            .iter()
+                            .map(|project| project.sessions.len())
+                            .sum::<usize>();
                         self.status = format!(
                             "Working... {verb} sessions: {} sessions, {} projects",
-                            self.projects
-                                .iter()
-                                .map(|project| project.sessions.len())
-                                .sum::<usize>(),
-                            self.projects.len()
+                            loaded_session_count, loaded_project_count
                         );
+                        if !self.search_query.trim().is_empty() {
+                            self.status
+                                .push_str("  |  search results updating as sessions arrive");
+                        }
                     } else if result.repaired_count > 0
                         || result.repaired_id_count > 0
                         || result.synced_threads > 0
@@ -2602,10 +2608,16 @@ impl App {
                             result.repaired_id_count,
                             result.synced_threads
                         );
+                        if !self.search_query.trim().is_empty() {
+                            self.status.push_str("  |  search results refreshed");
+                        }
                     } else {
                         self.status = format!("Loaded {} projects", self.projects.len());
                         if let Some(summary) = self.remote_health_summary() {
                             self.status.push_str(&format!("  {summary}"));
+                        }
+                        if !self.search_query.trim().is_empty() {
+                            self.status.push_str("  |  search results refreshed");
                         }
                     }
                     if result.finished {
@@ -4305,6 +4317,7 @@ impl App {
     }
 
     fn apply_search_result(&mut self, result: SearchFilterResult) {
+        let previous_path = self.current_preview_session().map(|session| session.path);
         self.projects = result.projects;
         self.refresh_browser_short_ids();
         self.project_idx = 0;
@@ -4313,10 +4326,15 @@ impl App {
         self.selected_group_path = None;
         self.collapsed_groups =
             default_collapsed_group_paths(&self.projects, &self.config.virtual_folders);
+        let mut repositioned_to_first = false;
         if !self.projects.is_empty() {
             if let Some(first_session_path) = result.first_session_path {
                 self.browser_cursor = BrowserCursor::Session;
                 self.reveal_project_in_browser(0);
+                let first_session_path_for_compare = first_session_path.clone();
+                repositioned_to_first = previous_path
+                    .as_ref()
+                    .is_some_and(|path| *path != first_session_path_for_compare);
                 self.pending_preview_search_jump =
                     Some((first_session_path, self.search_query.clone()));
             } else {
@@ -4336,6 +4354,11 @@ impl App {
             result.total_matches,
             self.projects.len()
         );
+        if repositioned_to_first {
+            self.status.push_str(
+                "  |  new sessions changed the result set; focused first matching session",
+            );
+        }
         self.search_dirty = false;
     }
 
@@ -10385,6 +10408,43 @@ mod tests {
     }
 
     #[test]
+    fn poll_startup_load_shows_search_update_notice_while_search_is_active() {
+        let mut app = empty_test_app();
+        app.status = String::from("Working... loading sessions");
+        app.search_query = String::from("litellm");
+        app.startup_loading = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.startup_load_rx = Some(rx);
+        tx.send(Ok(StartupLoadResult {
+            all_projects: vec![ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
+                machine_exec_prefix: None,
+                cwd: String::from("/repo"),
+                sessions: vec![sample_session("/tmp/a.jsonl", "/repo", "a")],
+            }],
+            remote_states: BTreeMap::new(),
+            repaired_count: 0,
+            repaired_id_count: 0,
+            synced_threads: 0,
+            finished: false,
+        }))
+        .expect("send");
+
+        app.poll_startup_load();
+
+        assert!(
+            app.status
+                .contains("Working... loading sessions: 1 sessions, 1 projects")
+        );
+        assert!(
+            app.status
+                .contains("search results updating as sessions arrive")
+        );
+    }
+
+    #[test]
     fn apply_scanned_projects_preserves_existing_tree_state_and_collapses_new_async_remote_rows() {
         let mut app = empty_test_app();
         let local = ProjectBucket {
@@ -14370,6 +14430,53 @@ mod tests {
         assert_eq!(app.project_idx, 1);
         assert_eq!(app.session_idx, 0);
         assert!(app.status.contains("Wrapped to last matching session"));
+    }
+
+    #[test]
+    fn apply_search_result_reports_when_streamed_updates_reposition_to_first_match() {
+        let mut app = empty_test_app();
+        app.search_query = String::from("litellm");
+        app.projects = vec![
+            ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
+                machine_exec_prefix: None,
+                cwd: String::from("/repo/a"),
+                sessions: vec![sample_session("/tmp/a.jsonl", "/repo/a", "a")],
+            },
+            ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
+                machine_exec_prefix: None,
+                cwd: String::from("/repo/b"),
+                sessions: vec![sample_session("/tmp/b.jsonl", "/repo/b", "b")],
+            },
+        ];
+        app.all_projects = app.projects.clone();
+        app.project_idx = 1;
+        app.session_idx = 0;
+        app.browser_cursor = BrowserCursor::Session;
+        app.preview_session_path = Some(PathBuf::from("/tmp/b.jsonl"));
+
+        app.apply_search_result(SearchFilterResult {
+            seq: 1,
+            data_seq: 1,
+            query: String::from("litellm"),
+            projects: app.projects.clone(),
+            total_matches: 2,
+            first_session_path: Some(PathBuf::from("/tmp/a.jsonl")),
+        });
+
+        assert!(
+            app.status
+                .contains("Search 'litellm' matched 2 session(s) in 2 project(s)")
+        );
+        assert!(
+            app.status
+                .contains("new sessions changed the result set; focused first matching session")
+        );
     }
 
     #[test]
