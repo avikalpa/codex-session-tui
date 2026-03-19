@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.0.1 - 2026-03-19
+
+- Streamed startup and refresh loading so the TUI no longer waits for a full local-plus-remote scan before becoming usable.
+- Local sessions now populate incrementally, remote machines arrive one by one, and folder session counts update as the browser fills.
+- Preserved existing tree collapse state during async updates and ensured newly arriving remote machine/folder rows stay collapsed by default.
+- Slowed the blinking `Working...` indicator so long-running background work is easier to track in the status bar.
+- Fixed kept-search status so preview hit controls and hit counts stay visible while clicking around filtered sessions.
+
 ## 1.3.26 - 2026-03-16
 
 - Added folder and subtree delete from the browser with the same `d` confirmation flow already used for session delete.
