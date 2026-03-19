@@ -163,6 +163,8 @@ On launch:
 - the browser starts on the `local` machine root
 - the first machine root is visible immediately
 - folders start collapsed so the tree is readable
+- local and remote sessions stream in incrementally instead of blocking the first frame
+- folder rows update their session counts as the browser fills
 - no session preview is shown until you actually select a session
 
 ## Navigation
@@ -179,7 +181,7 @@ On launch:
 - `Ctrl+Up` / `Ctrl+Down`: jump between projects
 - `Ctrl+Left`: collapse all folders except the current one
 - `Ctrl+Right`: expand all folders
-- `F5` / `Ctrl+R`: refresh local and remote state
+- `F5` / `Ctrl+R`: refresh local and remote state in the background
 - `R`: add or update a remote machine
 - `d`: delete the selected remote machine entry
 - `n`: create a new virtual folder under the selected machine or folder
@@ -391,9 +393,16 @@ Move, copy, paste, export, and folder-wide operations can take time, especially 
 When that happens, the status bar shows:
 
 - an explicit `Working...` state immediately
-- a blinking `Working...` indicator while the operation is active
+- a slower blinking `Working...` indicator while the operation is active
 - a live progress bar
 - counts for completed, skipped, and failed session transfers
+
+Startup and refresh use the same model:
+
+- the UI stays responsive while the browser populates
+- local sessions stream in first
+- remote machines update as each scan finishes
+- new async-loaded machine and folder rows arrive collapsed so the existing tree state is preserved
 
 That keeps long remote copies and grouped drag/drop operations understandable instead of looking like a stalled terminal UI.
 
