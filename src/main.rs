@@ -270,7 +270,6 @@ fn handle_paste_event(text: String, app: &mut App) {
     if app.search_focused {
         insert_text_at_cursor(&mut app.search_query, &mut app.search_cursor, &text);
         app.search_dirty = true;
-        app.process_search_update();
         return;
     }
     if app.mode == Mode::Input && app.input_focused {
@@ -684,7 +683,9 @@ fn trigger_status_button(button: StatusButton, app: &mut App) {
 
 fn handle_status_click(x: u16, y: u16, app: &mut App) {
     let content_y = app.panes.status.y.saturating_add(1);
-    let controls_y = content_y.saturating_add(2);
+    let controls_y = content_y
+        .saturating_add(status_key_line_count(app))
+        .saturating_add(1);
     if y == controls_y {
         let mut cursor = 0u16;
         let rel_x = x.saturating_sub(app.panes.status.x.saturating_add(1));
@@ -701,6 +702,24 @@ fn handle_status_click(x: u16, y: u16, app: &mut App) {
 
     if app.mode == Mode::Input && y == controls_y.saturating_add(1) {
         app.input_focused = true;
+    }
+}
+
+fn status_key_line_count(app: &App) -> u16 {
+    if app.mode == Mode::Input {
+        1
+    } else if app.search_focused || (app.focus == Focus::Preview && app.mode == Mode::Normal) {
+        1
+    } else if app.focus == Focus::Projects
+        && app.mode == Mode::Normal
+        && matches!(
+            app.browser_cursor,
+            BrowserCursor::Project | BrowserCursor::Group | BrowserCursor::Session
+        )
+    {
+        2
+    } else {
+        1
     }
 }
 
@@ -911,13 +930,11 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
             KeyCode::Backspace => {
                 if delete_char_before_cursor(&mut app.search_query, &mut app.search_cursor) {
                     app.search_dirty = true;
-                    app.process_search_update();
                 }
             }
             KeyCode::Delete => {
                 if delete_char_at_cursor(&mut app.search_query, app.search_cursor) {
                     app.search_dirty = true;
-                    app.process_search_update();
                 }
             }
             KeyCode::Left => {
@@ -946,7 +963,6 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
                         &ch.to_string(),
                     );
                     app.search_dirty = true;
-                    app.process_search_update();
                 }
             }
             _ => {}
@@ -1648,6 +1664,7 @@ struct App {
     search_focused: bool,
     search_dirty: bool,
     search_job_seq: u64,
+    search_data_seq: u64,
     search_job_running: bool,
     search_result_rx: Option<std::sync::mpsc::Receiver<SearchFilterResult>>,
     preview_mode: PreviewMode,
@@ -1725,6 +1742,7 @@ struct SessionActionProgress {
 #[derive(Clone)]
 struct SearchFilterResult {
     seq: u64,
+    data_seq: u64,
     query: String,
     projects: Vec<ProjectBucket>,
     total_matches: usize,
@@ -2413,6 +2431,7 @@ impl App {
             search_focused: false,
             search_dirty: false,
             search_job_seq: 0,
+            search_data_seq: 0,
             search_job_running: false,
             search_result_rx: None,
             preview_mode: PreviewMode::Chat,
@@ -2614,6 +2633,7 @@ impl App {
         let previous_projects = self.projects.clone();
         let previous_collapsed_groups = self.collapsed_groups.clone();
         let previous_collapsed_projects = self.collapsed_projects.clone();
+        self.search_data_seq = self.search_data_seq.wrapping_add(1);
         self.all_projects = all_projects;
         self.remote_states = remote_states;
         self.search_job_running = false;
@@ -3399,6 +3419,7 @@ impl App {
         }
         let result = compute_search_filter_result(
             self.search_job_seq,
+            self.search_data_seq,
             self.search_query.clone(),
             self.all_projects.clone(),
         );
@@ -3409,9 +3430,17 @@ impl App {
         if !self.search_dirty {
             return;
         }
-        self.search_job_running = false;
-        self.search_result_rx = None;
-        self.apply_search_filter();
+        if self.search_query.trim().is_empty() {
+            self.search_job_running = false;
+            self.search_result_rx = None;
+            self.apply_search_filter();
+            self.search_dirty = false;
+            return;
+        }
+        if self.search_job_running || self.all_projects.is_empty() {
+            return;
+        }
+        self.start_search_job();
         self.search_dirty = false;
     }
 
@@ -4221,6 +4250,25 @@ impl App {
         })
     }
 
+    fn start_search_job(&mut self) {
+        if self.search_query.trim().is_empty() || self.all_projects.is_empty() {
+            return;
+        }
+        self.search_job_seq += 1;
+        let seq = self.search_job_seq;
+        let data_seq = self.search_data_seq;
+        let query = self.search_query.clone();
+        let projects = self.all_projects.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.search_result_rx = Some(rx);
+        self.search_job_running = true;
+        self.status = format!("Searching '{}'...", self.search_query);
+        std::thread::spawn(move || {
+            let result = compute_search_filter_result(seq, data_seq, query, projects);
+            let _ = tx.send(result);
+        });
+    }
+
     fn poll_search_job(&mut self) {
         let Some(rx) = &self.search_result_rx else {
             return;
@@ -4230,7 +4278,10 @@ impl App {
         };
         self.search_job_running = false;
         self.search_result_rx = None;
-        if result.seq != self.search_job_seq || result.query != self.search_query {
+        if result.seq != self.search_job_seq
+            || result.data_seq != self.search_data_seq
+            || result.query != self.search_query
+        {
             return;
         }
         self.apply_search_result(result);
@@ -6854,6 +6905,7 @@ fn literal_search_score(token: &str, haystack: &str, weight: i64) -> Option<i64>
 
 fn compute_search_filter_result(
     seq: u64,
+    data_seq: u64,
     query: String,
     all_projects: Vec<ProjectBucket>,
 ) -> SearchFilterResult {
@@ -6908,6 +6960,7 @@ fn compute_search_filter_result(
 
     SearchFilterResult {
         seq,
+        data_seq,
         query,
         projects,
         total_matches,
@@ -10158,6 +10211,7 @@ mod tests {
             search_focused: false,
             search_dirty: false,
             search_job_seq: 0,
+            search_data_seq: 0,
             search_job_running: false,
             search_result_rx: None,
             preview_mode: PreviewMode::Chat,
@@ -12987,6 +13041,7 @@ mod tests {
             search_focused: false,
             search_dirty: false,
             search_job_seq: 0,
+            search_data_seq: 0,
             search_job_running: false,
             search_result_rx: None,
             preview_mode: PreviewMode::Chat,
@@ -13703,6 +13758,7 @@ mod tests {
             search_focused: true,
             search_dirty: true,
             search_job_seq: 0,
+            search_data_seq: 0,
             search_job_running: false,
             search_result_rx: None,
             preview_mode: PreviewMode::Chat,
@@ -13954,10 +14010,12 @@ mod tests {
         .expect("type");
 
         assert_eq!(app.search_query, "litell");
-        assert!(!app.search_dirty);
-        assert_eq!(app.projects.len(), 1);
-        assert_eq!(app.projects[0].cwd, "/repo/litellm");
-        assert!(app.status.contains("Search 'litell' matched 1 session"));
+        assert!(app.search_dirty);
+
+        app.process_search_update();
+
+        assert!(app.search_job_running);
+        assert!(app.status.contains("Searching 'litell'"));
     }
 
     #[test]
@@ -14176,10 +14234,46 @@ mod tests {
         app.preview_search_index = Some(1);
         app.panes.status = ratatui::layout::Rect::new(0, 0, 120, 5);
         app.panes.preview.height = 12;
-
-        handle_status_click(1, 3, &mut app);
+        trigger_status_button(StatusButton::PrevHit, &mut app);
 
         assert_eq!(app.preview_search_index, Some(0));
+    }
+
+    #[test]
+    fn handle_status_click_triggers_prev_session_button_after_wrap() {
+        let mut app = empty_test_app();
+        app.search_query = String::from("litellm");
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Session;
+        app.projects = vec![
+            ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
+                machine_exec_prefix: None,
+                cwd: String::from("/repo/a"),
+                sessions: vec![sample_session("/tmp/a.jsonl", "/repo/a", "a")],
+            },
+            ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
+                machine_exec_prefix: None,
+                cwd: String::from("/repo/b"),
+                sessions: vec![sample_session("/tmp/b.jsonl", "/repo/b", "b")],
+            },
+        ];
+        app.all_projects = app.projects.clone();
+        app.project_idx = 1;
+        app.session_idx = 0;
+        app.panes.status = ratatui::layout::Rect::new(0, 0, 180, 6);
+
+        let click_y = app.panes.status.y + 1 + status_key_line_count(&app) + 1;
+        handle_status_click(1, click_y, &mut app);
+
+        assert_eq!(app.project_idx, 0);
+        assert_eq!(app.session_idx, 0);
+        assert!(app.status.contains("Matching session 1/2"));
     }
 
     #[test]
@@ -15165,6 +15259,7 @@ mod tests {
             search_focused: false,
             search_dirty: false,
             search_job_seq: 0,
+            search_data_seq: 0,
             search_job_running: false,
             search_result_rx: None,
             preview_mode: PreviewMode::Chat,
@@ -15651,7 +15746,7 @@ codex_home = "/root/.codex"
         handle_paste_event(String::from(" router"), &mut app);
 
         assert_eq!(app.search_query, "open router");
-        assert!(!app.search_dirty);
+        assert!(app.search_dirty);
     }
 
     #[test]

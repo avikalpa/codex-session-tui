@@ -230,7 +230,7 @@ Search is built to feel like editor search, not fuzzy guesswork.
 
 It:
 
-- updates results on each keystroke instead of waiting for a deferred background-search pause
+- updates the query immediately and starts searching without waiting for the old deferred background-search pause
 - filters the browser tree
 - searches conversation text, path, session id/hash, and file name
 - supports multi-word search
