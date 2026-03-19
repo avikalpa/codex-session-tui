@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.7 - 2026-03-19
+
+- Fixed async search/loading status so the footer explains when streamed session updates are still arriving and when refreshed results move focus back to the first matching session.
+
 ## 2.0.6 - 2026-03-19
 
 - Fixed search session navigation so stepping to the previous or next matching session expands the browser tree to reveal that session and moves the browser cursor onto it.
