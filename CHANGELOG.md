@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.0.4 - 2026-03-19
+
+- Changed search to update immediately on each keystroke instead of waiting for the old deferred background-search pause, which removes visible lag while typing queries such as `litellm`.
+- Added separate search navigation for matching sessions and matching hits inside the current session.
+- Kept hit navigation scoped to the current session and added explicit status messages when `n` / `N` wraps at the end or beginning of that session.
+
 ## 2.0.3 - 2026-03-19
 
 - Fixed browser folder/project counts so tree rows consistently show subtree session totals instead of mixing direct-project counts with descendant-folder counts.

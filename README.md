@@ -230,6 +230,7 @@ Search is built to feel like editor search, not fuzzy guesswork.
 
 It:
 
+- updates results on each keystroke instead of waiting for a deferred background-search pause
 - filters the browser tree
 - searches conversation text, path, session id/hash, and file name
 - supports multi-word search
@@ -239,7 +240,6 @@ It:
 - highlights matches in Browser and Preview
 - highlights the primary preview hit more strongly than later hits
 - keeps Preview attached to the current filtered browser context instead of going blank
-- runs filtering asynchronously so typing stays responsive on larger session stores
 
 Search navigation:
 
@@ -248,9 +248,10 @@ Search navigation:
 - `Left` / `Right`: move inside the search text
 - `Ctrl+A` / `Ctrl+E`: jump to start/end of the search text
 - `Tab` / `Shift+Tab`: move focus out of the search box
-- `n` / `N` in Preview: next/previous occurrence in the current chat
-- `n` / `N` on a selected session row while search is active: next/previous occurrence in that session without switching panes
-- footer buttons `[Prev Hit]` / `[Next Hit]` are clickable by mouse
+- `[` / `]`: previous/next matching session in the filtered results
+- `n` / `N`: previous/next occurrence in the current session only
+- when `n` / `N` reaches the end or beginning of the current session, the status bar tells you it wrapped and keeps navigation inside that session
+- footer buttons `[Prev Session]` / `[Next Session]` and `[Prev Hit]` / `[Next Hit]` are clickable by mouse
 - the Preview header shows the current hit count as `hits=x/y`
 
 ## Session Workflows
