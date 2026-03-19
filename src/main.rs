@@ -1801,7 +1801,8 @@ struct StartupLocalResult {
 }
 
 enum StartupWorkItem {
-    Local(Result<StartupLocalResult, String>),
+    LocalSnapshot(Vec<ProjectBucket>),
+    LocalFinal(Result<StartupLocalResult, String>),
     Remote {
         machine_name: String,
         state: RemoteMachineState,
@@ -2443,15 +2444,15 @@ impl App {
         };
 
         if include_remote_scan {
-            let local_projects = scan_local_sessions(&app.sessions_root)?;
-            app.apply_scanned_projects(local_projects, BTreeMap::new(), false);
             app.startup_loading = true;
-            app.status = String::from("Working... loading remote sessions");
+            app.status = String::from("Working... loading sessions");
             app.startup_load_rx = Some(start_startup_loader(
                 app.config.clone(),
                 app.sessions_root.clone(),
                 app.state_db_path.clone(),
-                app.all_projects.clone(),
+                Vec::new(),
+                BTreeMap::new(),
+                true,
             ));
             Ok(app)
         } else {
@@ -2481,7 +2482,27 @@ impl App {
     }
 
     fn reload(&mut self, force_remote_scan: bool) -> Result<()> {
-        self.reload_mode(force_remote_scan, true)
+        self.start_background_refresh(force_remote_scan);
+        Ok(())
+    }
+
+    fn start_background_refresh(&mut self, force_remote_scan: bool) {
+        let initial_local_projects = self
+            .all_projects
+            .iter()
+            .filter(|project| project.machine_name == "local")
+            .cloned()
+            .collect::<Vec<_>>();
+        self.startup_loading = true;
+        self.status = String::from("Working... refreshing sessions");
+        self.startup_load_rx = Some(start_startup_loader(
+            self.config.clone(),
+            self.sessions_root.clone(),
+            self.state_db_path.clone(),
+            initial_local_projects,
+            self.remote_states.clone(),
+            force_remote_scan,
+        ));
     }
 
     fn poll_startup_load(&mut self) {
@@ -2522,7 +2543,21 @@ impl App {
                         result.remote_states,
                         had_projects_before,
                     );
-                    if result.repaired_count > 0
+                    if !result.finished {
+                        let verb = if self.status.starts_with("Working... refreshing") {
+                            "refreshing"
+                        } else {
+                            "loading"
+                        };
+                        self.status = format!(
+                            "Working... {verb} sessions: {} sessions, {} projects",
+                            self.projects
+                                .iter()
+                                .map(|project| project.sessions.len())
+                                .sum::<usize>(),
+                            self.projects.len()
+                        );
+                    } else if result.repaired_count > 0
                         || result.repaired_id_count > 0
                         || result.synced_threads > 0
                     {
@@ -2556,6 +2591,9 @@ impl App {
         remote_states: BTreeMap<String, RemoteMachineState>,
         had_projects_before: bool,
     ) {
+        let previous_projects = self.projects.clone();
+        let previous_collapsed_groups = self.collapsed_groups.clone();
+        let previous_collapsed_projects = self.collapsed_projects.clone();
         self.all_projects = all_projects;
         self.remote_states = remote_states;
         self.search_job_running = false;
@@ -2572,6 +2610,12 @@ impl App {
             self.search_dirty = false;
             if !had_projects_before {
                 self.collapse_all_projects();
+            } else {
+                self.preserve_tree_state_for_async_updates(
+                    &previous_projects,
+                    &previous_collapsed_groups,
+                    &previous_collapsed_projects,
+                );
             }
         } else {
             self.search_dirty = true;
@@ -2580,7 +2624,9 @@ impl App {
         if self.projects.is_empty() {
             self.project_idx = 0;
             self.session_idx = 0;
-            self.status = format!("No sessions found under {}", self.sessions_root.display());
+            if !self.status.starts_with("Working...") {
+                self.status = format!("No sessions found under {}", self.sessions_root.display());
+            }
             return;
         }
 
@@ -2596,7 +2642,7 @@ impl App {
             self.browser_cursor = BrowserCursor::Project;
         }
 
-        if self.search_query.trim().is_empty() {
+        if self.search_query.trim().is_empty() && !self.status.starts_with("Working...") {
             self.status = format!("Loaded {} projects", self.projects.len());
             if let Some(summary) = self.remote_health_summary() {
                 self.status.push_str(&format!("  {summary}"));
@@ -2605,6 +2651,7 @@ impl App {
         self.ensure_selection_visible();
     }
 
+    #[allow(dead_code)]
     fn reload_mode(&mut self, force_remote_scan: bool, include_remote_scan: bool) -> Result<()> {
         let had_projects_before = !self.projects.is_empty();
         let (all_projects, remote_states) =
@@ -2616,11 +2663,41 @@ impl App {
         Ok(())
     }
 
+    fn preserve_tree_state_for_async_updates(
+        &mut self,
+        previous_projects: &[ProjectBucket],
+        previous_collapsed_groups: &HashSet<String>,
+        previous_collapsed_projects: &HashSet<String>,
+    ) {
+        let old_group_paths =
+            default_collapsed_group_paths(previous_projects, &self.config.virtual_folders);
+        let new_group_paths =
+            default_collapsed_group_paths(&self.projects, &self.config.virtual_folders);
+        self.collapsed_groups = previous_collapsed_groups.clone();
+        for path in new_group_paths.difference(&old_group_paths) {
+            self.collapsed_groups.insert(path.clone());
+        }
+
+        self.collapsed_projects = previous_collapsed_projects.clone();
+        let existing_project_keys = previous_projects
+            .iter()
+            .map(project_bucket_key)
+            .collect::<HashSet<_>>();
+        for project in &self.projects {
+            let key = project_bucket_key(project);
+            if !existing_project_keys.contains(&key) {
+                self.collapsed_projects.insert(key);
+                self.collapsed_projects.insert(project.cwd.clone());
+            }
+        }
+    }
+
     fn expand_all_for_cli(&mut self) {
         self.collapsed_groups.clear();
         self.collapsed_projects.clear();
     }
 
+    #[allow(dead_code)]
     fn scan_all_projects(
         &mut self,
         force_remote_scan: bool,
@@ -6131,7 +6208,7 @@ fn progress_bar(done: usize, total: usize, width: usize) -> String {
 fn working_blink_on() -> bool {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| (d.as_millis() / 450) % 2 == 0)
+        .map(|d| (d.as_millis() / 900) % 2 == 0)
         .unwrap_or(true)
 }
 
@@ -7620,6 +7697,60 @@ fn scan_local_sessions(root: &Path) -> Result<Vec<ProjectBucket>> {
         .collect())
 }
 
+fn scan_local_sessions_streaming<F>(root: &Path, batch_size: usize, mut on_batch: F) -> Result<()>
+where
+    F: FnMut(Vec<ProjectBucket>) -> Result<()>,
+{
+    if !root.exists() {
+        on_batch(Vec::new())?;
+        return Ok(());
+    }
+
+    let mut projects: HashMap<String, Vec<SessionSummary>> = HashMap::new();
+    let mut seen = 0usize;
+    walk_jsonl_files(root, &mut |path| {
+        if let Ok(summary) = parse_local_session_summary(path) {
+            projects
+                .entry(summary.cwd.clone())
+                .or_default()
+                .push(summary);
+            seen += 1;
+            if seen % batch_size.max(1) == 0 {
+                on_batch(local_projects_from_map(&projects))?;
+            }
+        }
+        Ok(())
+    })?;
+
+    on_batch(local_projects_from_map(&projects))?;
+    Ok(())
+}
+
+fn local_projects_from_map(projects: &HashMap<String, Vec<SessionSummary>>) -> Vec<ProjectBucket> {
+    let mut sorted_projects = BTreeMap::new();
+    for (cwd, sessions) in projects {
+        let mut sessions = sessions.clone();
+        sessions.sort_by(|a, b| {
+            b.modified_epoch
+                .cmp(&a.modified_epoch)
+                .then_with(|| b.started_at.cmp(&a.started_at))
+        });
+        sorted_projects.insert(cwd.clone(), sessions);
+    }
+
+    sorted_projects
+        .into_iter()
+        .map(|(cwd, sessions)| ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            cwd,
+            sessions,
+        })
+        .collect()
+}
+
 fn collect_jsonl_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     for entry in fs::read_dir(root).with_context(|| format!("failed to read {}", root.display()))? {
         let entry = entry?;
@@ -7641,6 +7772,32 @@ fn collect_jsonl_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn walk_jsonl_files<F>(root: &Path, visit: &mut F) -> Result<()>
+where
+    F: FnMut(&Path) -> Result<()>,
+{
+    for entry in fs::read_dir(root).with_context(|| format!("failed to read {}", root.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = entry.metadata()?;
+
+        if metadata.is_dir() {
+            walk_jsonl_files(&path, visit)?;
+            continue;
+        }
+
+        if metadata.is_file()
+            && path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|name| name.ends_with(".jsonl"))
+        {
+            visit(&path)?;
+        }
+    }
     Ok(())
 }
 
@@ -8351,6 +8508,8 @@ fn start_startup_loader(
     sessions_root: PathBuf,
     state_db_path: Option<PathBuf>,
     initial_local_projects: Vec<ProjectBucket>,
+    initial_remote_states: BTreeMap<String, RemoteMachineState>,
+    force_remote_scan: bool,
 ) -> std::sync::mpsc::Receiver<Result<StartupLoadResult, String>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -8361,21 +8520,30 @@ fn start_startup_loader(
             let sessions_root = sessions_root.clone();
             let state_db_path = state_db_path.clone();
             std::thread::spawn(move || {
+                let stream_result = scan_local_sessions_streaming(&sessions_root, 24, |projects| {
+                    let _ = work_tx.send(StartupWorkItem::LocalSnapshot(projects));
+                    Ok(())
+                });
+                if let Err(err) = stream_result {
+                    let _ = work_tx.send(StartupWorkItem::LocalFinal(Err(format!("{err:#}"))));
+                    return;
+                }
                 std::thread::sleep(STARTUP_LOCAL_REPAIR_DELAY);
                 let result = load_startup_local_state(sessions_root, state_db_path)
                     .map_err(|err| format!("{err:#}"));
-                let _ = work_tx.send(StartupWorkItem::Local(result));
+                let _ = work_tx.send(StartupWorkItem::LocalFinal(result));
             });
         }
 
         for machine in config.machines.clone() {
             let work_tx = work_tx.clone();
+            let previous = initial_remote_states
+                .get(&machine.name)
+                .cloned()
+                .unwrap_or_default();
             std::thread::spawn(move || {
-                let state = scan_remote_machine_with_previous(
-                    &machine,
-                    &RemoteMachineState::default(),
-                    true,
-                );
+                let state =
+                    scan_remote_machine_with_previous(&machine, &previous, force_remote_scan);
                 let _ = work_tx.send(StartupWorkItem::Remote {
                     machine_name: machine.name.clone(),
                     state,
@@ -8385,7 +8553,7 @@ fn start_startup_loader(
         drop(work_tx);
 
         let mut local_projects = initial_local_projects;
-        let mut remote_states = BTreeMap::new();
+        let mut remote_states = initial_remote_states;
         let mut repaired_count = 0usize;
         let mut repaired_id_count = 0usize;
         let mut synced_threads = 0usize;
@@ -8395,15 +8563,18 @@ fn start_startup_loader(
             let Ok(item) = work_rx.recv() else {
                 break;
             };
-            pending = pending.saturating_sub(1);
             match item {
-                StartupWorkItem::Local(Ok(result)) => {
+                StartupWorkItem::LocalSnapshot(projects) => {
+                    local_projects = projects;
+                }
+                StartupWorkItem::LocalFinal(Ok(result)) => {
+                    pending = pending.saturating_sub(1);
                     local_projects = result.local_projects;
                     repaired_count = result.repaired_count;
                     repaired_id_count = result.repaired_id_count;
                     synced_threads = result.synced_threads;
                 }
-                StartupWorkItem::Local(Err(err)) => {
+                StartupWorkItem::LocalFinal(Err(err)) => {
                     let _ = tx.send(Err(err));
                     return;
                 }
@@ -8411,6 +8582,7 @@ fn start_startup_loader(
                     machine_name,
                     state,
                 } => {
+                    pending = pending.saturating_sub(1);
                     remote_states.insert(machine_name, state);
                 }
             }
@@ -9915,7 +10087,7 @@ mod tests {
     }
 
     #[test]
-    fn load_from_parts_prefills_local_projects_before_background_startup_finishes() {
+    fn load_from_parts_starts_background_loading_without_blocking_on_local_scan() {
         let dir = std::env::temp_dir().join(format!("cse-startup-local-first-{}", Uuid::new_v4()));
         let sessions_root = dir.join("sessions");
         let session_path = sessions_root
@@ -9936,8 +10108,35 @@ mod tests {
 
         assert!(app.startup_loading);
         assert!(app.startup_load_rx.is_some());
-        assert_eq!(app.projects.len(), 1);
-        assert_eq!(app.projects[0].cwd, "/tmp/x");
+        assert!(app.projects.is_empty());
+        assert_eq!(app.status, "Working... loading sessions");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn scan_local_sessions_streaming_emits_partial_snapshots() {
+        let dir = std::env::temp_dir().join(format!("cse-stream-local-{}", Uuid::new_v4()));
+        let sessions_root = dir.join("sessions");
+        write_test_session(
+            &sessions_root.join("2026/03/19/a.jsonl"),
+            &sample_chat_jsonl().replace("\"/tmp/x\"", "\"/repo/a\""),
+        );
+        write_test_session(
+            &sessions_root.join("2026/03/19/b.jsonl"),
+            &sample_chat_jsonl().replace("\"/tmp/x\"", "\"/repo/b\""),
+        );
+
+        let mut snapshots = Vec::new();
+        scan_local_sessions_streaming(&sessions_root, 1, |projects| {
+            snapshots.push(projects.iter().map(|p| p.sessions.len()).sum::<usize>());
+            Ok(())
+        })
+        .expect("stream scan");
+
+        assert!(snapshots.len() >= 2);
+        assert!(snapshots.contains(&1));
+        assert_eq!(snapshots.last().copied(), Some(2));
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -9996,6 +10195,53 @@ mod tests {
         assert!(app.startup_load_rx.is_some());
         assert_eq!(app.projects.len(), 2);
         assert!(app.remote_states.contains_key("pi"));
+    }
+
+    #[test]
+    fn apply_scanned_projects_preserves_existing_tree_state_and_collapses_new_async_remote_rows() {
+        let mut app = empty_test_app();
+        let local = ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            cwd: String::from("/repo/local"),
+            sessions: vec![sample_session("/tmp/local.jsonl", "/repo/local", "local-1")],
+        };
+        app.projects = vec![local.clone()];
+        app.all_projects = app.projects.clone();
+        app.collapsed_groups.clear();
+        app.collapsed_projects.clear();
+
+        let remote = ProjectBucket {
+            machine_name: String::from("pi"),
+            machine_target: Some(String::from("pi@host")),
+            machine_codex_home: Some(String::from("/home/pi/.codex")),
+            machine_exec_prefix: None,
+            cwd: String::from("/remote/repo"),
+            sessions: vec![sample_session(
+                "/tmp/remote.jsonl",
+                "/remote/repo",
+                "remote-1",
+            )],
+        };
+        let mut remote_states = BTreeMap::new();
+        remote_states.insert(
+            String::from("pi"),
+            RemoteMachineState {
+                status: RemoteMachineStatus::Healthy,
+                last_error: None,
+                cached_projects: vec![remote.clone()],
+                last_scan_at: Some(Instant::now()),
+            },
+        );
+
+        app.apply_scanned_projects(vec![local, remote], remote_states, true);
+
+        assert!(!app.collapsed_groups.contains("local"));
+        assert!(!app.collapsed_projects.contains("/repo/local"));
+        assert!(app.collapsed_groups.contains("pi"));
+        assert!(app.collapsed_projects.contains("/remote/repo"));
     }
 
     fn init_test_state_db(path: &Path) {
@@ -14014,7 +14260,7 @@ mod tests {
     }
 
     #[test]
-    fn f5_reloads_sessions() {
+    fn f5_starts_async_refresh() {
         let dir = std::env::temp_dir().join(format!("cse-refresh-f5-{}", Uuid::new_v4()));
         let sessions_root = dir.join("sessions");
         let source_path = sessions_root.join("2026/03/14/source.jsonl");
@@ -14026,12 +14272,13 @@ mod tests {
         let quit = handle_normal_mode(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE), &mut app)
             .expect("handle");
         assert!(!quit);
-        assert_eq!(app.projects.len(), 1);
-        assert_eq!(app.projects[0].cwd, "/tmp/x");
+        assert!(app.startup_loading);
+        assert!(app.startup_load_rx.is_some());
+        assert!(app.status.starts_with("Working... refreshing sessions"));
     }
 
     #[test]
-    fn ctrl_r_reloads_sessions() {
+    fn ctrl_r_starts_async_refresh() {
         let dir = std::env::temp_dir().join(format!("cse-refresh-ctrlr-{}", Uuid::new_v4()));
         let sessions_root = dir.join("sessions");
         let source_path = sessions_root.join("2026/03/14/source.jsonl");
@@ -14046,8 +14293,9 @@ mod tests {
         )
         .expect("handle");
         assert!(!quit);
-        assert_eq!(app.projects.len(), 1);
-        assert_eq!(app.projects[0].cwd, "/tmp/x");
+        assert!(app.startup_loading);
+        assert!(app.startup_load_rx.is_some());
+        assert!(app.status.starts_with("Working... refreshing sessions"));
     }
 
     #[test]
