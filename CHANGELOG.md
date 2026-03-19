@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.0.5 - 2026-03-19
+
+- Fixed search typing so the query updates immediately and search jobs start without the old idle wait, while keeping the heavy filtering work off the keystroke path.
+- Fixed footer click handling so search session buttons use the correct dynamic status-bar row.
+- Fixed search behavior during streamed session loading so background load updates no longer block typing one partial query chunk at a time.
+
 ## 2.0.4 - 2026-03-19
 
 - Changed search to update immediately on each keystroke instead of waiting for the old deferred background-search pause, which removes visible lag while typing queries such as `litellm`.
