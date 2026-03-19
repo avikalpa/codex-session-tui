@@ -1480,6 +1480,7 @@ struct BrowserRow {
     kind: BrowserRowKind,
     depth: usize,
     label: String,
+    count: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1788,6 +1789,22 @@ struct StartupLoadResult {
     repaired_count: usize,
     repaired_id_count: usize,
     synced_threads: usize,
+    finished: bool,
+}
+
+struct StartupLocalResult {
+    local_projects: Vec<ProjectBucket>,
+    repaired_count: usize,
+    repaired_id_count: usize,
+    synced_threads: usize,
+}
+
+enum StartupWorkItem {
+    Local(Result<StartupLocalResult, String>),
+    Remote {
+        machine_name: String,
+        state: RemoteMachineState,
+    },
 }
 
 impl App {
@@ -2429,16 +2446,12 @@ impl App {
             app.apply_scanned_projects(local_projects, BTreeMap::new(), false);
             app.startup_loading = true;
             app.status = String::from("Working... loading remote sessions");
-            let config = app.config.clone();
-            let sessions_root = app.sessions_root.clone();
-            let state_db_path = app.state_db_path.clone();
-            let (tx, rx) = std::sync::mpsc::channel();
-            app.startup_load_rx = Some(rx);
-            std::thread::spawn(move || {
-                let result = load_startup_state(config, sessions_root, state_db_path, true)
-                    .map_err(|err| format!("{err:#}"));
-                let _ = tx.send(result);
-            });
+            app.startup_load_rx = Some(start_startup_loader(
+                app.config.clone(),
+                app.sessions_root.clone(),
+                app.state_db_path.clone(),
+                app.all_projects.clone(),
+            ));
             Ok(app)
         } else {
             let cwd_base = env::current_dir().context("failed to resolve current directory")?;
@@ -2471,36 +2484,68 @@ impl App {
     }
 
     fn poll_startup_load(&mut self) {
-        let Some(rx) = &self.startup_load_rx else {
+        if self.startup_load_rx.is_none() {
             return;
-        };
-        let Ok(result) = rx.try_recv() else {
-            return;
-        };
-        self.startup_load_rx = None;
-        self.startup_loading = false;
-        let had_projects_before = !self.projects.is_empty();
-        match result {
-            Ok(result) => {
-                self.apply_scanned_projects(
-                    result.all_projects,
-                    result.remote_states,
-                    had_projects_before,
-                );
-                if result.repaired_count > 0
-                    || result.repaired_id_count > 0
-                    || result.synced_threads > 0
-                {
-                    self.status = format!(
-                        "Loaded {} projects, repaired {} cwd(s), repaired {} id(s), synced {} thread row(s)",
-                        self.projects.len(),
-                        result.repaired_count,
-                        result.repaired_id_count,
-                        result.synced_threads
-                    );
+        }
+
+        let mut results = Vec::new();
+        loop {
+            let recv_result = {
+                let rx = self
+                    .startup_load_rx
+                    .as_ref()
+                    .expect("startup receiver checked above");
+                rx.try_recv()
+            };
+            match recv_result {
+                Ok(result) => results.push(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.startup_load_rx = None;
+                    self.startup_loading = false;
+                    break;
                 }
             }
-            Err(err) => self.status = format!("Startup load failed: {err}"),
+        }
+
+        if results.is_empty() {
+            return;
+        }
+
+        for result in results {
+            let had_projects_before = !self.projects.is_empty();
+            match result {
+                Ok(result) => {
+                    self.apply_scanned_projects(
+                        result.all_projects,
+                        result.remote_states,
+                        had_projects_before,
+                    );
+                    if result.repaired_count > 0
+                        || result.repaired_id_count > 0
+                        || result.synced_threads > 0
+                    {
+                        self.status = format!(
+                            "Loaded {} projects, repaired {} cwd(s), repaired {} id(s), synced {} thread row(s)",
+                            self.projects.len(),
+                            result.repaired_count,
+                            result.repaired_id_count,
+                            result.synced_threads
+                        );
+                    }
+                    if result.finished {
+                        self.startup_load_rx = None;
+                        self.startup_loading = false;
+                    } else {
+                        self.startup_loading = true;
+                    }
+                }
+                Err(err) => {
+                    self.startup_load_rx = None;
+                    self.startup_loading = false;
+                    self.status = format!("Startup load failed: {err}");
+                }
+            }
         }
     }
 
@@ -5038,12 +5083,13 @@ fn render_browser(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
                     let icon = if row.depth == 0 { "🖥" } else { "📁" };
                     let group_label = if row.depth == 0 {
                         format!(
-                            "{} {}",
+                            "{} {} ({})",
                             row.label,
-                            machine_status_suffix(app.remote_status_for_machine(&row.label))
+                            machine_status_suffix(app.remote_status_for_machine(&row.label)),
+                            row.count,
                         )
                     } else {
-                        row.label.clone()
+                        format!("{} ({})", row.label, row.count)
                     };
                     let label = format!(
                         "{indent}{} {} {}",
@@ -5065,7 +5111,7 @@ fn render_browser(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
                         "{indent}{} 📁 {} ({})",
                         if collapsed { "▶" } else { "▼" },
                         row.label,
-                        project.sessions.len()
+                        row.count
                     );
                     ListItem::new(Line::from(prepend_style(
                         highlight_spans(&label, &app.search_query),
@@ -6780,6 +6826,7 @@ struct BrowserTreeNode {
     name: String,
     full_path: String,
     project_idx: Option<usize>,
+    session_count: usize,
     children: BTreeMap<String, BrowserTreeNode>,
 }
 
@@ -6855,6 +6902,7 @@ fn build_browser_tree(
         insert_browser_tree_group_path(root, rest);
     }
     compress_browser_tree_children(&mut roots);
+    populate_browser_tree_counts(&mut roots, projects);
     roots
 }
 
@@ -6917,8 +6965,33 @@ fn compress_browser_tree_node(node: &mut BrowserTreeNode, can_compress_self: boo
         node.name = browser_tree_join_label(&node.name, &child.name);
         node.full_path = child.full_path;
         node.project_idx = child.project_idx;
+        node.session_count = child.session_count;
         node.children = child.children;
     }
+}
+
+fn populate_browser_tree_counts(
+    nodes: &mut BTreeMap<String, BrowserTreeNode>,
+    projects: &[ProjectBucket],
+) {
+    for node in nodes.values_mut() {
+        populate_browser_tree_node_count(node, projects);
+    }
+}
+
+fn populate_browser_tree_node_count(
+    node: &mut BrowserTreeNode,
+    projects: &[ProjectBucket],
+) -> usize {
+    let mut count = node
+        .project_idx
+        .map(|project_idx| projects[project_idx].sessions.len())
+        .unwrap_or(0);
+    for child in node.children.values_mut() {
+        count += populate_browser_tree_node_count(child, projects);
+    }
+    node.session_count = count;
+    count
 }
 
 fn browser_tree_child_path(parent: &str, segment: &str) -> String {
@@ -6963,6 +7036,11 @@ fn append_browser_rows(
         },
         depth,
         label: node.name.clone(),
+        count: if let Some(project_idx) = node.project_idx {
+            projects[project_idx].sessions.len()
+        } else {
+            node.session_count
+        },
     });
 
     let collapsed = if group_only {
@@ -6989,6 +7067,7 @@ fn append_browser_rows(
                         .get(&projects[project_idx].sessions[session_idx].path)
                         .map(String::as_str),
                 ),
+                count: 0,
             });
         }
     }
@@ -8263,34 +8342,123 @@ fn repair_session_ids(root: &Path) -> Result<usize> {
     Ok(repaired)
 }
 
-fn load_startup_state(
+fn start_startup_loader(
     config: AppConfig,
     sessions_root: PathBuf,
     state_db_path: Option<PathBuf>,
-    include_remote_scan: bool,
-) -> Result<StartupLoadResult> {
+    initial_local_projects: Vec<ProjectBucket>,
+) -> std::sync::mpsc::Receiver<Result<StartupLoadResult, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (work_tx, work_rx) = std::sync::mpsc::channel();
+
+        {
+            let work_tx = work_tx.clone();
+            let sessions_root = sessions_root.clone();
+            let state_db_path = state_db_path.clone();
+            std::thread::spawn(move || {
+                let result = load_startup_local_state(sessions_root, state_db_path)
+                    .map_err(|err| format!("{err:#}"));
+                let _ = work_tx.send(StartupWorkItem::Local(result));
+            });
+        }
+
+        for machine in config.machines.clone() {
+            let work_tx = work_tx.clone();
+            std::thread::spawn(move || {
+                let state = scan_remote_machine_with_previous(
+                    &machine,
+                    &RemoteMachineState::default(),
+                    true,
+                );
+                let _ = work_tx.send(StartupWorkItem::Remote {
+                    machine_name: machine.name.clone(),
+                    state,
+                });
+            });
+        }
+        drop(work_tx);
+
+        let mut local_projects = initial_local_projects;
+        let mut remote_states = BTreeMap::new();
+        let mut repaired_count = 0usize;
+        let mut repaired_id_count = 0usize;
+        let mut synced_threads = 0usize;
+        let mut pending = 1usize + config.machines.len();
+
+        while pending > 0 {
+            let Ok(item) = work_rx.recv() else {
+                break;
+            };
+            pending = pending.saturating_sub(1);
+            match item {
+                StartupWorkItem::Local(Ok(result)) => {
+                    local_projects = result.local_projects;
+                    repaired_count = result.repaired_count;
+                    repaired_id_count = result.repaired_id_count;
+                    synced_threads = result.synced_threads;
+                }
+                StartupWorkItem::Local(Err(err)) => {
+                    let _ = tx.send(Err(err));
+                    return;
+                }
+                StartupWorkItem::Remote {
+                    machine_name,
+                    state,
+                } => {
+                    remote_states.insert(machine_name, state);
+                }
+            }
+
+            let all_projects = merge_local_and_remote_projects(&local_projects, &remote_states);
+            let _ = tx.send(Ok(StartupLoadResult {
+                all_projects,
+                remote_states: remote_states.clone(),
+                repaired_count,
+                repaired_id_count,
+                synced_threads,
+                finished: pending == 0,
+            }));
+        }
+    });
+    rx
+}
+
+fn load_startup_local_state(
+    sessions_root: PathBuf,
+    state_db_path: Option<PathBuf>,
+) -> Result<StartupLocalResult> {
     let cwd_base = env::current_dir().context("failed to resolve current directory")?;
     let repaired_count = repair_session_cwds(&sessions_root, &cwd_base)?;
     let repaired_id_count = repair_session_ids(&sessions_root)?;
-    let (all_projects, remote_states) = scan_all_projects_from_config(
-        &config,
-        &sessions_root,
-        &BTreeMap::new(),
-        true,
-        include_remote_scan,
-    )?;
+    let all_projects = scan_local_sessions(&sessions_root)?;
     let synced_threads = if let Some(db_path) = state_db_path.as_deref() {
         sync_threads_db_from_projects(db_path, &all_projects)?
     } else {
         0
     };
-    Ok(StartupLoadResult {
-        all_projects,
-        remote_states,
+    Ok(StartupLocalResult {
+        local_projects: all_projects,
         repaired_count,
         repaired_id_count,
         synced_threads,
     })
+}
+
+fn merge_local_and_remote_projects(
+    local_projects: &[ProjectBucket],
+    remote_states: &BTreeMap<String, RemoteMachineState>,
+) -> Vec<ProjectBucket> {
+    let mut all_projects = local_projects.to_vec();
+    for state in remote_states.values() {
+        all_projects.extend(state.cached_projects.iter().cloned());
+    }
+    all_projects.sort_by(|a, b| {
+        a.machine_name
+            .cmp(&b.machine_name)
+            .then_with(|| a.cwd.cmp(&b.cwd))
+    });
+    all_projects
 }
 
 fn resolve_state_db_path(codex_home: &Path) -> Option<PathBuf> {
@@ -9767,6 +9935,62 @@ mod tests {
         assert_eq!(app.projects[0].cwd, "/tmp/x");
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn poll_startup_load_applies_partial_remote_snapshot_without_finishing_loader() {
+        let mut app = empty_test_app();
+        let local = ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            cwd: String::from("/repo/local"),
+            sessions: vec![sample_session("/tmp/local.jsonl", "/repo/local", "local-1")],
+        };
+        let remote = ProjectBucket {
+            machine_name: String::from("pi"),
+            machine_target: Some(String::from("pi@host")),
+            machine_codex_home: Some(String::from("/home/pi/.codex")),
+            machine_exec_prefix: None,
+            cwd: String::from("/repo/remote"),
+            sessions: vec![sample_session(
+                "/tmp/remote.jsonl",
+                "/repo/remote",
+                "remote-1",
+            )],
+        };
+        app.all_projects = vec![local.clone()];
+        app.projects = vec![local];
+        app.startup_loading = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.startup_load_rx = Some(rx);
+        let mut remote_states = BTreeMap::new();
+        remote_states.insert(
+            String::from("pi"),
+            RemoteMachineState {
+                status: RemoteMachineStatus::Healthy,
+                last_error: None,
+                cached_projects: vec![remote.clone()],
+                last_scan_at: Some(Instant::now()),
+            },
+        );
+        tx.send(Ok(StartupLoadResult {
+            all_projects: vec![app.projects[0].clone(), remote],
+            remote_states,
+            repaired_count: 0,
+            repaired_id_count: 0,
+            synced_threads: 0,
+            finished: false,
+        }))
+        .expect("send");
+
+        app.poll_startup_load();
+
+        assert!(app.startup_loading);
+        assert!(app.startup_load_rx.is_some());
+        assert_eq!(app.projects.len(), 2);
+        assert!(app.remote_states.contains_key("pi"));
     }
 
     fn init_test_state_db(path: &Path) {
@@ -11643,6 +11867,7 @@ mod tests {
             kind: BrowserRowKind::Project { project_idx: 0 },
             depth: 0,
             label: String::from("repo"),
+            count: 0,
         };
         let now = Instant::now();
 
@@ -11659,6 +11884,7 @@ mod tests {
                 },
                 depth: 1,
                 label: String::from("sess"),
+                count: 0,
             },
             now.checked_add(Duration::from_millis(250)).unwrap_or(now)
         ));
@@ -13396,6 +13622,7 @@ mod tests {
             },
             depth: 1,
             label: String::new(),
+            count: 0,
         });
 
         assert_eq!(
@@ -13598,6 +13825,7 @@ mod tests {
             },
             depth: 1,
             label: String::new(),
+            count: 0,
         });
         app.focus_next_preview_search_match();
 
@@ -14952,6 +15180,58 @@ codex_home = "/root/.codex"
             })
             .expect("draw");
         assert!(buffer_contains(terminal.backend(), "[offline]"));
+    }
+
+    #[test]
+    fn render_browser_shows_folder_session_counts() {
+        let mut app = empty_test_app();
+        app.projects = vec![
+            ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
+                machine_exec_prefix: None,
+                cwd: String::from("/root/git/this"),
+                sessions: vec![sample_session(
+                    "/tmp/this.jsonl",
+                    "/root/git/this",
+                    "abcdef0",
+                )],
+            },
+            ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
+                machine_exec_prefix: None,
+                cwd: String::from("/root/git/that"),
+                sessions: vec![
+                    sample_session("/tmp/that-a.jsonl", "/root/git/that", "abcdef1"),
+                    sample_session("/tmp/that-b.jsonl", "/root/git/that", "abcdef2"),
+                ],
+            },
+        ];
+        app.collapsed_groups.clear();
+        app.collapsed_projects.clear();
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_browser(
+                    frame,
+                    ratatui::layout::Rect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 12,
+                    },
+                    &app,
+                );
+            })
+            .expect("draw");
+
+        assert!(buffer_contains(terminal.backend(), "local [ok] (3)"));
+        assert!(buffer_contains(terminal.backend(), "/root/git (3)"));
     }
 
     #[test]
