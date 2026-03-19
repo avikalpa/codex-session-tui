@@ -2568,6 +2568,11 @@ impl App {
                             result.repaired_id_count,
                             result.synced_threads
                         );
+                    } else {
+                        self.status = format!("Loaded {} projects", self.projects.len());
+                        if let Some(summary) = self.remote_health_summary() {
+                            self.status.push_str(&format!("  {summary}"));
+                        }
                     }
                     if result.finished {
                         self.startup_load_rx = None;
@@ -10195,6 +10200,37 @@ mod tests {
         assert!(app.startup_load_rx.is_some());
         assert_eq!(app.projects.len(), 2);
         assert!(app.remote_states.contains_key("pi"));
+    }
+
+    #[test]
+    fn poll_startup_load_finishes_with_loaded_status_when_no_repairs_occur() {
+        let mut app = empty_test_app();
+        app.status = String::from("Working... loading sessions");
+        app.startup_loading = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.startup_load_rx = Some(rx);
+        tx.send(Ok(StartupLoadResult {
+            all_projects: vec![ProjectBucket {
+                machine_name: String::from("local"),
+                machine_target: None,
+                machine_codex_home: None,
+                machine_exec_prefix: None,
+                cwd: String::from("/repo/local"),
+                sessions: vec![sample_session("/tmp/local.jsonl", "/repo/local", "local-1")],
+            }],
+            remote_states: BTreeMap::new(),
+            repaired_count: 0,
+            repaired_id_count: 0,
+            synced_threads: 0,
+            finished: true,
+        }))
+        .expect("send");
+
+        app.poll_startup_load();
+
+        assert!(!app.startup_loading);
+        assert!(app.startup_load_rx.is_none());
+        assert_eq!(app.status, "Loaded 1 projects");
     }
 
     #[test]
