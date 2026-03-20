@@ -2,8 +2,10 @@
 
 ## Unreleased
 
-- Preloaded local sessions synchronously at startup and now stream only remote machines in the background. This avoids the browser showing a partial local project/session set while the initial local scan is still in flight.
-- Added a conservative recovery path for complex sessions where Codex may resume only an earlier branch prefix: Preview warns about likely event-heavy sessions and `b` creates a fresh linear recovery clone without mutating the source session.
+## 2.0.9 - 2026-03-20
+
+- Fixed flatten recovery for compacted sessions by rebuilding chat turns from compacted `replacement_history`, so recovery clones keep earlier assistant replies instead of collapsing into user-only tails.
+- Changed interactive startup to stream local sessions, repairs, and thread-index sync in the background too, so the TUI opens immediately and finishes the heavy local work inside the UI.
 
 ## 2.0.8 - 2026-03-20
 
