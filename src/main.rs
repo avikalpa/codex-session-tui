@@ -194,6 +194,7 @@ fn duplicate_rewrite_flags(action: Action) -> (bool, bool) {
         Action::Copy | Action::ProjectCopy => (true, true),
         Action::Export => (true, false),
         Action::Fork => (true, true),
+        Action::Flatten => (false, false),
         Action::AddRemote
         | Action::Delete
         | Action::ProjectDelete
@@ -543,6 +544,7 @@ enum StatusButton {
     Move,
     Copy,
     Fork,
+    Flatten,
     Export,
     Delete,
     DeleteRemote,
@@ -596,6 +598,7 @@ fn status_buttons(app: &App) -> Vec<StatusButton> {
             StatusButton::Move,
             StatusButton::Copy,
             StatusButton::Fork,
+            StatusButton::Flatten,
             StatusButton::Export,
             StatusButton::Delete,
             StatusButton::Refresh,
@@ -608,6 +611,7 @@ fn status_buttons(app: &App) -> Vec<StatusButton> {
         StatusButton::Move,
         StatusButton::Copy,
         StatusButton::Fork,
+        StatusButton::Flatten,
         StatusButton::Export,
         StatusButton::Delete,
         StatusButton::Refresh,
@@ -629,6 +633,7 @@ fn status_button_label(button: StatusButton) -> &'static str {
         StatusButton::Move => "[Move]",
         StatusButton::Copy => "[Copy]",
         StatusButton::Fork => "[Fork]",
+        StatusButton::Flatten => "[Flatten]",
         StatusButton::Export => "[Export]",
         StatusButton::Delete => "[Delete]",
         StatusButton::DeleteRemote => "[Delete Remote]",
@@ -656,6 +661,7 @@ fn trigger_status_button(button: StatusButton, app: &mut App) {
         StatusButton::Move => app.start_action(Action::Move),
         StatusButton::Copy => app.start_action(Action::Copy),
         StatusButton::Fork => app.start_action(Action::Fork),
+        StatusButton::Flatten => app.start_flatten_action(),
         StatusButton::Export => app.start_action(Action::Export),
         StatusButton::Delete => {
             if app.selected_remote_machine().is_some() {
@@ -1243,6 +1249,11 @@ fn handle_normal_mode(key: KeyEvent, app: &mut App) -> Result<bool> {
                 app.start_action(Action::Export);
             }
         }
+        KeyCode::Char('b') => {
+            if app.current_session().is_some() {
+                app.start_flatten_action();
+            }
+        }
         KeyCode::Char('n') => {
             if app.focus == Focus::Preview
                 || (app.focus == Focus::Projects
@@ -1521,6 +1532,7 @@ enum Action {
     Copy,
     Fork,
     Export,
+    Flatten,
     Delete,
     ProjectDelete,
     DeleteRemote,
@@ -1934,6 +1946,22 @@ impl App {
         self.status = status;
     }
 
+    fn start_flatten_action(&mut self) {
+        let targets = self.action_targets(Action::Flatten);
+        if targets.is_empty() {
+            self.status = String::from("No session selected");
+            return;
+        }
+        self.start_session_action_progress(
+            Action::Flatten,
+            targets,
+            None,
+            String::from("same machine/cwd"),
+            None,
+            None,
+        );
+    }
+
     fn start_session_action_progress(
         &mut self,
         action: Action,
@@ -2008,6 +2036,10 @@ impl App {
                     )
                 }
             }
+            Action::Flatten => {
+                let effective_target = self.default_flatten_target(&session);
+                self.apply_session_action_to_target(Action::Flatten, &session, &effective_target)
+            }
             Action::Export => export_session_via_ssh(
                 &session,
                 progress
@@ -2050,6 +2082,7 @@ impl App {
             Action::Copy | Action::ProjectCopy => "copying",
             Action::Fork => "forking",
             Action::Export => "exporting",
+            Action::Flatten => "flattening",
             Action::Delete
             | Action::ProjectDelete
             | Action::AddRemote
@@ -2090,6 +2123,7 @@ impl App {
             Action::Copy => "copied",
             Action::Fork => "forked",
             Action::Export => "exported",
+            Action::Flatten => "flattened",
             Action::Delete => "deleted",
             Action::ProjectDelete => "deleted",
             Action::DeleteRemote => "deleted remote",
@@ -2365,6 +2399,7 @@ impl App {
             Some(Action::Copy) => String::from("Working... copying session(s)"),
             Some(Action::Fork) => String::from("Working... forking session(s)"),
             Some(Action::Export) => String::from("Working... exporting session(s)"),
+            Some(Action::Flatten) => String::from("Working... flattening session(s)"),
             Some(Action::Delete) => String::from("Working... deleting session(s)"),
             Some(Action::ProjectDelete) => String::from("Working... deleting folder session(s)"),
             Some(Action::DeleteRemote) => String::from("Working... deleting remote"),
@@ -4513,7 +4548,12 @@ impl App {
             Action::AddRemote | Action::DeleteRemote | Action::RenameRemote | Action::NewFolder => {
                 Vec::new()
             }
-            Action::Move | Action::Copy | Action::Fork | Action::Export | Action::Delete => {
+            Action::Move
+            | Action::Copy
+            | Action::Fork
+            | Action::Export
+            | Action::Flatten
+            | Action::Delete => {
                 let selected = self.selected_sessions_in_current_project();
                 if !selected.is_empty() {
                     selected
@@ -4831,6 +4871,10 @@ impl App {
                 "Export {} session(s): enter user@host:/remote/project/path and press Enter",
                 targets.len()
             ),
+            Action::Flatten => format!(
+                "Flatten {} session(s) into fresh linear recovery clone(s) in the same folder",
+                targets.len()
+            ),
             Action::Delete => format!(
                 "Delete {} session(s): type DELETE and press Enter",
                 targets.len()
@@ -5089,6 +5133,7 @@ impl App {
             Action::Copy => "copied",
             Action::Fork => "forked",
             Action::Export => "exported",
+            Action::Flatten => "flattened",
             Action::Delete => "deleted",
             Action::ProjectDelete => "deleted",
             Action::DeleteRemote => "deleted remote",
@@ -5281,6 +5326,80 @@ impl App {
         Ok(())
     }
 
+    fn default_flatten_target(&self, session: &SessionSummary) -> MachineTargetSpec {
+        MachineTargetSpec {
+            name: session.machine_name.clone(),
+            ssh_target: session.machine_target.clone(),
+            codex_home: session.machine_codex_home.clone().unwrap_or_else(|| {
+                self.sessions_root
+                    .parent()
+                    .map(path_to_string)
+                    .unwrap_or_else(|| String::from("~/.codex"))
+            }),
+            cwd: session.cwd.clone(),
+            exec_prefix: session.machine_exec_prefix.clone(),
+        }
+    }
+
+    fn write_flattened_session_to_target(
+        &self,
+        session: &SessionSummary,
+        target: &MachineTargetSpec,
+    ) -> Result<()> {
+        let content = read_session_content(session)?;
+        let (out, session_id, created_at) =
+            flatten_session_content(&content, &target.cwd, &session.storage_path)?;
+        if let Some(ssh_target) = &target.ssh_target {
+            let remote_codex_home = resolve_remote_codex_home(
+                ssh_target,
+                target.exec_prefix.as_deref(),
+                &target.codex_home,
+            )?;
+            let remote_path = write_new_remote_session(
+                ssh_target,
+                target.exec_prefix.as_deref(),
+                &remote_codex_home,
+                &session_id,
+                &out,
+            )?;
+            let sync_session = SessionSummary {
+                id: session_id,
+                cwd: target.cwd.clone(),
+                storage_path: remote_path.clone(),
+                machine_exec_prefix: target.exec_prefix.clone(),
+                ..session.clone()
+            };
+            sync_remote_thread_index(
+                ssh_target,
+                target.exec_prefix.as_deref(),
+                &remote_path,
+                &target.cwd,
+                &sync_session,
+            )?;
+        } else {
+            let new_path = write_new_local_session(&self.sessions_root, &session_id, &out)?;
+            if let Some(db_path) = self.state_db_path.as_deref() {
+                let meta = build_thread_index_meta(&out, &session_id, Some(created_at))?;
+                let conn = Connection::open(db_path)
+                    .with_context(|| format!("failed opening {}", db_path.display()))?;
+                let tx = conn.unchecked_transaction().with_context(|| {
+                    format!("failed starting transaction on {}", db_path.display())
+                })?;
+                sync_thread_record_tx(
+                    &tx,
+                    &session_id,
+                    &new_path,
+                    &target.cwd,
+                    &new_path,
+                    Some(&meta),
+                )?;
+                tx.commit()
+                    .with_context(|| format!("failed committing {}", db_path.display()))?;
+            }
+        }
+        Ok(())
+    }
+
     fn apply_session_action_to_target(
         &self,
         action: Action,
@@ -5308,6 +5427,7 @@ impl App {
             Action::Copy | Action::ProjectCopy | Action::Fork | Action::Export => {
                 self.write_duplicate_session_to_target(action, session, target)
             }
+            Action::Flatten => self.write_flattened_session_to_target(session, target),
             Action::Delete | Action::ProjectDelete => self.apply_delete_action(session),
             Action::AddRemote | Action::DeleteRemote | Action::RenameRemote | Action::NewFolder => {
                 Ok(())
@@ -5572,6 +5692,15 @@ fn is_user_only_session(session: &SessionSummary) -> bool {
     session.user_message_count > 0 && session.assistant_message_count == 0
 }
 
+fn session_may_resume_incompletely(session: &SessionSummary) -> bool {
+    let visible_messages = session
+        .user_message_count
+        .saturating_add(session.assistant_message_count);
+    session.assistant_message_count >= 8
+        && session.event_count >= 500
+        && session.event_count > visible_messages.saturating_mul(4)
+}
+
 fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut App) {
     let preview_inner_width = area.width.saturating_sub(2) as usize;
     let preview_session = app.current_preview_session();
@@ -5658,6 +5787,8 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
         .map(|s| {
             let warning = if is_user_only_session(s) {
                 "  [user-only; may not resume in codex]"
+            } else if session_may_resume_incompletely(s) {
+                "  [complex; codex may resume only a prefix; b=flatten]"
             } else {
                 ""
             };
@@ -5687,6 +5818,13 @@ fn render_preview(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
     {
         app.status = String::from(
             "Selected session has user messages but no assistant reply; codex may not resume it",
+        );
+    } else if let Some(session) = preview_session.as_ref()
+        && session_may_resume_incompletely(session)
+        && !app.status.starts_with("Working...")
+    {
+        app.status = String::from(
+            "Complex session selected. If codex resumes only a prefix, press b to flatten as a new session",
         );
     }
     app.ensure_preview_focus_valid();
@@ -6017,6 +6155,7 @@ fn status_button_style(button: StatusButton) -> Style {
         | StatusButton::Move
         | StatusButton::Copy
         | StatusButton::Fork
+        | StatusButton::Flatten
         | StatusButton::Export
         | StatusButton::PrevHit
         | StatusButton::NextHit
@@ -6113,6 +6252,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" panes  "),
             Span::styled("o", Style::default().fg(Color::Green)),
             Span::raw(" open in codex  "),
+            Span::styled("b", Style::default().fg(Color::Green)),
+            Span::raw(" flatten recovery  "),
             Span::styled("drag", Style::default().fg(Color::Cyan)),
             Span::raw(" preview-select+copy  "),
             Span::styled("drag", Style::default().fg(Color::Cyan)),
@@ -6227,6 +6368,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
                 Span::raw(" cut/move  "),
                 Span::styled("f", Style::default().fg(Color::Green)),
                 Span::raw(" fork branch copy  "),
+                Span::styled("b", Style::default().fg(Color::Green)),
+                Span::raw(" flatten recovery  "),
                 Span::styled("v/ctrl+v", Style::default().fg(Color::Green)),
                 Span::raw(" paste  "),
                 Span::styled("M/C/F", Style::default().fg(Color::Green)),
@@ -6263,6 +6406,8 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" splitter  preview-select "),
             Span::styled("m/c/f/v", Style::default().fg(Color::Green)),
             Span::raw(" browser ops  "),
+            Span::styled("b", Style::default().fg(Color::Green)),
+            Span::raw(" flatten  "),
             Span::styled("M/C/F", Style::default().fg(Color::Green)),
             Span::raw(" typed target  "),
             Span::styled("R", Style::default().fg(Color::Green)),
@@ -6349,6 +6494,7 @@ fn render_status(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Some(Action::Copy) => "COPY",
             Some(Action::Fork) => "FORK",
             Some(Action::Export) => "EXPORT",
+            Some(Action::Flatten) => "FLATTEN",
             Some(Action::Delete) => "DELETE",
             Some(Action::ProjectDelete) => "DELETE FOLDER",
             Some(Action::DeleteRemote) => "DELETE REMOTE",
@@ -9477,6 +9623,134 @@ fn build_thread_index_meta(
     })
 }
 
+fn extract_first_payload(content: &str, record_type: &str) -> Result<Option<Value>> {
+    for raw in content.lines() {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let obj: Value =
+            serde_json::from_str(raw).with_context(|| format!("invalid JSON in {record_type}"))?;
+        if obj.get("type").and_then(Value::as_str) == Some(record_type) {
+            return Ok(obj.get("payload").cloned());
+        }
+    }
+    Ok(None)
+}
+
+fn extract_last_payload(content: &str, record_type: &str) -> Result<Option<Value>> {
+    let mut out = None;
+    for raw in content.lines() {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let obj: Value =
+            serde_json::from_str(raw).with_context(|| format!("invalid JSON in {record_type}"))?;
+        if obj.get("type").and_then(Value::as_str) == Some(record_type) {
+            out = obj.get("payload").cloned();
+        }
+    }
+    Ok(out)
+}
+
+fn flatten_session_content(
+    content: &str,
+    target_cwd: &str,
+    source_label: &str,
+) -> Result<(String, String, i64)> {
+    let turns = coalesce_chat_turns(&extract_chat_turns(content));
+    if turns.is_empty() {
+        return Err(anyhow!(
+            "cannot flatten {source_label}: no visible user/assistant messages found"
+        ));
+    }
+
+    let session_id = Uuid::new_v4().to_string();
+    let created_at = Utc::now().timestamp();
+    let base_dt = DateTime::<Utc>::from_timestamp(created_at, 0)
+        .ok_or_else(|| anyhow!("failed to construct flatten timestamp"))?;
+    let mut seq = 0i64;
+    let next_ts = |seq: &mut i64| {
+        let ts = base_dt + chrono::Duration::milliseconds(*seq);
+        *seq += 1;
+        ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    };
+
+    let mut session_meta = extract_first_payload(content, "session_meta")?.unwrap_or_else(|| {
+        serde_json::json!({
+            "source": "cli",
+            "model_provider": "openai",
+        })
+    });
+    rewrite_cwd_fields(&mut session_meta, target_cwd);
+    rewrite_session_id(&mut session_meta, &session_id);
+    if let Some(obj) = session_meta.as_object_mut() {
+        obj.insert(String::from("id"), Value::String(session_id.clone()));
+        obj.insert(String::from("cwd"), Value::String(target_cwd.to_string()));
+        obj.insert(String::from("timestamp"), Value::String(next_ts(&mut seq)));
+    }
+
+    let mut out = String::new();
+    out.push_str(&serde_json::to_string(&serde_json::json!({
+        "timestamp": next_ts(&mut seq),
+        "type": "session_meta",
+        "payload": session_meta,
+    }))?);
+    out.push('\n');
+
+    if let Some(mut turn_context) = extract_last_payload(content, "turn_context")? {
+        rewrite_cwd_fields(&mut turn_context, target_cwd);
+        out.push_str(&serde_json::to_string(&serde_json::json!({
+            "timestamp": next_ts(&mut seq),
+            "type": "turn_context",
+            "payload": turn_context,
+        }))?);
+        out.push('\n');
+    }
+
+    for turn in turns {
+        let role = if turn.role == "assistant" {
+            "assistant"
+        } else {
+            "user"
+        };
+        let content_type = if role == "assistant" {
+            "output_text"
+        } else {
+            "input_text"
+        };
+        out.push_str(&serde_json::to_string(&serde_json::json!({
+            "timestamp": next_ts(&mut seq),
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": role,
+                "content": [{
+                    "type": content_type,
+                    "text": turn.text,
+                }],
+            },
+        }))?);
+        out.push('\n');
+
+        if role == "user" {
+            out.push_str(&serde_json::to_string(&serde_json::json!({
+                "timestamp": next_ts(&mut seq),
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": turn.text,
+                    "images": [],
+                },
+            }))?);
+            out.push('\n');
+        }
+    }
+
+    Ok((out, session_id, created_at))
+}
+
 fn meta_matches_row(
     tx: &rusqlite::Transaction<'_>,
     session_id: &str,
@@ -11766,6 +12040,31 @@ mod tests {
     }
 
     #[test]
+    fn flatten_session_content_creates_fresh_linear_session() {
+        let content = [
+            r#"{"timestamp":"2026-03-20T10:00:00Z","type":"session_meta","payload":{"id":"orig","timestamp":"2026-03-20T10:00:00Z","cwd":"/old/path","source":"cli","model_provider":"openai","cli_version":"0.0.0"}}"#,
+            r#"{"timestamp":"2026-03-20T10:00:01Z","type":"turn_context","payload":{"cwd":"/old/path","approval_policy":"never","sandbox_policy":{"mode":"danger-full-access"}}}"#,
+            r#"{"timestamp":"2026-03-20T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"first prompt"}]}}"#,
+            r#"{"timestamp":"2026-03-20T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"text":"first answer"}]}}"#,
+            r#"{"timestamp":"2026-03-20T10:00:04Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"follow-up"}]}}"#,
+            r#"{"timestamp":"2026-03-20T10:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"text":"second answer"}]}}"#,
+        ]
+        .join("\n");
+
+        let (out, new_id, created_at) =
+            flatten_session_content(&content, "/new/path", "source").expect("flatten");
+        assert_ne!(new_id, "orig");
+        assert!(created_at > 0);
+        assert!(out.contains(&format!("\"id\":\"{new_id}\"")));
+        assert!(out.contains("\"cwd\":\"/new/path\""));
+        assert!(out.contains("\"first prompt\""));
+        assert!(out.contains("\"first answer\""));
+        assert!(out.contains("\"follow-up\""));
+        assert!(out.contains("\"second answer\""));
+        assert!(!out.contains("\"id\":\"orig\""));
+    }
+
+    #[test]
     fn duplicate_rewrite_flags_preserve_id_for_move() {
         assert_eq!(duplicate_rewrite_flags(Action::Move), (false, false));
         assert_eq!(
@@ -11774,6 +12073,31 @@ mod tests {
         );
         assert_eq!(duplicate_rewrite_flags(Action::Copy), (true, true));
         assert_eq!(duplicate_rewrite_flags(Action::Fork), (true, true));
+    }
+
+    #[test]
+    fn b_starts_flatten_progress_for_session_row() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            cwd: String::from("/tmp/x"),
+            sessions: vec![sample_session("/tmp/a.jsonl", "/tmp/x", "abc")],
+        }];
+        app.project_idx = 0;
+        app.session_idx = 0;
+        app.browser_cursor = BrowserCursor::Session;
+        app.focus = Focus::Projects;
+
+        handle_normal_mode(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+            &mut app,
+        )
+        .expect("handle");
+
+        assert!(app.action_progress_op.is_some());
     }
 
     #[test]
@@ -15373,6 +15697,35 @@ mod tests {
     }
 
     #[test]
+    fn render_status_shows_flatten_recovery_shortcut() {
+        let mut app = empty_test_app();
+        app.focus = Focus::Projects;
+        app.browser_cursor = BrowserCursor::Session;
+
+        let backend = TestBackend::new(260, 6);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_status(
+                    frame,
+                    ratatui::layout::Rect {
+                        x: 0,
+                        y: 0,
+                        width: 260,
+                        height: 6,
+                    },
+                    &app,
+                );
+            })
+            .expect("draw");
+
+        let backend = terminal.backend();
+        assert!(buffer_contains(backend, "flatten recovery"));
+        assert!(buffer_contains(backend, "[Flatten]"));
+        assert!(buffer_contains(backend, "b"));
+    }
+
+    #[test]
     fn render_status_shows_drag_drop_shortcuts_for_browser() {
         let mut app = empty_test_app();
         app.focus = Focus::Projects;
@@ -15826,6 +16179,67 @@ mod tests {
             "user-only; may not resume in codex"
         ));
         assert!(app.status.contains("may not resume"));
+    }
+
+    #[test]
+    fn render_preview_title_warns_for_complex_session_recovery() {
+        let dir = std::env::temp_dir().join(format!("cse-preview-complex-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("sample.jsonl");
+        fs::write(&path, sample_chat_jsonl()).expect("write");
+
+        let session = SessionSummary {
+            path: path.clone(),
+            storage_path: path_to_string(Path::new(&path.clone())),
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            file_name: String::from("sample.jsonl"),
+            id: String::from("abcdef123456"),
+            cwd: String::from("/tmp/x"),
+            started_at: String::from("2026-01-01T00:00:00Z"),
+            modified_epoch: 123,
+            event_count: 600,
+            user_message_count: 20,
+            assistant_message_count: 20,
+            search_blob: String::from("hello world"),
+        };
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            cwd: String::from("/tmp/x"),
+            sessions: vec![session],
+        }];
+        app.browser_cursor = BrowserCursor::Session;
+        app.preview_folded.insert(path, HashSet::new());
+
+        let backend = TestBackend::new(140, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_preview(
+                    frame,
+                    ratatui::layout::Rect {
+                        x: 0,
+                        y: 0,
+                        width: 140,
+                        height: 20,
+                    },
+                    &mut app,
+                );
+            })
+            .expect("draw");
+
+        let backend = terminal.backend();
+        assert!(buffer_contains(
+            backend,
+            "complex; codex may resume only a prefix; b=flatten"
+        ));
+        assert!(app.status.contains("press b to flatten"));
     }
 
     #[test]

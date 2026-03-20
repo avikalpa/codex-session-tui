@@ -96,6 +96,7 @@ This is not a file dumper. It is meant to feel like an editor/workspace browser:
 - Virtual folder creation for cwd targets that do not exist on disk yet
 - Export to another machine as a real Codex session, not a loose JSONL dump
 - Repair of previously broken local `cwd` mappings and Codex thread-index sync
+- Recovery flatten for complex sessions when Codex resumes only a prefix of the visible chat
 
 ## Command Center Use Cases
 
@@ -214,6 +215,7 @@ Mouse:
 - `Ctrl+Left` / `Ctrl+Right`: move to previous or next folded block
 - `n` / `N`: jump to next/previous match in the current chat
 - `o`: leave the TUI and open the selected session in `codex resume`
+- `b`: flatten the selected session into a fresh linear recovery clone in the same machine and folder
 
 Mouse:
 
@@ -540,6 +542,17 @@ It also repairs common Codex session breakage:
 - stale local `threads` rows pointing outside the active `~/.codex/sessions` root are removed on startup
 - Codex's local `threads` SQLite index is reconciled so repaired sessions reappear in `codex resume`
 - repaired thread metadata skips AGENTS/system preambles so `codex resume` is more likely to show the real first prompt
+
+There is one Codex-side failure mode the TUI does not try to rewrite in place:
+
+- some very large or fork-heavy sessions are stored on disk, and the TUI Preview can show the visible transcript, but `codex resume` may reopen only an earlier branch prefix
+
+For that case the TUI now offers a conservative recovery path:
+
+- Preview marks some event-heavy sessions as complex and warns that Codex may resume only a prefix
+- press `b` on a selected session or from Preview to create a fresh linear recovery clone in the same machine and `cwd`
+- the original session is left untouched
+- if the recovery clone looks right, you can then move/copy it elsewhere using the normal browser workflows
 
 User-only sessions are also marked clearly:
 
