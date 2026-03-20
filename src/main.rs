@@ -7917,6 +7917,20 @@ fn push_chat_turn_from_message_payload(
     timestamp: &str,
     payload: &Value,
 ) {
+    let role = normalized_message_role(payload);
+    let text_parts = message_content_texts(payload);
+    if text_parts.is_empty() {
+        return;
+    }
+
+    turns.push(ChatTurn {
+        role,
+        timestamp: timestamp.to_string(),
+        text: text_parts.join("\n"),
+    });
+}
+
+fn normalized_message_role(payload: &Value) -> String {
     let mut role = payload
         .get("role")
         .and_then(Value::as_str)
@@ -7925,7 +7939,10 @@ fn push_chat_turn_from_message_payload(
     if role == "developer" {
         role = String::from("user");
     }
+    role
+}
 
+fn message_content_texts(payload: &Value) -> Vec<String> {
     let mut text_parts = Vec::new();
     if let Some(items) = payload.get("content").and_then(Value::as_array) {
         for item in items {
@@ -7940,16 +7957,7 @@ fn push_chat_turn_from_message_payload(
             }
         }
     }
-
-    if text_parts.is_empty() {
-        return;
-    }
-
-    turns.push(ChatTurn {
-        role,
-        timestamp: timestamp.to_string(),
-        text: text_parts.join("\n"),
-    });
+    text_parts
 }
 
 #[cfg(test)]
@@ -8204,22 +8212,30 @@ fn parse_local_session_summary(path: &Path) -> Result<SessionSummary> {
                 if let Some(payload) = value.get("payload")
                     && payload.get("type").and_then(Value::as_str) == Some("message")
                 {
-                    match payload.get("role").and_then(Value::as_str) {
-                        Some("user") | Some("developer") => user_message_count += 1,
-                        Some("assistant") => assistant_message_count += 1,
-                        _ => {}
-                    }
-                    if let Some(content_items) = payload.get("content").and_then(Value::as_array) {
-                        for item in content_items {
-                            if let Some(text) = item
-                                .get("text")
-                                .or_else(|| item.get("input_text"))
-                                .or_else(|| item.get("output_text"))
-                                .and_then(Value::as_str)
-                            {
-                                search_parts.push(text.to_lowercase());
-                            }
+                    accumulate_message_summary_counts(
+                        payload,
+                        &mut user_message_count,
+                        &mut assistant_message_count,
+                        &mut search_parts,
+                    );
+                }
+            }
+            Some("compacted") => {
+                if let Some(history) = value
+                    .get("payload")
+                    .and_then(|payload| payload.get("replacement_history"))
+                    .and_then(Value::as_array)
+                {
+                    for item in history {
+                        if item.get("type").and_then(Value::as_str) != Some("message") {
+                            continue;
                         }
+                        accumulate_message_summary_counts(
+                            item,
+                            &mut user_message_count,
+                            &mut assistant_message_count,
+                            &mut search_parts,
+                        );
                     }
                 }
             }
@@ -8258,6 +8274,22 @@ fn parse_local_session_summary(path: &Path) -> Result<SessionSummary> {
         assistant_message_count,
         search_blob: search_parts.join("\n"),
     })
+}
+
+fn accumulate_message_summary_counts(
+    payload: &Value,
+    user_message_count: &mut usize,
+    assistant_message_count: &mut usize,
+    search_parts: &mut Vec<String>,
+) {
+    match normalized_message_role(payload).as_str() {
+        "user" => *user_message_count += 1,
+        "assistant" => *assistant_message_count += 1,
+        _ => {}
+    }
+    for text in message_content_texts(payload) {
+        search_parts.push(text.to_lowercase());
+    }
 }
 
 fn parse_remote_session_summary_line(
@@ -9664,7 +9696,7 @@ fn flatten_session_content(
     target_cwd: &str,
     source_label: &str,
 ) -> Result<(String, String, i64)> {
-    let turns = coalesce_chat_turns(&extract_chat_turns(content));
+    let turns = extract_chat_turns(content);
     if turns.is_empty() {
         return Err(anyhow!(
             "cannot flatten {source_label}: no visible user/assistant messages found"
@@ -9832,6 +9864,20 @@ def summarize(path):
                         elif role == "assistant":
                             assistant_count += 1
                         for item in payload.get("content") or []:
+                            text = item.get("text") or item.get("input_text") or item.get("output_text")
+                            if text:
+                                search_parts.append(str(text).lower())
+                elif ty == "compacted":
+                    payload = value.get("payload") or {}
+                    for msg in payload.get("replacement_history") or []:
+                        if (msg or {}).get("type") != "message":
+                            continue
+                        role = msg.get("role")
+                        if role in ("user", "developer"):
+                            user_count += 1
+                        elif role == "assistant":
+                            assistant_count += 1
+                        for item in msg.get("content") or []:
                             text = item.get("text") or item.get("input_text") or item.get("output_text")
                             if text:
                                 search_parts.append(str(text).lower())
@@ -12088,6 +12134,24 @@ mod tests {
     }
 
     #[test]
+    fn flatten_session_content_preserves_adjacent_assistant_messages() {
+        let content = [
+            r#"{"timestamp":"2026-03-20T10:00:00Z","type":"session_meta","payload":{"id":"orig","timestamp":"2026-03-20T10:00:00Z","cwd":"/old/path"}}"#,
+            r#"{"timestamp":"2026-03-20T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"first prompt"}]}}"#,
+            r#"{"timestamp":"2026-03-20T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"first answer"}]}}"#,
+            r#"{"timestamp":"2026-03-20T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"second answer"}]}}"#,
+        ]
+        .join("\n");
+
+        let (out, _, _) =
+            flatten_session_content(&content, "/new/path", "source").expect("flatten");
+        let assistant_count = out.matches("\"role\":\"assistant\"").count();
+        assert_eq!(assistant_count, 2);
+        assert!(out.contains("\"first answer\""));
+        assert!(out.contains("\"second answer\""));
+    }
+
+    #[test]
     fn duplicate_rewrite_flags_preserve_id_for_move() {
         assert_eq!(duplicate_rewrite_flags(Action::Move), (false, false));
         assert_eq!(
@@ -12121,6 +12185,27 @@ mod tests {
         .expect("handle");
 
         assert!(app.action_progress_op.is_some());
+    }
+
+    #[test]
+    fn parse_local_session_summary_counts_compacted_replacement_history() {
+        let dir = std::env::temp_dir().join(format!("cse-summary-compacted-{}", Uuid::new_v4()));
+        let path = dir.join("sessions/2026/03/20/rollout.jsonl");
+        write_test_session(
+            &path,
+            &[
+                r#"{"timestamp":"2026-03-20T10:00:00Z","type":"session_meta","payload":{"id":"orig","timestamp":"2026-03-20T10:00:00Z","cwd":"/tmp/x"}}"#,
+                r#"{"timestamp":"2026-03-20T10:00:01Z","type":"compacted","payload":{"replacement_history":[{"role":"user","type":"message","content":[{"type":"input_text","text":"first prompt"}]},{"role":"assistant","type":"message","content":[{"type":"output_text","text":"first answer"}]},{"role":"assistant","type":"message","content":[{"type":"output_text","text":"second answer"}]}]}}"#,
+                r#"{"timestamp":"2026-03-20T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"follow-up"}]}}"#,
+            ]
+            .join("\n"),
+        );
+
+        let summary = parse_local_session_summary(&path).expect("summary");
+        assert_eq!(summary.user_message_count, 2);
+        assert_eq!(summary.assistant_message_count, 2);
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
