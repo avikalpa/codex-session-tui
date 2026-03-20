@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "codex-session-explorer"
-version = "2.0.9"
+version = "2.0.10"
 dependencies = [
  "anyhow",
  "base64",
