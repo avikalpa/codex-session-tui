@@ -2479,16 +2479,34 @@ impl App {
         };
 
         if include_remote_scan {
-            app.startup_loading = true;
-            app.status = String::from("Working... loading sessions");
-            app.startup_load_rx = Some(start_startup_loader(
-                app.config.clone(),
-                app.sessions_root.clone(),
-                app.state_db_path.clone(),
-                Vec::new(),
-                BTreeMap::new(),
-                true,
-            ));
+            let cwd_base = env::current_dir().context("failed to resolve current directory")?;
+            let repaired_count = repair_session_cwds(&app.sessions_root, &cwd_base)?;
+            let repaired_id_count = repair_session_ids(&app.sessions_root)?;
+            let local_projects = scan_local_sessions(&app.sessions_root)?;
+            app.apply_scanned_projects(local_projects.clone(), BTreeMap::new(), false);
+            let synced_threads = app.sync_state_index()?;
+            if repaired_count > 0 || repaired_id_count > 0 || synced_threads > 0 {
+                app.status = format!(
+                    "Loaded {} projects, repaired {} cwd(s), repaired {} id(s), synced {} thread row(s)",
+                    app.projects.len(),
+                    repaired_count,
+                    repaired_id_count,
+                    synced_threads
+                );
+            }
+            if !app.config.machines.is_empty() {
+                app.startup_loading = true;
+                app.status = String::from("Working... loading sessions");
+                app.startup_load_rx = Some(start_startup_loader(
+                    app.config.clone(),
+                    app.sessions_root.clone(),
+                    app.state_db_path.clone(),
+                    local_projects,
+                    BTreeMap::new(),
+                    true,
+                    false,
+                ));
+            }
             Ok(app)
         } else {
             let cwd_base = env::current_dir().context("failed to resolve current directory")?;
@@ -2537,6 +2555,7 @@ impl App {
             initial_local_projects,
             self.remote_states.clone(),
             force_remote_scan,
+            true,
         ));
     }
 
@@ -8697,12 +8716,13 @@ fn start_startup_loader(
     initial_local_projects: Vec<ProjectBucket>,
     initial_remote_states: BTreeMap<String, RemoteMachineState>,
     force_remote_scan: bool,
+    include_local_scan: bool,
 ) -> std::sync::mpsc::Receiver<Result<StartupLoadResult, String>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let (work_tx, work_rx) = std::sync::mpsc::channel();
 
-        {
+        if include_local_scan {
             let work_tx = work_tx.clone();
             let sessions_root = sessions_root.clone();
             let state_db_path = state_db_path.clone();
@@ -8744,7 +8764,7 @@ fn start_startup_loader(
         let mut repaired_count = 0usize;
         let mut repaired_id_count = 0usize;
         let mut synced_threads = 0usize;
-        let mut pending = 1usize + config.machines.len();
+        let mut pending = config.machines.len() + usize::from(include_local_scan);
 
         while pending > 0 {
             let Ok(item) = work_rx.recv() else {
@@ -10597,7 +10617,7 @@ mod tests {
     }
 
     #[test]
-    fn load_from_parts_starts_background_loading_without_blocking_on_local_scan() {
+    fn load_from_parts_preloads_local_sessions_before_remote_background_scan() {
         let dir = std::env::temp_dir().join(format!("cse-startup-local-first-{}", Uuid::new_v4()));
         let sessions_root = dir.join("sessions");
         let session_path = sessions_root
@@ -10616,10 +10636,10 @@ mod tests {
         )
         .expect("load app");
 
-        assert!(app.startup_loading);
-        assert!(app.startup_load_rx.is_some());
-        assert!(app.projects.is_empty());
-        assert_eq!(app.status, "Working... loading sessions");
+        assert!(!app.startup_loading);
+        assert!(app.startup_load_rx.is_none());
+        assert_eq!(app.projects.len(), 1);
+        assert_eq!(app.projects[0].sessions.len(), 1);
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -16716,6 +16736,45 @@ codex_home = "/root/.codex"
         assert_eq!(rows[0].label, "local");
         assert_eq!(rows[1].label, "/root/git/this");
         assert_eq!(rows[2].label, "f012345");
+    }
+
+    #[test]
+    fn browser_tree_shows_all_sessions_under_project_leaf() {
+        let mut app = empty_test_app();
+        app.projects = vec![ProjectBucket {
+            machine_name: String::from("local"),
+            machine_target: None,
+            machine_codex_home: None,
+            machine_exec_prefix: None,
+            cwd: String::from("/home/pi/gh/yggdrasil"),
+            sessions: vec![
+                sample_session(
+                    "/tmp/one.jsonl",
+                    "/home/pi/gh/yggdrasil",
+                    "019ca921-37f3-7bb2-a1c4-4255fac4acf7",
+                ),
+                sample_session(
+                    "/tmp/two.jsonl",
+                    "/home/pi/gh/yggdrasil",
+                    "2138a529-4c22-4fb6-97d4-598edd803c6c",
+                ),
+            ],
+        }];
+        app.collapsed_projects.clear();
+        app.collapsed_groups.clear();
+        app.refresh_browser_short_ids();
+
+        let rows = app.browser_render_rows();
+        let session_labels = rows
+            .iter()
+            .filter_map(|row| match row.kind {
+                BrowserRowKind::Session { .. } => Some(row.label.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(session_labels.len(), 2);
+        assert_ne!(session_labels[0], session_labels[1]);
+        assert!(session_labels.iter().all(|label| !label.trim().is_empty()));
     }
 
     #[test]
