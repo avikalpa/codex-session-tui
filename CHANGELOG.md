@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Preloaded local sessions synchronously at startup and now stream only remote machines in the background. This avoids the browser showing a partial local project/session set while the initial local scan is still in flight.
+- Added a conservative recovery path for complex sessions where Codex may resume only an earlier branch prefix: Preview warns about likely event-heavy sessions and `b` creates a fresh linear recovery clone without mutating the source session.
+
 ## 2.0.8 - 2026-03-20
 
 - Fixed local copy/fork indexing so duplicated sessions upsert the correct local Codex `threads` row instead of leaving `codex resume` to surface an older unrelated thread.
