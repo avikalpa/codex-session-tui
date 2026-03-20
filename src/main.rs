@@ -8797,7 +8797,9 @@ fn load_startup_local_state(
     let repaired_id_count = repair_session_ids(&sessions_root)?;
     let all_projects = scan_local_sessions(&sessions_root)?;
     let synced_threads = if let Some(db_path) = state_db_path.as_deref() {
-        sync_threads_db_from_projects(db_path, &all_projects)?
+        let removed = repair_local_thread_index(db_path, &sessions_root)?.removed;
+        let synced = sync_threads_db_from_projects(db_path, &all_projects)?;
+        removed + synced
     } else {
         0
     };
@@ -12631,6 +12633,72 @@ mod tests {
 
         let repaired = repair_local_thread_index(&db, &dir.join("sessions")).expect("repair");
         assert_eq!(repaired.removed, 1);
+    }
+
+    #[test]
+    fn load_startup_local_state_repairs_stale_rows_outside_active_root() {
+        let dir = std::env::temp_dir().join(format!("cse-startup-repair-{}", Uuid::new_v4()));
+        let sessions_root = dir.join("sessions");
+        fs::create_dir_all(sessions_root.join("2026/03/20")).expect("mkdir");
+        fs::create_dir_all(dir.join("other-root/2026/03/20")).expect("mkdir");
+        let db = dir.join("state_5.sqlite");
+        init_test_state_db(&db);
+
+        let live_rollout = sessions_root.join("2026/03/20/live.jsonl");
+        let stale_rollout = dir.join("other-root/2026/03/20/stale.jsonl");
+        let live_id = "019cdead-beef-7abc-9999-aaaaaaaaaaaa";
+        let live_content = format!(
+            concat!(
+                r#"{{"timestamp":"2026-03-20T10:00:00Z","type":"session_meta","payload":{{"id":"{id}","timestamp":"2026-03-20T10:00:00Z","cwd":"/home/pi/gh/yggdrasil","source":"cli","model_provider":"openai","cli_version":"0.0.0"}}}}"#,
+                "\n",
+                r#"{{"timestamp":"2026-03-20T10:00:01Z","type":"event_msg","payload":{{"type":"user_message","message":"real restored prompt"}}}}"#
+            ),
+            id = live_id
+        );
+        write_test_session(&live_rollout, &live_content);
+        write_test_session(&stale_rollout, &sample_chat_jsonl());
+
+        let conn = Connection::open(&db).expect("open");
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path, cwd, title, first_user_message) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "stale-id",
+                path_to_string(&stale_rollout),
+                "/wrong",
+                "stale title",
+                "stale first"
+            ],
+        )
+        .expect("insert stale");
+        drop(conn);
+
+        let result =
+            load_startup_local_state(sessions_root.clone(), Some(db.clone())).expect("startup");
+        assert_eq!(result.repaired_id_count, 0);
+        assert_eq!(result.synced_threads, 2);
+        assert_eq!(result.local_projects.len(), 1);
+        assert_eq!(result.local_projects[0].sessions.len(), 1);
+
+        let conn = Connection::open(&db).expect("open");
+        let rows = conn
+            .prepare("SELECT id, rollout_path, cwd, title FROM threads ORDER BY id")
+            .expect("prepare")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .expect("query")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, live_id);
+        assert_eq!(rows[0].1, path_to_string(&live_rollout));
+        assert_eq!(rows[0].2, "/home/pi/gh/yggdrasil");
+        assert_eq!(rows[0].3, "real restored prompt");
     }
 
     #[test]
