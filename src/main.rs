@@ -2514,34 +2514,17 @@ impl App {
         };
 
         if include_remote_scan {
-            let cwd_base = env::current_dir().context("failed to resolve current directory")?;
-            let repaired_count = repair_session_cwds(&app.sessions_root, &cwd_base)?;
-            let repaired_id_count = repair_session_ids(&app.sessions_root)?;
-            let local_projects = scan_local_sessions(&app.sessions_root)?;
-            app.apply_scanned_projects(local_projects.clone(), BTreeMap::new(), false);
-            let synced_threads = app.sync_state_index()?;
-            if repaired_count > 0 || repaired_id_count > 0 || synced_threads > 0 {
-                app.status = format!(
-                    "Loaded {} projects, repaired {} cwd(s), repaired {} id(s), synced {} thread row(s)",
-                    app.projects.len(),
-                    repaired_count,
-                    repaired_id_count,
-                    synced_threads
-                );
-            }
-            if !app.config.machines.is_empty() {
-                app.startup_loading = true;
-                app.status = String::from("Working... loading sessions");
-                app.startup_load_rx = Some(start_startup_loader(
-                    app.config.clone(),
-                    app.sessions_root.clone(),
-                    app.state_db_path.clone(),
-                    local_projects,
-                    BTreeMap::new(),
-                    true,
-                    false,
-                ));
-            }
+            app.startup_loading = true;
+            app.status = String::from("Working... loading sessions");
+            app.startup_load_rx = Some(start_startup_loader(
+                app.config.clone(),
+                app.sessions_root.clone(),
+                app.state_db_path.clone(),
+                Vec::new(),
+                BTreeMap::new(),
+                true,
+                true,
+            ));
             Ok(app)
         } else {
             let cwd_base = env::current_dir().context("failed to resolve current directory")?;
@@ -7864,56 +7847,38 @@ fn extract_chat_turns(content: &str) -> Vec<ChatTurn> {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-
-        if value.get("type").and_then(Value::as_str) != Some("response_item") {
-            continue;
-        }
-
-        let payload = value.get("payload").unwrap_or(&Value::Null);
-        if payload.get("type").and_then(Value::as_str) != Some("message") {
-            continue;
-        }
-
-        let mut role = payload
-            .get("role")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
-        if role == "developer" {
-            role = String::from("user");
-        }
-
         let timestamp = value
             .get("timestamp")
             .and_then(Value::as_str)
             .unwrap_or("-")
             .to_string();
-
-        let mut text_parts = Vec::new();
-        if let Some(items) = payload.get("content").and_then(Value::as_array) {
-            for item in items {
-                if let Some(text) = item
-                    .get("text")
-                    .or_else(|| item.get("input_text"))
-                    .or_else(|| item.get("output_text"))
-                    .and_then(Value::as_str)
+        match value.get("type").and_then(Value::as_str) {
+            Some("response_item") => {
+                let payload = value.get("payload").unwrap_or(&Value::Null);
+                if payload.get("type").and_then(Value::as_str) != Some("message") {
+                    continue;
+                }
+                push_chat_turn_from_message_payload(&mut turns, &timestamp, payload);
+            }
+            Some("compacted") => {
+                let payload = value.get("payload").unwrap_or(&Value::Null);
+                if let Some(history) = payload.get("replacement_history").and_then(Value::as_array)
                 {
-                    if !text.trim().is_empty() {
-                        text_parts.push(text.to_string());
+                    for item in history {
+                        if item.get("type").and_then(Value::as_str) != Some("message") {
+                            continue;
+                        }
+                        let item_timestamp = item
+                            .get("timestamp")
+                            .and_then(Value::as_str)
+                            .unwrap_or(&timestamp)
+                            .to_string();
+                        push_chat_turn_from_message_payload(&mut turns, &item_timestamp, item);
                     }
                 }
             }
+            _ => {}
         }
-
-        if text_parts.is_empty() {
-            continue;
-        }
-
-        turns.push(ChatTurn {
-            role,
-            timestamp,
-            text: text_parts.join("\n"),
-        });
     }
 
     if turns.is_empty() {
@@ -7945,6 +7910,46 @@ fn extract_chat_turns(content: &str) -> Vec<ChatTurn> {
     }
 
     turns
+}
+
+fn push_chat_turn_from_message_payload(
+    turns: &mut Vec<ChatTurn>,
+    timestamp: &str,
+    payload: &Value,
+) {
+    let mut role = payload
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    if role == "developer" {
+        role = String::from("user");
+    }
+
+    let mut text_parts = Vec::new();
+    if let Some(items) = payload.get("content").and_then(Value::as_array) {
+        for item in items {
+            if let Some(text) = item
+                .get("text")
+                .or_else(|| item.get("input_text"))
+                .or_else(|| item.get("output_text"))
+                .and_then(Value::as_str)
+                && !text.trim().is_empty()
+            {
+                text_parts.push(text.to_string());
+            }
+        }
+    }
+
+    if text_parts.is_empty() {
+        return;
+    }
+
+    turns.push(ChatTurn {
+        role,
+        timestamp: timestamp.to_string(),
+        text: text_parts.join("\n"),
+    });
 }
 
 #[cfg(test)]
@@ -10910,10 +10915,9 @@ mod tests {
         )
         .expect("load app");
 
-        assert!(!app.startup_loading);
-        assert!(app.startup_load_rx.is_none());
-        assert_eq!(app.projects.len(), 1);
-        assert_eq!(app.projects[0].sessions.len(), 1);
+        assert!(app.startup_loading);
+        assert!(app.startup_load_rx.is_some());
+        assert!(app.projects.is_empty());
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -12062,6 +12066,25 @@ mod tests {
         assert!(out.contains("\"follow-up\""));
         assert!(out.contains("\"second answer\""));
         assert!(!out.contains("\"id\":\"orig\""));
+    }
+
+    #[test]
+    fn flatten_session_content_includes_compacted_replacement_history() {
+        let content = [
+            r#"{"timestamp":"2026-03-20T10:00:00Z","type":"session_meta","payload":{"id":"orig","timestamp":"2026-03-20T10:00:00Z","cwd":"/old/path","source":"cli","model_provider":"openai","cli_version":"0.0.0"}}"#,
+            r#"{"timestamp":"2026-03-20T10:00:01Z","type":"compacted","payload":{"replacement_history":[{"role":"user","type":"message","content":[{"type":"input_text","text":"first prompt"}]},{"role":"assistant","type":"message","content":[{"type":"output_text","text":"first answer"}]}]}}"#,
+            r#"{"timestamp":"2026-03-20T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"follow-up"}]}}"#,
+            r#"{"timestamp":"2026-03-20T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"second answer"}]}}"#,
+        ]
+        .join("\n");
+
+        let (out, new_id, _) =
+            flatten_session_content(&content, "/new/path", "source").expect("flatten");
+        assert_ne!(new_id, "orig");
+        assert!(out.contains("\"first prompt\""));
+        assert!(out.contains("\"first answer\""));
+        assert!(out.contains("\"follow-up\""));
+        assert!(out.contains("\"second answer\""));
     }
 
     #[test]
