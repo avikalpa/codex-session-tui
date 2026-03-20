@@ -537,7 +537,9 @@ It also repairs common Codex session breakage:
 - trailing slashes and `.` / `..` segments are cleaned
 - previously broken local `cwd` rewrites are repaired on startup
 - session files whose internal `session_meta.id` drifted away from the rollout filename are repaired on startup
+- stale local `threads` rows pointing outside the active `~/.codex/sessions` root are removed on startup
 - Codex's local `threads` SQLite index is reconciled so repaired sessions reappear in `codex resume`
+- repaired thread metadata skips AGENTS/system preambles so `codex resume` is more likely to show the real first prompt
 
 User-only sessions are also marked clearly:
 
