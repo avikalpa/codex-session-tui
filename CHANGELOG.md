@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 2.0.10 - 2026-03-20
+
+- Fixed flatten recovery so it preserves the raw visible message sequence instead of coalescing adjacent same-role messages into fewer blocks. This prevents large compacted sessions from flattening into clones with sharply reduced assistant counts.
+- Fixed local and remote session summaries to count compacted `replacement_history` messages too, so preview header counts match the actual flattened recovery stream more closely.
+
 ## 2.0.9 - 2026-03-20
 
 - Fixed flatten recovery for compacted sessions by rebuilding chat turns from compacted `replacement_history`, so recovery clones keep earlier assistant replies instead of collapsing into user-only tails.
