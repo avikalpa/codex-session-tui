@@ -191,7 +191,8 @@ fn run_cli_command(cmd: CliCommand) -> Result<()> {
 fn duplicate_rewrite_flags(action: Action) -> (bool, bool) {
     match action {
         Action::Move | Action::ProjectRename => (false, false),
-        Action::Copy | Action::ProjectCopy | Action::Export => (true, false),
+        Action::Copy | Action::ProjectCopy => (true, true),
+        Action::Export => (true, false),
         Action::Fork => (true, true),
         Action::AddRemote
         | Action::Delete
@@ -1858,7 +1859,7 @@ impl App {
                     lines.push(String::from("local: no state db found"));
                     continue;
                 };
-                repair_local_thread_index(db_path)?
+                repair_local_thread_index(db_path, &self.sessions_root)?
             };
             let backup = summary
                 .backup_path
@@ -5181,7 +5182,9 @@ impl App {
         let Some(db_path) = self.state_db_path.as_deref() else {
             return Ok(0);
         };
-        sync_threads_db_from_projects(db_path, &self.all_projects)
+        let removed = repair_local_thread_index(db_path, &self.sessions_root)?.removed;
+        let synced = sync_threads_db_from_projects(db_path, &self.all_projects)?;
+        Ok(removed + synced)
     }
 
     fn sync_state_thread(&self, session: &SessionSummary, target_cwd: &str) -> Result<bool> {
@@ -5235,20 +5238,26 @@ impl App {
             )?;
         } else {
             let new_path = write_new_local_session(&self.sessions_root, &session_id, &out)?;
-            let _ = self.sync_state_thread(
-                &SessionSummary {
-                    id: session_id,
-                    cwd: target.cwd.clone(),
-                    storage_path: path_to_string(&new_path),
-                    path: new_path.clone(),
-                    machine_name: String::from("local"),
-                    machine_target: None,
-                    machine_codex_home: None,
-                    machine_exec_prefix: None,
-                    ..session.clone()
-                },
-                &target.cwd,
-            )?;
+            if let Some(db_path) = self.state_db_path.as_deref() {
+                let now_override = rewrite_start_timestamp
+                    .then(|| DateTime::<Utc>::from(SystemTime::now()).timestamp());
+                let meta = build_thread_index_meta(&out, &session_id, now_override)?;
+                let conn = Connection::open(db_path)
+                    .with_context(|| format!("failed opening {}", db_path.display()))?;
+                let tx = conn.unchecked_transaction().with_context(|| {
+                    format!("failed starting transaction on {}", db_path.display())
+                })?;
+                sync_thread_record_tx(
+                    &tx,
+                    &session_id,
+                    &new_path,
+                    &target.cwd,
+                    &new_path,
+                    Some(&meta),
+                )?;
+                tx.commit()
+                    .with_context(|| format!("failed committing {}", db_path.display()))?;
+            }
         }
         Ok(())
     }
@@ -8923,7 +8932,17 @@ fn sync_threads_db_from_projects(db_path: &Path, projects: &[ProjectBucket]) -> 
         if session.machine_target.is_some() {
             continue;
         }
-        if sync_thread_record_tx(&tx, &session.id, &session.path, &session.cwd, &session.path)? {
+        let meta = fs::read_to_string(&session.storage_path)
+            .ok()
+            .and_then(|content| build_thread_index_meta(&content, &session.id, None).ok());
+        if sync_thread_record_tx(
+            &tx,
+            &session.id,
+            &session.path,
+            &session.cwd,
+            &session.path,
+            meta.as_ref(),
+        )? {
             synced += 1;
         }
     }
@@ -8949,12 +8968,20 @@ fn sync_thread_record(
     let tx = conn
         .unchecked_transaction()
         .with_context(|| format!("failed starting transaction on {}", db_path.display()))?;
+    let meta = if target_rollout_path.exists() {
+        let content = fs::read_to_string(target_rollout_path)
+            .with_context(|| format!("failed to read {}", target_rollout_path.display()))?;
+        Some(build_thread_index_meta(&content, session_id, None)?)
+    } else {
+        None
+    };
     let changed = sync_thread_record_tx(
         &tx,
         session_id,
         rollout_path,
         target_cwd,
         target_rollout_path,
+        meta.as_ref(),
     )?;
     tx.commit()
         .with_context(|| format!("failed committing {}", db_path.display()))?;
@@ -8967,6 +8994,7 @@ fn sync_thread_record_tx(
     rollout_path: &Path,
     target_cwd: &str,
     target_rollout_path: &Path,
+    meta: Option<&ThreadIndexMeta>,
 ) -> Result<bool> {
     let rollout_path_s = path_to_string(rollout_path);
     let target_rollout_path_s = path_to_string(target_rollout_path);
@@ -9011,14 +9039,45 @@ fn sync_thread_record_tx(
     };
 
     let Some((row_id, current_cwd, current_rollout_path)) = existing else {
-        return Ok(false);
+        let Some(meta) = meta else {
+            return Ok(false);
+        };
+        tx.execute(
+            "INSERT INTO threads (
+                id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+                sandbox_policy, approval_mode, tokens_used, has_user_event, archived,
+                cli_version, first_user_message, memory_mode
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, 0, 0, ?11, ?12, ?13)",
+            params![
+                session_id,
+                target_rollout_path_s,
+                meta.created_at,
+                meta.updated_at,
+                meta.source,
+                meta.model_provider,
+                target_cwd,
+                meta.title,
+                meta.sandbox_policy,
+                meta.approval_mode,
+                meta.cli_version,
+                meta.first_user_message,
+                meta.memory_mode,
+            ],
+        )?;
+        return Ok(true);
     };
 
     if row_id == session_id
         && current_cwd == target_cwd
         && current_rollout_path == target_rollout_path_s
     {
-        return Ok(false);
+        if let Some(meta) = meta {
+            if meta_matches_row(tx, session_id, meta)? {
+                return Ok(false);
+            }
+        } else {
+            return Ok(false);
+        }
     }
 
     if current_rollout_path == rollout_path_s && row_id != session_id {
@@ -9037,25 +9096,78 @@ fn sync_thread_record_tx(
         {
             tx.execute("DELETE FROM threads WHERE id = ?1", params![session_id])?;
         }
-        tx.execute(
-            "UPDATE threads SET id = ?1, cwd = ?2, rollout_path = ?3 WHERE rollout_path = ?4",
-            params![
-                session_id,
-                target_cwd,
-                target_rollout_path_s,
-                current_rollout_path
-            ],
-        )?;
+        if let Some(meta) = meta {
+            tx.execute(
+                "UPDATE threads
+                 SET id = ?1, cwd = ?2, rollout_path = ?3, created_at = ?4, updated_at = ?5,
+                     source = ?6, model_provider = ?7, title = ?8, sandbox_policy = ?9,
+                     approval_mode = ?10, cli_version = ?11, first_user_message = ?12,
+                     memory_mode = ?13
+                 WHERE rollout_path = ?14",
+                params![
+                    session_id,
+                    target_cwd,
+                    target_rollout_path_s,
+                    meta.created_at,
+                    meta.updated_at,
+                    meta.source,
+                    meta.model_provider,
+                    meta.title,
+                    meta.sandbox_policy,
+                    meta.approval_mode,
+                    meta.cli_version,
+                    meta.first_user_message,
+                    meta.memory_mode,
+                    current_rollout_path,
+                ],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE threads SET id = ?1, cwd = ?2, rollout_path = ?3 WHERE rollout_path = ?4",
+                params![
+                    session_id,
+                    target_cwd,
+                    target_rollout_path_s,
+                    current_rollout_path
+                ],
+            )?;
+        }
     } else {
-        tx.execute(
-            "UPDATE threads SET cwd = ?1, rollout_path = ?2 WHERE id = ?3",
-            params![target_cwd, target_rollout_path_s, row_id],
-        )?;
+        if let Some(meta) = meta {
+            tx.execute(
+                "UPDATE threads
+                 SET cwd = ?1, rollout_path = ?2, created_at = ?3, updated_at = ?4,
+                     source = ?5, model_provider = ?6, title = ?7, sandbox_policy = ?8,
+                     approval_mode = ?9, cli_version = ?10, first_user_message = ?11,
+                     memory_mode = ?12
+                 WHERE id = ?13",
+                params![
+                    target_cwd,
+                    target_rollout_path_s,
+                    meta.created_at,
+                    meta.updated_at,
+                    meta.source,
+                    meta.model_provider,
+                    meta.title,
+                    meta.sandbox_policy,
+                    meta.approval_mode,
+                    meta.cli_version,
+                    meta.first_user_message,
+                    meta.memory_mode,
+                    row_id
+                ],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE threads SET cwd = ?1, rollout_path = ?2 WHERE id = ?3",
+                params![target_cwd, target_rollout_path_s, row_id],
+            )?;
+        }
     }
     Ok(true)
 }
 
-fn repair_local_thread_index(db_path: &Path) -> Result<RepairIndexSummary> {
+fn repair_local_thread_index(db_path: &Path, sessions_root: &Path) -> Result<RepairIndexSummary> {
     if !db_path.exists() {
         return Ok(RepairIndexSummary {
             checked: 0,
@@ -9078,7 +9190,7 @@ fn repair_local_thread_index(db_path: &Path) -> Result<RepairIndexSummary> {
         .iter()
         .filter_map(|(id, rollout_path)| {
             let expanded = expand_tilde(rollout_path);
-            if expanded.exists() {
+            if expanded.exists() && expanded.starts_with(sessions_root) {
                 None
             } else {
                 Some(id.clone())
@@ -9154,6 +9266,223 @@ fn rewrite_session_start_timestamp(value: &mut Value) {
     };
 
     payload_obj.insert("timestamp".to_string(), Value::String(now));
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThreadIndexMeta {
+    created_at: i64,
+    updated_at: i64,
+    source: String,
+    model_provider: String,
+    cli_version: String,
+    title: String,
+    first_user_message: String,
+    sandbox_policy: String,
+    approval_mode: String,
+    memory_mode: String,
+}
+
+fn parse_iso_ts(raw: &str) -> i64 {
+    DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.timestamp())
+        .unwrap_or(0)
+}
+
+fn is_context_preamble_text(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("<environment_context>")
+        || trimmed.starts_with("<permissions instructions>")
+        || trimmed.starts_with("<sandbox_mode>")
+        || trimmed.starts_with("<approval_policy>")
+        || trimmed.starts_with("<collaboration_mode>")
+        || trimmed.starts_with("<personality_spec>")
+        || trimmed.starts_with("<skills_instructions>")
+        || trimmed.starts_with("# AGENTS.md instructions for ")
+        || trimmed.starts_with("<INSTRUCTIONS>")
+}
+
+fn first_meaningful_content_text(payload: &Value) -> Option<String> {
+    let items = payload.get("content")?.as_array()?;
+    items.iter().find_map(|item| {
+        let text = item
+            .get("text")
+            .or_else(|| item.get("input_text"))
+            .or_else(|| item.get("output_text"))
+            .and_then(Value::as_str)?;
+        if text.trim().is_empty() || is_context_preamble_text(text) {
+            None
+        } else {
+            Some(text.to_string())
+        }
+    })
+}
+
+fn build_thread_index_meta(
+    content: &str,
+    session_id_hint: &str,
+    now_override: Option<i64>,
+) -> Result<ThreadIndexMeta> {
+    let mut session_id = session_id_hint.to_string();
+    let mut created_at = 0i64;
+    let mut updated_at = 0i64;
+    let mut source = String::from("cli");
+    let mut model_provider = String::from("openai");
+    let mut cli_version = String::new();
+    let mut title = String::new();
+    let mut first_user_message = String::new();
+    let mut sandbox_policy = String::from("{}");
+    let mut approval_mode = String::new();
+    let mut memory_mode = String::from("enabled");
+
+    for raw in content.lines() {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let obj: Value =
+            serde_json::from_str(raw).context("invalid JSON while building thread index meta")?;
+        updated_at = updated_at.max(
+            obj.get("timestamp")
+                .and_then(Value::as_str)
+                .map(parse_iso_ts)
+                .unwrap_or(0),
+        );
+        match obj.get("type").and_then(Value::as_str) {
+            Some("session_meta") => {
+                if let Some(payload) = obj.get("payload").and_then(Value::as_object) {
+                    if let Some(id) = payload.get("id").and_then(Value::as_str) {
+                        session_id = id.to_string();
+                    }
+                    if let Some(ts) = payload.get("timestamp").and_then(Value::as_str) {
+                        created_at = parse_iso_ts(ts).max(created_at);
+                    }
+                    if let Some(val) = payload.get("source").and_then(Value::as_str) {
+                        source = val.to_string();
+                    }
+                    if let Some(val) = payload.get("model_provider").and_then(Value::as_str) {
+                        model_provider = val.to_string();
+                    }
+                    if let Some(val) = payload.get("cli_version").and_then(Value::as_str) {
+                        cli_version = val.to_string();
+                    }
+                }
+            }
+            Some("turn_context") => {
+                if let Some(payload) = obj.get("payload").and_then(Value::as_object) {
+                    if let Some(policy) = payload.get("sandbox_policy") {
+                        sandbox_policy = serde_json::to_string(policy)?;
+                    }
+                    if let Some(val) = payload.get("approval_policy").and_then(Value::as_str) {
+                        approval_mode = val.to_string();
+                    }
+                    if let Some(mode) = payload
+                        .get("collaboration_mode")
+                        .and_then(Value::as_object)
+                        .and_then(|v| v.get("memory_mode"))
+                        .and_then(Value::as_str)
+                    {
+                        memory_mode = mode.to_string();
+                    } else if let Some(mode) = payload.get("memory_mode").and_then(Value::as_str) {
+                        memory_mode = mode.to_string();
+                    }
+                }
+            }
+            Some("response_item") => {
+                let Some(payload) = obj.get("payload") else {
+                    continue;
+                };
+                let role = payload.get("role").and_then(Value::as_str);
+                if payload.get("type").and_then(Value::as_str) == Some("message")
+                    && matches!(role, Some("user") | Some("developer"))
+                    && first_user_message.is_empty()
+                    && let Some(text) = first_meaningful_content_text(payload)
+                {
+                    first_user_message = text.clone();
+                    title = text;
+                }
+            }
+            Some("event_msg") => {
+                let Some(payload) = obj.get("payload") else {
+                    continue;
+                };
+                if payload.get("type").and_then(Value::as_str) == Some("user_message")
+                    && first_user_message.is_empty()
+                    && let Some(text) = payload.get("message").and_then(Value::as_str)
+                    && !text.trim().is_empty()
+                    && !is_context_preamble_text(text)
+                {
+                    first_user_message = text.to_string();
+                    title = text.to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(now) = now_override {
+        created_at = now;
+        updated_at = now;
+    }
+    if title.is_empty() {
+        title = if !first_user_message.is_empty() {
+            first_user_message.clone()
+        } else {
+            session_id.clone()
+        };
+    }
+    if first_user_message.is_empty() {
+        first_user_message = title.clone();
+    }
+    if created_at == 0 {
+        created_at = if updated_at == 0 {
+            now_override.unwrap_or(0)
+        } else {
+            updated_at
+        };
+    }
+
+    Ok(ThreadIndexMeta {
+        created_at,
+        updated_at,
+        source,
+        model_provider,
+        cli_version,
+        title,
+        first_user_message,
+        sandbox_policy,
+        approval_mode,
+        memory_mode,
+    })
+}
+
+fn meta_matches_row(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    meta: &ThreadIndexMeta,
+) -> Result<bool> {
+    let row = tx
+        .query_row(
+            "SELECT created_at, updated_at, source, model_provider, title, sandbox_policy,
+                    approval_mode, cli_version, first_user_message, memory_mode
+             FROM threads WHERE id = ?1 LIMIT 1",
+            params![session_id],
+            |row| {
+                Ok(ThreadIndexMeta {
+                    created_at: row.get(0)?,
+                    updated_at: row.get(1)?,
+                    source: row.get(2)?,
+                    model_provider: row.get(3)?,
+                    title: row.get(4)?,
+                    sandbox_policy: row.get(5)?,
+                    approval_mode: row.get(6)?,
+                    cli_version: row.get(7)?,
+                    first_user_message: row.get(8)?,
+                    memory_mode: row.get(9)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(row.as_ref().is_some_and(|row| row == meta))
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -10588,11 +10917,14 @@ mod tests {
     fn run_noninteractive_copy_local_to_local_works() {
         let dir = std::env::temp_dir().join(format!("cse-cli-copy-{}", Uuid::new_v4()));
         let sessions_root = dir.join("sessions");
+        let db_path = dir.join("state.sqlite");
         let source_path = sessions_root.join("2026/03/15/source.jsonl");
         write_test_session(&source_path, &sample_chat_jsonl());
+        init_test_state_db(&db_path);
 
         let mut app = empty_test_app();
         app.sessions_root = sessions_root.clone();
+        app.state_db_path = Some(db_path.clone());
         let session = sample_session_with_id(
             &path_to_string(&source_path),
             "/old",
@@ -10617,6 +10949,11 @@ mod tests {
         let mut created = Vec::new();
         collect_jsonl_files(&sessions_root, &mut created).expect("collect jsonl");
         assert!(created.len() >= 2);
+        let conn = Connection::open(db_path).expect("open db");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
+            .expect("count threads");
+        assert_eq!(count, 1);
     }
 
     #[test]
@@ -11365,13 +11702,55 @@ mod tests {
     }
 
     #[test]
+    fn build_thread_index_meta_skips_environment_context_preamble() {
+        let content = [
+            r#"{"timestamp":"2025-12-01T07:04:07.387Z","type":"session_meta","payload":{"id":"sess-1","timestamp":"2025-12-01T07:04:07.375Z","cwd":"/repo","source":"cli","model_provider":"openai","cli_version":"0.63.0"}}"#,
+            r#"{"timestamp":"2025-12-01T07:04:07.488Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/home/pi</cwd>\n</environment_context>"}]}}"#,
+            r#"{"timestamp":"2025-12-01T07:07:38.720Z","type":"event_msg","payload":{"type":"user_message","message":"actual prompt"}} "#,
+        ]
+        .join("\n");
+
+        let meta = build_thread_index_meta(&content, "sess-1", None).expect("meta");
+        assert_eq!(meta.title, "actual prompt");
+        assert_eq!(meta.first_user_message, "actual prompt");
+    }
+
+    #[test]
+    fn build_thread_index_meta_skips_agents_preamble() {
+        let content = [
+            r#"{"timestamp":"2026-03-01T07:04:07.387Z","type":"session_meta","payload":{"id":"sess-2","timestamp":"2026-03-01T07:04:07.375Z","cwd":"/repo","source":"cli","model_provider":"openai","cli_version":"0.63.0"}}"#,
+            r##"{"timestamp":"2026-03-01T07:04:07.488Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nUse tests first.\n</INSTRUCTIONS>"}]}}"##,
+            r#"{"timestamp":"2026-03-01T07:07:38.720Z","type":"event_msg","payload":{"type":"user_message","message":"real user prompt"}} "#,
+        ]
+        .join("\n");
+
+        let meta = build_thread_index_meta(&content, "sess-2", None).expect("meta");
+        assert_eq!(meta.title, "real user prompt");
+        assert_eq!(meta.first_user_message, "real user prompt");
+    }
+
+    #[test]
+    fn build_thread_index_meta_skips_collaboration_preamble() {
+        let content = [
+            r#"{"timestamp":"2026-03-01T07:04:07.387Z","type":"session_meta","payload":{"id":"sess-3","timestamp":"2026-03-01T07:04:07.375Z","cwd":"/repo","source":"cli","model_provider":"openai","cli_version":"0.63.0"}}"#,
+            r##"{"timestamp":"2026-03-01T07:04:07.488Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<collaboration_mode># Collaboration Mode: Default\n\nDetails"}]}}"##,
+            r#"{"timestamp":"2026-03-01T07:07:38.720Z","type":"event_msg","payload":{"type":"user_message","message":"real prompt after system preamble"}} "#,
+        ]
+        .join("\n");
+
+        let meta = build_thread_index_meta(&content, "sess-3", None).expect("meta");
+        assert_eq!(meta.title, "real prompt after system preamble");
+        assert_eq!(meta.first_user_message, "real prompt after system preamble");
+    }
+
+    #[test]
     fn duplicate_rewrite_flags_preserve_id_for_move() {
         assert_eq!(duplicate_rewrite_flags(Action::Move), (false, false));
         assert_eq!(
             duplicate_rewrite_flags(Action::ProjectRename),
             (false, false)
         );
-        assert_eq!(duplicate_rewrite_flags(Action::Copy), (true, false));
+        assert_eq!(duplicate_rewrite_flags(Action::Copy), (true, true));
         assert_eq!(duplicate_rewrite_flags(Action::Fork), (true, true));
     }
 
@@ -12208,7 +12587,7 @@ mod tests {
         .expect("insert drop");
         drop(conn);
 
-        let repaired = repair_local_thread_index(&db).expect("repair");
+        let repaired = repair_local_thread_index(&db, &dir.join("sessions")).expect("repair");
         assert_eq!(repaired.removed, 1);
         assert_eq!(repaired.checked, 2);
         assert!(repaired.backup_path.is_some());
@@ -12222,6 +12601,36 @@ mod tests {
             .collect::<std::result::Result<Vec<_>, _>>()
             .expect("collect");
         assert_eq!(ids, vec![String::from("keep")]);
+    }
+
+    #[test]
+    fn repair_local_thread_index_removes_rows_outside_active_sessions_root() {
+        let dir = std::env::temp_dir().join(format!("cse-repair-root-{}", Uuid::new_v4()));
+        fs::create_dir_all(dir.join("sessions/2026/03/15")).expect("mkdir");
+        fs::create_dir_all(dir.join("other-root/2026/03/15")).expect("mkdir");
+        let db = dir.join("state_5.sqlite");
+        init_test_state_db(&db);
+
+        let keep = dir.join("sessions/2026/03/15/keep.jsonl");
+        let drop_path = dir.join("other-root/2026/03/15/drop.jsonl");
+        write_test_session(&keep, &sample_chat_jsonl());
+        write_test_session(&drop_path, &sample_chat_jsonl());
+
+        let conn = Connection::open(&db).expect("open");
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path, cwd, title, first_user_message) VALUES (?1, ?2, ?3, '', '')",
+            params!["keep", path_to_string(&keep), "/keep"],
+        )
+        .expect("insert keep");
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path, cwd, title, first_user_message) VALUES (?1, ?2, ?3, '', '')",
+            params!["drop", path_to_string(&drop_path), "/drop"],
+        )
+        .expect("insert drop");
+        drop(conn);
+
+        let repaired = repair_local_thread_index(&db, &dir.join("sessions")).expect("repair");
+        assert_eq!(repaired.removed, 1);
     }
 
     #[test]
