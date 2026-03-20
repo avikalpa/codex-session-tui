@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.0.8 - 2026-03-20
+
+- Fixed local copy/fork indexing so duplicated sessions upsert the correct local Codex `threads` row instead of leaving `codex resume` to surface an older unrelated thread.
+- Fixed local thread metadata extraction so AGENTS, environment, and collaboration preambles are skipped when deriving the indexed title and first user message.
+- Fixed startup auto-repair so launching the TUI removes stale local `threads` rows outside the active `~/.codex/sessions` root before rebuilding the local index.
+
 ## 2.0.7 - 2026-03-19
 
 - Fixed async search/loading status so the footer explains when streamed session updates are still arriving and when refreshed results move focus back to the first matching session.
