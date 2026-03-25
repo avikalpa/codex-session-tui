@@ -90,6 +90,8 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'release'
     steps:
+      - uses: actions/checkout@v6
+
       - name: Download Build Artifacts
         uses: actions/download-artifact@v8
         with:
@@ -110,6 +112,17 @@ jobs:
             fi
           done
           ls -lah release-assets
+
+      - name: Generate curated release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/release-notes.sh "${{ github.event.release.tag_name }}" > release-assets/RELEASE_NOTES.md
+
+      - name: Update GitHub release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "${{ github.event.release.tag_name }}" --notes-file release-assets/RELEASE_NOTES.md -R "${{ github.repository }}"
 
       - name: Upload Assets To GitHub Release
         env:
