@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Rewrote the README around the actual `npx -y codex-session-tui@latest` recovery workflow: moving sessions between machines, searching lost threads, and explaining the tool's limits plainly.
+- Prepared npm package search metadata with a clearer description, keywords, homepage, and issue links for the next publish.
+
 ## 2.0.10 - 2026-03-20
 
 - Fixed flatten recovery so it preserves the raw visible message sequence instead of coalescing adjacent same-role messages into fewer blocks. This prevents large compacted sessions from flattening into clones with sharply reduced assistant counts.

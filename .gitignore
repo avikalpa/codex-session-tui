@@ -1,3 +1,4 @@
 /target
 /npm/dist
 /npm/*.tgz
+.tmp-codex-resume-test/

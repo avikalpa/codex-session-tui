@@ -1,8 +1,18 @@
 {
   "name": "codex-session-tui",
   "version": "2.0.10",
-  "description": "Prebuilt codex-session-tui binaries for macOS, Linux, and Windows.",
+  "description": "Search, move, copy, fork, and repair Codex sessions from any terminal or SSH session.",
   "license": "Apache-2.0",
+  "keywords": [
+    "codex",
+    "codex-cli",
+    "codex-resume",
+    "sessions",
+    "session-recovery",
+    "tui",
+    "terminal",
+    "ssh"
+  ],
   "bin": {
     "codex-session-tui": "bin/codex-session-explorer.js",
     "codex-session-explorer": "bin/codex-session-explorer.js"
@@ -17,6 +27,10 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/avikalpa/codex-session-tui.git"
+  },
+  "homepage": "https://github.com/avikalpa/codex-session-tui#readme",
+  "bugs": {
+    "url": "https://github.com/avikalpa/codex-session-tui/issues"
   },
   "publishConfig": {
     "access": "public"
