@@ -16918,7 +16918,7 @@ codex_home = "/root/.codex"
     fn browser_tree_segments_normalize_double_leading_slash() {
         assert_eq!(
             browser_tree_segments("//home/user"),
-            vec![String::from("/"), String::from("home"), String::from("pi")]
+            vec![String::from("/"), String::from("home"), String::from("user")]
         );
     }
 
